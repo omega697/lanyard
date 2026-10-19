@@ -1,0 +1,71 @@
+{
+  "name": "lanyard",
+  "version": "0.1.0",
+  "description": "UID-first, storage-agnostic authentication, presence tracking, and role/capability authorization library.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./core": {
+      "types": "./dist/core/index.d.ts",
+      "import": "./dist/core/index.js"
+    },
+    "./client": {
+      "types": "./dist/client/index.d.ts",
+      "import": "./dist/client/index.js"
+    },
+    "./client/firestore": {
+      "types": "./dist/client/firestore.d.ts",
+      "import": "./dist/client/firestore.js"
+    },
+    "./server": {
+      "types": "./dist/server/index.d.ts",
+      "import": "./dist/server/index.js"
+    },
+    "./server/firestore": {
+      "types": "./dist/server/firestore.d.ts",
+      "import": "./dist/server/firestore.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "prepare": "npm run build",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "format": "prettier --write \"src/**/*.ts\""
+  },
+  "peerDependencies": {
+    "express": "^4.18.0 || ^5.0.0",
+    "firebase": "^11.0.0",
+    "firebase-admin": "^13.0.0 || ^14.0.0"
+  },
+  "peerDependenciesMeta": {
+    "express": {
+      "optional": true
+    },
+    "firebase": {
+      "optional": true
+    },
+    "firebase-admin": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@types/express": "^4.17.21",
+    "@types/node": "^20.11.19",
+    "express": "^4.18.2",
+    "firebase": "^11.1.0",
+    "firebase-admin": "^14.1.0",
+    "prettier": "^3.8.4",
+    "typescript": "^5.5.0",
+    "vitest": "^4.1.9"
+  }
+}
