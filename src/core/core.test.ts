@@ -1,4 +1,5 @@
 import { describe, it, expect, vi } from "vitest";
+import * as rootBarrel from "../index.js";
 import {
   assertValidResourceId,
   createPermissionPolicy,
@@ -518,6 +519,85 @@ describe("lanyard/core unit tests", () => {
 
       await expect(store.getScopeMember("../bad", "uid-1")).rejects.toThrow(/Invalid scopeId/);
       await expect(store.getSystemAdmin("uid/bad")).rejects.toThrow(/Invalid uid/);
+    });
+
+    it("covers root barrel exports, defaultRole/quantifier edge cases, URL parse catch, punctuation initials, and store no-ops", async () => {
+      // 1. Root barrel re-exports core APIs
+      expect(rootBarrel.createPermissionPolicy).toBe(createPermissionPolicy);
+      expect(rootBarrel.InMemoryLanyardStore).toBe(InMemoryLanyardStore);
+
+      // 2. Explicit defaultRole vs unrecognized defaultRole fallback + omitted capabilities
+      const customDefaultPolicy = createPermissionPolicy<"lead" | "viewer", "read">({
+        roles: {
+          lead: { weight: 20, capabilities: "*" },
+          viewer: { weight: 5 }
+        },
+        defaultRole: "lead"
+      });
+      expect(customDefaultPolicy.defaultRole).toBe("lead");
+
+      const fallbackDefaultPolicy = createPermissionPolicy<"lead" | "viewer", "read">({
+        roles: {
+          lead: { weight: 20 },
+          viewer: { weight: 5 }
+        },
+        defaultRole: "nonexistent" as any
+      });
+      expect(fallbackDefaultPolicy.defaultRole).toBe("viewer");
+
+      // hasAllCapabilities quantifier semantics on empty array vs null member
+      const viewerMember: ScopedMember<"lead" | "viewer", "read"> = {
+        uid: "u-v",
+        email: "v@example.com",
+        role: "viewer",
+        capabilities: []
+      };
+      expect(fallbackDefaultPolicy.hasAllCapabilities(viewerMember, [])).toBe(true);
+      expect(fallbackDefaultPolicy.hasAllCapabilities(null, [])).toBe(false);
+      expect(fallbackDefaultPolicy.hasAnyCapability(viewerMember, [])).toBe(false);
+
+      // 3. Malformed URL starting with https:// triggers URL constructor catch block
+      expect(sanitizeAvatarUrl("https://[invalid-ipv6")).toBeNull();
+
+      // 4. Initials with leading punctuation, punctuation-only strings, and resolveAvatar(null)
+      expect(getAvatarInitials(" (Alice)   [Bob] ")).toBe("AB");
+      expect(getAvatarInitials("--- ***", "?")).toBe("?");
+      expect(getAvatarInitials("@", "?")).toBe("@");
+      expect(resolveAvatar(null)).toEqual({
+        photoUrl: null,
+        initials: "?",
+        displayName: "User",
+        colorIndex: expect.any(Number)
+      });
+
+      // 5. InMemoryLanyardStore edge cases: non-object patch, existing admin syncAvatar update, and non-existent member/admin heartbeats
+      const store = new InMemoryLanyardStore<TestRole, TestCapability>();
+      await store.savePreferences("u-1", null as any);
+      await store.savePreferences("u-1", ["bad"] as any);
+
+      await store.upsertSystemAdmin({
+        uid: "admin-1",
+        email: "admin@example.com",
+        photoUrl: "https://example.com/old.png"
+      });
+      await store.syncAvatar({
+        uid: "admin-1",
+        photoUrl: "https://example.com/new.png"
+      });
+      expect((await store.getSystemAdmin("admin-1"))?.photoUrl).toBe("https://example.com/new.png");
+
+      // Heartbeat & revoke on non-existent member/admin are safe no-ops
+      await store.recordPresenceHeartbeat({
+        uid: "ghost-user",
+        scopeId: "ws-ghost",
+        lastSeenIso: "2026-10-20T00:00:00.000Z"
+      });
+      await store.recordPresenceHeartbeat({
+        uid: "ghost-admin",
+        lastSeenIso: "2026-10-20T00:00:00.000Z"
+      });
+      await store.revokeScopeCapabilities("ws-ghost", "ghost-user", ["edit_content"]);
+      expect(await store.getScopeMember("ws-ghost", "ghost-user")).toBeNull();
     });
   });
 });

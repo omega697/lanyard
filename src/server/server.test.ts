@@ -953,4 +953,105 @@ describe("lanyard/server unit tests", () => {
       })
     ).rejects.toThrow(/role is not defined in policy\.roles/);
   });
+
+  it("covers FIREBASE_CONFIG emulator interplay, non-fatal requireAdmin store errors, requireScopeCapability 500 sanitization, and FirestoreServerStore photoUrl sanitization", async () => {
+    // 1. FIREBASE_CONFIG without FIREBASE_AUTH_EMULATOR_HOST throws SECURITY VIOLATION, but succeeds when emulator host is set
+    const origFbConfig = process.env.FIREBASE_CONFIG;
+    const origAuthEmu = process.env.FIREBASE_AUTH_EMULATOR_HOST;
+    try {
+      process.env.FIREBASE_CONFIG = '{"projectId":"prod-proj"}';
+      delete process.env.FIREBASE_AUTH_EMULATOR_HOST;
+      expect(() => assertNotProduction("FakeAuthService")).toThrow(/SECURITY VIOLATION/);
+
+      process.env.FIREBASE_AUTH_EMULATOR_HOST = "127.0.0.1:9099";
+      expect(() => assertNotProduction("FakeAuthService")).not.toThrow();
+    } finally {
+      if (origFbConfig !== undefined) process.env.FIREBASE_CONFIG = origFbConfig;
+      else delete process.env.FIREBASE_CONFIG;
+      if (origAuthEmu !== undefined) process.env.FIREBASE_AUTH_EMULATOR_HOST = origAuthEmu;
+      else delete process.env.FIREBASE_AUTH_EMULATOR_HOST;
+    }
+
+    // 2. FakeAuthService without adminAuth fallback returns null when no x-mock-user-email header is present
+    const standaloneFakeAuth = new FakeAuthService();
+    expect(await standaloneFakeAuth.verifyToken("Bearer some-token", {})).toBeNull();
+
+    // 3. requireAdmin continues (calls next()) even if the backing directory store throws a transient error
+    const adminAuth = createFakeAdminAuth();
+    const store = new InMemoryLanyardStore<TestRole, TestCap>();
+    const server = createLanyardServer<TestRole, TestCap>({
+      adminAuth,
+      store,
+      policy: TEST_POLICY,
+      authService: standaloneFakeAuth
+    });
+
+    vi.spyOn(store, "getSystemAdmin").mockRejectedValueOnce(new Error("Transient directory outage"));
+    let adminProceeded = false;
+    await server.requireAdmin(
+      { user: { uid: "u-admin", email: "admin@example.com", isAdmin: true } } as any,
+      createMockRes(),
+      () => {
+        adminProceeded = true;
+      }
+    );
+    expect(adminProceeded).toBe(true);
+
+    // 4. requireScopeCapability returns 500 with sanitized error when store.getScopeMember rejects
+    const requireEdit = server.requireScopeCapability("edit_content");
+    vi.spyOn(store, "getScopeMember").mockRejectedValueOnce(new Error("INTERNAL_SQL_STATE_ERROR_999"));
+    const resCap500 = createMockRes();
+    await requireEdit(
+      { user: { uid: "u-1", email: "u1@example.com" }, params: { scopeId: "ws-1" } } as any,
+      resCap500,
+      () => {}
+    );
+    expect(resCap500.statusCode).toBe(500);
+    expect(JSON.stringify(resCap500.body)).not.toContain("INTERNAL_SQL_STATE_ERROR_999");
+
+    // 5. FirestoreServerStore custom collection names and photoUrl sanitization on write & read
+    const docs = new Map<string, Record<string, any>>();
+    const fakeDb: any = {
+      doc(path: string) {
+        return {
+          path,
+          async get() {
+            const data = docs.get(path);
+            return {
+              id: path.split("/").pop()!,
+              exists: Boolean(data),
+              data: () => (data ? { ...data } : undefined)
+            };
+          },
+          async set(payload: Record<string, any>) {
+            docs.set(path, { ...payload });
+          }
+        };
+      }
+    };
+
+    const fsStore = new FirestoreServerStore<TestRole, TestCap>({
+      db: fakeDb,
+      defaultRole: "member",
+      systemAdminsCollection: "custom_admins",
+      scopeCollection: "custom_orgs",
+      membersSubcollection: "custom_users"
+    });
+
+    await fsStore.upsertSystemAdmin({
+      uid: "a-1",
+      email: "a1@example.com",
+      photoUrl: "data:image/svg+xml;base64,PHN2Zz4="
+    });
+    expect((await fsStore.getSystemAdmin("a-1"))?.photoUrl).toBeNull();
+
+    await fsStore.upsertScopeMember("org-1", {
+      uid: "u-1",
+      email: "u1@example.com",
+      role: "member",
+      capabilities: [],
+      photoUrl: "javascript:alert(1)"
+    });
+    expect((await fsStore.getScopeMember("org-1", "u-1"))?.photoUrl).toBeNull();
+  });
 });

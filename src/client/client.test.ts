@@ -973,4 +973,191 @@ describe("lanyard/client unit tests", () => {
     client.destroy();
     clientArrayCache.destroy();
   });
+
+  it("recovers from transient syncAvatar & recordPresenceHeartbeat errors, handles auth/policy fallbacks, and exercises FirestoreClientStore error callbacks", async () => {
+    const store = new InMemoryLanyardStore<TestRole, TestCap, TestPrefs>();
+    await store.upsertScopeMember("ws-1", {
+      uid: "u-retry",
+      email: "retry@example.com",
+      role: "manager",
+      capabilities: [],
+      photoUrl: null
+    });
+
+    // 1. Avatar sync failure clears syncedAvatars cache so next trigger retries both admin & scoped member sync
+    const syncSpy = vi
+      .spyOn(store, "syncAvatar")
+      .mockRejectedValueOnce(new Error("Transient network failure"))
+      .mockRejectedValueOnce(new Error("Transient member sync failure"));
+
+    // Create client WITHOUT a policy to also exercise the policy-less shouldTrackPresence fallback
+    const clientNoPolicy = createLanyardClient<TestRole, TestCap, TestPrefs>({
+      store,
+      defaultPreferences: DEFAULT_PREFS,
+      storageKeyPrefix: "retryapp"
+    });
+
+    clientNoPolicy.setActiveUser({
+      uid: "u-retry",
+      email: "retry@example.com",
+      emailVerified: true,
+      displayName: "Retry User",
+      photoUrl: "https://example.com/retry.png",
+      isAnonymous: false,
+      isAdmin: true,
+      providerIds: ["google.com"]
+    });
+    await new Promise((r) => setTimeout(r, 0));
+    expect(syncSpy).toHaveBeenCalledTimes(2); // 1 admin attempt + 1 member attempt (both rejected)
+
+    // Re-trigger setActiveUser: because .catch() deleted the keys from syncedAvatars, both retry and succeed!
+    clientNoPolicy.setActiveUser({
+      uid: "u-retry",
+      email: "retry@example.com",
+      emailVerified: true,
+      displayName: "Retry User",
+      photoUrl: "https://example.com/retry.png",
+      isAnonymous: false,
+      isAdmin: true,
+      providerIds: ["google.com"]
+    });
+    await new Promise((r) => setTimeout(r, 0));
+    expect(syncSpy).toHaveBeenCalledTimes(4);
+    expect((await store.getSystemAdmin("u-retry"))?.photoUrl).toBe("https://example.com/retry.png");
+    expect((await store.getScopeMember("ws-1", "u-retry"))?.photoUrl).toBe("https://example.com/retry.png");
+
+    // 2. Presence heartbeat failure rolls back lastSynced in localStorage so the next sync retries immediately
+    const t0 = 1_700_000_000_000;
+    vi.spyOn(Date, "now").mockReturnValue(t0);
+    // Switch to non-admin to also verify policy-less shouldTrackPresence(scopeId) fallback
+    clientNoPolicy.setActiveUser({
+      uid: "u-retry",
+      email: "retry@example.com",
+      emailVerified: true,
+      displayName: "Retry User",
+      photoUrl: "https://example.com/retry.png",
+      isAnonymous: false,
+      isAdmin: false,
+      providerIds: ["google.com"]
+    });
+
+    // Without a policy, non-admin without scopeId or in non-member scopeId does not track presence
+    clientNoPolicy.recordActivity();
+    await clientNoPolicy.syncPresence();
+    clientNoPolicy.recordActivity("ws-not-member");
+    await clientNoPolicy.syncPresence({ scopeId: "ws-not-member" });
+    expect(clientNoPolicy.getPresenceStatus("ws-1").lastSynced).toBe(0);
+
+    // Reject first heartbeat write -> lastSynced rolls back to 0 so immediate retry succeeds!
+    const hbSpy = vi.spyOn(store, "recordPresenceHeartbeat").mockRejectedValueOnce(new Error("Offline"));
+    clientNoPolicy.recordActivity("ws-1");
+    await clientNoPolicy.syncPresence({ scopeId: "ws-1" });
+    expect(hbSpy).toHaveBeenCalledTimes(1);
+    expect(clientNoPolicy.getPresenceStatus("ws-1").lastSynced).toBe(0); // rolled back!
+
+    await clientNoPolicy.syncPresence({ scopeId: "ws-1" });
+    expect(hbSpy).toHaveBeenCalledTimes(2);
+    expect(clientNoPolicy.getPresenceStatus("ws-1").lastSynced).toBe(t0);
+
+    // 3. Uninitialized auth guards & fallbacks
+    await expect(clientNoPolicy.loginWithSocialProvider("google")).rejects.toThrow(/not initialized/);
+    await expect(clientNoPolicy.loginAnonymously()).rejects.toThrow(/not initialized/);
+    await expect(clientNoPolicy.sendPasswordlessEmailLink("a@b.com")).rejects.toThrow(/not initialized/);
+    await expect(clientNoPolicy.completePasswordlessSignIn("a@b.com")).rejects.toThrow(/not initialized/);
+    await expect(clientNoPolicy.handleDevModeLogin(new URLSearchParams("loginAs=a@b.com"))).rejects.toThrow(
+      /not initialized/
+    );
+    await expect(clientNoPolicy.linkSocialProvider("google")).rejects.toThrow(/No authenticated user/);
+    await expect(clientNoPolicy.unlinkSocialProvider("google.com")).rejects.toThrow(/No authenticated user/);
+    await expect(clientNoPolicy.sendEmailUpdateVerification("a@b.com")).rejects.toThrow(/No authenticated user/);
+    expect(await clientNoPolicy.getSignInMethodsForEmail("a@b.com")).toEqual([]);
+
+    // Auth with localStorage email fallback on completePasswordlessSignIn, failed fetchSignInMethodsForEmail, and failed dev login fetch
+    const fakeAuth: any = { currentUser: null };
+    vi.mocked(firebaseAuth.onAuthStateChanged).mockImplementation(() => () => {});
+    const clientWithAuth = createLanyardClient<TestRole, TestCap, TestPrefs>({
+      auth: fakeAuth,
+      store,
+      defaultPreferences: DEFAULT_PREFS,
+      storageKeyPrefix: "retryapp"
+    });
+
+    // completePasswordlessSignIn when link is not a sign-in link or when no email is found anywhere -> null
+    vi.mocked(firebaseAuth.isSignInWithEmailLink).mockReturnValueOnce(false);
+    expect(await clientWithAuth.completePasswordlessSignIn(undefined, "https://app.example.com/")).toBeNull();
+
+    vi.mocked(firebaseAuth.isSignInWithEmailLink).mockReturnValue(true);
+    localStorage.removeItem("retryapp_emailForSignIn");
+    expect(
+      await clientWithAuth.completePasswordlessSignIn(undefined, "https://app.example.com/?oobCode=123")
+    ).toBeNull();
+
+    // Stored email in localStorage is used when URL lacks ?email=
+    localStorage.setItem("retryapp_emailForSignIn", "stored@example.com");
+    vi.mocked(firebaseAuth.signInWithEmailLink).mockResolvedValueOnce({
+      user: {
+        uid: "u-stored",
+        email: "stored@example.com",
+        emailVerified: true,
+        providerData: [],
+        getIdTokenResult: vi.fn().mockResolvedValue({ claims: {} })
+      }
+    } as any);
+    const completedStored = await clientWithAuth.completePasswordlessSignIn(
+      undefined,
+      "https://app.example.com/?oobCode=123"
+    );
+    expect(completedStored?.email).toBe("stored@example.com");
+    expect(localStorage.getItem("retryapp_emailForSignIn")).toBeNull();
+
+    // getSignInMethodsForEmail catches errors and returns []
+    vi.mocked(firebaseAuth.fetchSignInMethodsForEmail).mockRejectedValueOnce(new Error("Network error"));
+    expect(await clientWithAuth.getSignInMethodsForEmail("stored@example.com")).toEqual([]);
+
+    // handleDevModeLogin no-ops when loginAs param is absent, and throws when response.ok is false
+    await clientWithAuth.handleDevModeLogin(new URLSearchParams(""));
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValueOnce({ ok: false, status: 403 }));
+    await expect(
+      clientWithAuth.handleDevModeLogin(new URLSearchParams("loginAs=dev@example.com"), "/api/dev/auth/token")
+    ).rejects.toThrow(/Dev token generation failed/);
+    vi.unstubAllGlobals();
+
+    // 4. FirestoreClientStore error callbacks, custom collection names, custom resolveRole, and unsafe photoUrl ignore
+    vi.mocked(firebaseFirestore.onSnapshot).mockImplementation((_ref: any, _onNext: any, onError?: any) => {
+      if (onError) onError(new Error("permission-denied"));
+      return () => {};
+    });
+
+    const fsStore = new FirestoreClientStore<TestRole, TestCap, TestPrefs>({
+      db: { type: "custom-fs" } as any,
+      defaultRole: "member",
+      resolveRole: (d) => (d.isOwner ? "owner" : "member"),
+      preferencesCollection: "custom_prefs",
+      systemAdminsCollection: "custom_admins",
+      scopeCollection: "custom_scopes",
+      membersSubcollection: "custom_members"
+    });
+
+    const prefErrCb = vi.fn();
+    const userMemErrCb = vi.fn();
+    const scopeMemErrCb = vi.fn();
+    fsStore.subscribeToPreferences("u-1", prefErrCb);
+    fsStore.subscribeToUserMemberships("u-1", userMemErrCb);
+    fsStore.subscribeToScopeMembers("ws-1", scopeMemErrCb);
+
+    expect(prefErrCb).not.toHaveBeenCalled();
+    expect(userMemErrCb).toHaveBeenCalledWith([]);
+    expect(scopeMemErrCb).toHaveBeenCalledWith([]);
+
+    // syncAvatar with unsafe URL is ignored without calling updateDoc or setDoc
+    vi.mocked(firebaseFirestore.updateDoc).mockClear();
+    vi.mocked(firebaseFirestore.setDoc).mockClear();
+    await fsStore.syncAvatar({ uid: "u-1", scopeId: "ws-1", photoUrl: "javascript:alert(1)" });
+    expect(firebaseFirestore.updateDoc).not.toHaveBeenCalled();
+    expect(firebaseFirestore.setDoc).not.toHaveBeenCalled();
+
+    clientNoPolicy.destroy();
+    clientWithAuth.destroy();
+    vi.restoreAllMocks();
+  });
 });
