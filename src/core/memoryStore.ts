@@ -1,8 +1,10 @@
 import { assertValidResourceId, sanitizeAvatarUrl } from "./formatters.js";
 import type {
+  EncryptedSecretData,
   LanyardClientStore,
   LanyardServerStore,
   ScopedMember,
+  SecretCipher,
   SystemAdminProfile,
   UserProfilePatch,
   UserRecord
@@ -36,18 +38,74 @@ export class InMemoryLanyardStore<
   TCapability extends string = string,
   TPreferences extends Record<string, any> = Record<string, any>,
   TAttributes extends Record<string, any> = Record<string, any>,
+  THiddenAttributes extends Record<string, any> = Record<string, any>,
   TSecrets extends Record<string, any> = Record<string, any>
 >
   implements
     LanyardClientStore<TRole, TCapability, TPreferences, TAttributes>,
-    LanyardServerStore<TRole, TCapability, TPreferences, TAttributes, TSecrets>
+    LanyardServerStore<TRole, TCapability, TPreferences, TAttributes, THiddenAttributes, TSecrets>
 {
+  private readonly cipher?: SecretCipher;
   private users = new Map<string, UserRecord<TRole, TCapability, TPreferences, TAttributes>>();
-  private userSecrets = new Map<string, Partial<TSecrets>>();
+  private userHiddenAttributes = new Map<string, Partial<THiddenAttributes>>();
+  private userSecrets = new Map<string, Record<string, string | EncryptedSecretData>>();
   // scopeId -> (uid -> ScopedMember)
   private scopeMembers = new Map<string, Map<string, ScopedMember<TRole, TCapability, TPreferences, TAttributes>>>();
-  // scopeId -> (uid -> Partial<TSecrets>)
-  private scopeSecrets = new Map<string, Map<string, Partial<TSecrets>>>();
+  // scopeId -> (uid -> Partial<THiddenAttributes>)
+  private scopeMemberHiddenAttributes = new Map<string, Map<string, Partial<THiddenAttributes>>>();
+  // scopeId -> (uid -> Record<string, string | EncryptedSecretData>)
+  private scopeMemberSecrets = new Map<string, Map<string, Record<string, string | EncryptedSecretData>>>();
+  // scopeId -> Record<string, string | EncryptedSecretData>
+  private scopeSecrets = new Map<string, Record<string, string | EncryptedSecretData>>();
+
+  constructor(options?: { cipher?: SecretCipher }) {
+    this.cipher = options?.cipher;
+  }
+
+  private encryptSecretMapPatch(
+    current: Record<string, string | EncryptedSecretData>,
+    patch: Partial<Record<keyof TSecrets & string, string | null>>
+  ): Record<string, string | EncryptedSecretData> {
+    const next: Record<string, string | EncryptedSecretData> = { ...current };
+    if (!patch || typeof patch !== "object" || Array.isArray(patch)) return next;
+    for (const [k, v] of Object.entries(patch)) {
+      if (FORBIDDEN_KEYS.has(k) || v === undefined) continue;
+      if (v === null || v === "") {
+        delete next[k];
+      } else if (typeof v === "string") {
+        next[k] = this.cipher ? this.cipher.encrypt(v) : v;
+      }
+    }
+    return next;
+  }
+
+  private decryptSecretMap(
+    stored: Record<string, string | EncryptedSecretData> | undefined
+  ): Partial<Record<keyof TSecrets & string, string>> {
+    const out: Record<string, string> = {};
+    if (!stored) return out as Partial<Record<keyof TSecrets & string, string>>;
+    for (const [k, v] of Object.entries(stored)) {
+      if (FORBIDDEN_KEYS.has(k)) continue;
+      if (typeof v === "string") {
+        out[k] = v;
+      } else if (v && typeof v === "object" && typeof v.ciphertext === "string" && this.cipher) {
+        out[k] = this.cipher.decrypt(v);
+      }
+    }
+    return out as Partial<Record<keyof TSecrets & string, string>>;
+  }
+
+  private toSecretStatusMap(
+    stored: Record<string, string | EncryptedSecretData> | undefined
+  ): Partial<Record<keyof TSecrets & string, boolean>> {
+    const out: Record<string, boolean> = {};
+    if (!stored) return out as Partial<Record<keyof TSecrets & string, boolean>>;
+    for (const [k, v] of Object.entries(stored)) {
+      if (FORBIDDEN_KEYS.has(k)) continue;
+      out[k] = Boolean(v);
+    }
+    return out as Partial<Record<keyof TSecrets & string, boolean>>;
+  }
 
   private prefListeners = new Map<string, Set<(prefs: Partial<TPreferences>) => void>>();
   private userListeners = new Map<
@@ -301,17 +359,41 @@ export class InMemoryLanyardStore<
     return this.cloneUser(updated)!;
   }
 
-  async getUserSecrets(uid: string): Promise<Partial<TSecrets>> {
+  async getUserHiddenAttributes(uid: string): Promise<Partial<THiddenAttributes>> {
     assertValidResourceId(uid, "uid");
-    return { ...(this.userSecrets.get(uid) || {}) } as Partial<TSecrets>;
+    return { ...(this.userHiddenAttributes.get(uid) || {}) } as Partial<THiddenAttributes>;
   }
 
-  async updateUserSecrets(uid: string, patch: Partial<TSecrets>): Promise<Partial<TSecrets>> {
+  async updateUserHiddenAttributes(
+    uid: string,
+    patch: Partial<THiddenAttributes>
+  ): Promise<Partial<THiddenAttributes>> {
+    assertValidResourceId(uid, "uid");
+    const current = this.userHiddenAttributes.get(uid) || {};
+    const updated = { ...current, ...sanitizePatch(patch) };
+    this.userHiddenAttributes.set(uid, updated);
+    return { ...updated };
+  }
+
+  async getUserSecrets(uid: string): Promise<Partial<Record<keyof TSecrets & string, string>>> {
+    assertValidResourceId(uid, "uid");
+    return this.decryptSecretMap(this.userSecrets.get(uid));
+  }
+
+  async getUserSecretsStatus(uid: string): Promise<Partial<Record<keyof TSecrets & string, boolean>>> {
+    assertValidResourceId(uid, "uid");
+    return this.toSecretStatusMap(this.userSecrets.get(uid));
+  }
+
+  async updateUserSecrets(
+    uid: string,
+    patch: Partial<Record<keyof TSecrets & string, string | null>>
+  ): Promise<Partial<Record<keyof TSecrets & string, boolean>>> {
     assertValidResourceId(uid, "uid");
     const current = this.userSecrets.get(uid) || {};
-    const updated = { ...current, ...sanitizePatch(patch) };
+    const updated = this.encryptSecretMapPatch(current, patch);
     this.userSecrets.set(uid, updated);
-    return { ...updated };
+    return this.toSecretStatusMap(updated);
   }
 
   async grantUserCapabilities(
@@ -468,22 +550,78 @@ export class InMemoryLanyardStore<
     return this.cloneMember(updated);
   }
 
-  async getScopeMemberSecrets(scopeId: string, uid: string): Promise<Partial<TSecrets>> {
+  async getScopeMemberHiddenAttributes(scopeId: string, uid: string): Promise<Partial<THiddenAttributes>> {
     assertValidResourceId(scopeId, "scopeId");
     assertValidResourceId(uid, "uid");
-    return { ...(this.scopeSecrets.get(scopeId)?.get(uid) || {}) } as Partial<TSecrets>;
+    return { ...(this.scopeMemberHiddenAttributes.get(scopeId)?.get(uid) || {}) } as Partial<THiddenAttributes>;
   }
 
-  async updateScopeMemberSecrets(scopeId: string, uid: string, patch: Partial<TSecrets>): Promise<Partial<TSecrets>> {
+  async updateScopeMemberHiddenAttributes(
+    scopeId: string,
+    uid: string,
+    patch: Partial<THiddenAttributes>
+  ): Promise<Partial<THiddenAttributes>> {
     assertValidResourceId(scopeId, "scopeId");
     assertValidResourceId(uid, "uid");
-    if (!this.scopeSecrets.has(scopeId)) {
-      this.scopeSecrets.set(scopeId, new Map());
+    if (!this.scopeMemberHiddenAttributes.has(scopeId)) {
+      this.scopeMemberHiddenAttributes.set(scopeId, new Map());
     }
-    const current = this.scopeSecrets.get(scopeId)!.get(uid) || {};
+    const current = this.scopeMemberHiddenAttributes.get(scopeId)!.get(uid) || {};
     const updated = { ...current, ...sanitizePatch(patch) };
-    this.scopeSecrets.get(scopeId)!.set(uid, updated);
+    this.scopeMemberHiddenAttributes.get(scopeId)!.set(uid, updated);
     return { ...updated };
+  }
+
+  async getScopeMemberSecrets(scopeId: string, uid: string): Promise<Partial<Record<keyof TSecrets & string, string>>> {
+    assertValidResourceId(scopeId, "scopeId");
+    assertValidResourceId(uid, "uid");
+    return this.decryptSecretMap(this.scopeMemberSecrets.get(scopeId)?.get(uid));
+  }
+
+  async getScopeMemberSecretsStatus(
+    scopeId: string,
+    uid: string
+  ): Promise<Partial<Record<keyof TSecrets & string, boolean>>> {
+    assertValidResourceId(scopeId, "scopeId");
+    assertValidResourceId(uid, "uid");
+    return this.toSecretStatusMap(this.scopeMemberSecrets.get(scopeId)?.get(uid));
+  }
+
+  async updateScopeMemberSecrets(
+    scopeId: string,
+    uid: string,
+    patch: Partial<Record<keyof TSecrets & string, string | null>>
+  ): Promise<Partial<Record<keyof TSecrets & string, boolean>>> {
+    assertValidResourceId(scopeId, "scopeId");
+    assertValidResourceId(uid, "uid");
+    if (!this.scopeMemberSecrets.has(scopeId)) {
+      this.scopeMemberSecrets.set(scopeId, new Map());
+    }
+    const current = this.scopeMemberSecrets.get(scopeId)!.get(uid) || {};
+    const updated = this.encryptSecretMapPatch(current, patch);
+    this.scopeMemberSecrets.get(scopeId)!.set(uid, updated);
+    return this.toSecretStatusMap(updated);
+  }
+
+  async getScopeSecrets(scopeId: string): Promise<Partial<Record<keyof TSecrets & string, string>>> {
+    assertValidResourceId(scopeId, "scopeId");
+    return this.decryptSecretMap(this.scopeSecrets.get(scopeId));
+  }
+
+  async getScopeSecretsStatus(scopeId: string): Promise<Partial<Record<keyof TSecrets & string, boolean>>> {
+    assertValidResourceId(scopeId, "scopeId");
+    return this.toSecretStatusMap(this.scopeSecrets.get(scopeId));
+  }
+
+  async updateScopeSecrets(
+    scopeId: string,
+    patch: Partial<Record<keyof TSecrets & string, string | null>>
+  ): Promise<Partial<Record<keyof TSecrets & string, boolean>>> {
+    assertValidResourceId(scopeId, "scopeId");
+    const current = this.scopeSecrets.get(scopeId) || {};
+    const updated = this.encryptSecretMapPatch(current, patch);
+    this.scopeSecrets.set(scopeId, updated);
+    return this.toSecretStatusMap(updated);
   }
 
   async grantScopeCapabilities(
@@ -531,7 +669,8 @@ export class InMemoryLanyardStore<
     assertValidResourceId(scopeId, "scopeId");
     assertValidResourceId(uid, "uid");
     this.scopeMembers.get(scopeId)?.delete(uid);
-    this.scopeSecrets.get(scopeId)?.delete(uid);
+    this.scopeMemberHiddenAttributes.get(scopeId)?.delete(uid);
+    this.scopeMemberSecrets.get(scopeId)?.delete(uid);
     this.notifyMembershipListeners(scopeId, uid);
   }
 

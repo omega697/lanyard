@@ -727,7 +727,7 @@ describe("lanyard/core unit tests", () => {
       ).toThrow(/Invalid weight for role 'badWeight'/);
     });
 
-    it("enforces independent read/write capabilities on attributes and secrets with strict self/admin/prototype invariants", () => {
+    it("enforces independent read/write capabilities on attributes, hiddenAttributes, and write-only secrets with strict self/admin/prototype invariants", () => {
       type Role = "attendee" | "scanner" | "auditor" | "moderator";
       type Cap =
         | "write:points"
@@ -735,7 +735,8 @@ describe("lanyard/core unit tests", () => {
         | "write:internal_tier"
         | "read:notes"
         | "write:notes"
-        | "full:risk";
+        | "full:risk"
+        | "write:ai_keys";
 
       const policy = createPermissionPolicy<Role, Cap>({
         roles: {
@@ -745,7 +746,7 @@ describe("lanyard/core unit tests", () => {
           moderator: {
             weight: 30,
             inherits: ["scanner", "auditor"],
-            capabilities: ["write:internal_tier", "write:notes", "full:risk"]
+            capabilities: ["write:internal_tier", "write:notes", "full:risk", "write:ai_keys"]
           }
         },
         attributeCapabilities: {
@@ -756,13 +757,21 @@ describe("lanyard/core unit tests", () => {
           // Read-only attribute with no non-admin writer
           systemFlag: { read: "read:internal_tier" }
         },
-        secretCapabilities: {
+        hiddenAttributeCapabilities: {
           // Object syntax: independent read and write capabilities; self NEVER gets access
           moderatorNotes: { read: "read:notes", write: "write:notes" },
-          // String shorthand on secrets: gates BOTH read and write
+          // String shorthand on hiddenAttributes: gates BOTH read and write
           riskScore: "full:risk",
-          // Write-only secret for non-admins (no read capability configured)
+          // Write-only hiddenAttribute for non-admins (no read capability configured)
           auditTrailHash: { write: "write:notes" }
+        },
+        secretCapabilities: {
+          // User/member-owned secret (allowSelfWrite defaults to true)
+          personalGeminiKey: { allowSelfWrite: true },
+          // Role-gated secret where self cannot write unless they hold 'write:ai_keys'
+          sharedOpenaiKey: { write: "write:ai_keys", allowSelfWrite: false },
+          // String shorthand on secretCapabilities: self OR 'write:ai_keys' can write
+          hybridAnthropicKey: "write:ai_keys"
         }
       });
 
@@ -794,32 +803,47 @@ describe("lanyard/core unit tests", () => {
       expect(policy.filterReadableAttributes(attendee, sampleAttrs, { isSelf: true })).toEqual(sampleAttrs);
       expect(policy.filterReadableAttributes(auditor, sampleAttrs, { isSelf: false })).toEqual(sampleAttrs);
 
-      // 2. Secrets: self NEVER gets read or write access; only explicit capability holders or systemAdmin
-      expect(policy.canReadSecret(attendee, "moderatorNotes")).toBe(false);
-      expect(policy.canReadSecret(scanner, "moderatorNotes")).toBe(false);
-      expect(policy.canReadSecret(auditor, "moderatorNotes")).toBe(true);
-      expect(policy.canWriteSecret(auditor, "moderatorNotes")).toBe(false); // auditor has read:notes, NOT write:notes!
-      expect(policy.canWriteSecret(moderator, "moderatorNotes")).toBe(true);
+      // 2. HiddenAttributes: self NEVER gets read or write access; only explicit capability holders or systemAdmin
+      expect(policy.canReadHiddenAttribute(attendee, "moderatorNotes")).toBe(false);
+      expect(policy.canReadHiddenAttribute(scanner, "moderatorNotes")).toBe(false);
+      expect(policy.canReadHiddenAttribute(auditor, "moderatorNotes")).toBe(true);
+      expect(policy.canWriteHiddenAttribute(auditor, "moderatorNotes")).toBe(false); // auditor has read:notes, NOT write:notes!
+      expect(policy.canWriteHiddenAttribute(moderator, "moderatorNotes")).toBe(true);
 
-      expect(policy.canReadSecret(auditor, "riskScore")).toBe(false);
-      expect(policy.canReadSecret(moderator, "riskScore")).toBe(true);
-      expect(policy.canWriteSecret(moderator, "riskScore")).toBe(true);
+      expect(policy.canReadHiddenAttribute(auditor, "riskScore")).toBe(false);
+      expect(policy.canReadHiddenAttribute(moderator, "riskScore")).toBe(true);
+      expect(policy.canWriteHiddenAttribute(moderator, "riskScore")).toBe(true);
 
-      // Secret with write capability but no read capability cannot be read by non-admins
-      expect(policy.canWriteSecret(moderator, "auditTrailHash")).toBe(true);
-      expect(policy.canReadSecret(moderator, "auditTrailHash")).toBe(false);
-      expect(policy.canReadSecret(null, "auditTrailHash", true)).toBe(true);
+      // HiddenAttribute with write capability but no read capability cannot be read by non-admins
+      expect(policy.canWriteHiddenAttribute(moderator, "auditTrailHash")).toBe(true);
+      expect(policy.canReadHiddenAttribute(moderator, "auditTrailHash")).toBe(false);
+      expect(policy.canReadHiddenAttribute(null, "auditTrailHash", true)).toBe(true);
 
-      const sampleSecrets = { moderatorNotes: "Trusted", riskScore: 0, superAdminOnly: "top-secret" };
-      expect(policy.filterReadableSecrets(attendee, sampleSecrets)).toEqual({});
-      expect(policy.filterReadableSecrets(auditor, sampleSecrets)).toEqual({ moderatorNotes: "Trusted" });
-      expect(policy.filterReadableSecrets(moderator, sampleSecrets)).toEqual({
+      const sampleHidden = { moderatorNotes: "Trusted", riskScore: 0, superAdminOnly: "top-secret" };
+      expect(policy.filterReadableHiddenAttributes(attendee, sampleHidden)).toEqual({});
+      expect(policy.filterReadableHiddenAttributes(auditor, sampleHidden)).toEqual({ moderatorNotes: "Trusted" });
+      expect(policy.filterReadableHiddenAttributes(moderator, sampleHidden)).toEqual({
         moderatorNotes: "Trusted",
         riskScore: 0
       });
-      expect(policy.filterReadableSecrets(null, sampleSecrets, true)).toEqual(sampleSecrets);
+      expect(policy.filterReadableHiddenAttributes(null, sampleHidden, true)).toEqual(sampleHidden);
 
-      // 3. Patch validation & prototype-pollution defenses (even for systemAdmin!)
+      // 3. Write-only Secrets:
+      // - personalGeminiKey (allowSelfWrite: true) -> self can write; non-self without capability cannot
+      expect(policy.canWriteSecret(attendee, "personalGeminiKey", { isSelf: true })).toBe(true);
+      expect(policy.canWriteSecret(attendee, "personalGeminiKey", { isSelf: false })).toBe(false);
+      // - Unconfigured secret key also defaults to allowSelfWrite: true when isSelf is true
+      expect(policy.canWriteSecret(attendee, "unconfiguredUserApiKey", { isSelf: true })).toBe(true);
+      expect(policy.canWriteSecret(attendee, "unconfiguredUserApiKey", { isSelf: false })).toBe(false);
+      // - sharedOpenaiKey (allowSelfWrite: false, write: "write:ai_keys") -> self cannot write unless holding write:ai_keys
+      expect(policy.canWriteSecret(attendee, "sharedOpenaiKey", { isSelf: true })).toBe(false);
+      expect(policy.canWriteSecret(moderator, "sharedOpenaiKey", { isSelf: false })).toBe(true);
+      // - hybridAnthropicKey ("write:ai_keys") -> self OR holder of write:ai_keys can write
+      expect(policy.canWriteSecret(attendee, "hybridAnthropicKey", { isSelf: true })).toBe(true);
+      expect(policy.canWriteSecret(moderator, "hybridAnthropicKey", { isSelf: false })).toBe(true);
+      expect(policy.canWriteSecret(scanner, "hybridAnthropicKey", { isSelf: false })).toBe(false);
+
+      // 4. Patch validation & prototype-pollution defenses (even for systemAdmin!)
       expect(policy.canWriteAttributesPatch(scanner, { pointsAllTime: 50 })).toBe(true);
       expect(policy.canWriteAttributesPatch(scanner, { pointsAllTime: 50, internalTier: "vip" })).toBe(false);
       expect(policy.canWriteAttributesPatch(scanner, {})).toBe(false);
@@ -831,27 +855,32 @@ describe("lanyard/core unit tests", () => {
         enumerable: true
       });
       expect(policy.canWriteAttributesPatch(null, protoPatch, true)).toBe(false);
+      expect(policy.canWriteHiddenAttributesPatch(null, protoPatch, true)).toBe(false);
       expect(policy.canWriteSecretsPatch(null, protoPatch, true)).toBe(false);
       expect(policy.canWriteAttribute(null, "__proto__", true)).toBe(false);
-      expect(policy.canReadSecret(null, "constructor", true)).toBe(false);
+      expect(policy.canReadHiddenAttribute(null, "constructor", true)).toBe(false);
+      expect(policy.canWriteSecret(null, "__proto__", true)).toBe(false);
     });
 
-    it("preserves user preferences, attributes, and profile when demoting a system admin in InMemoryLanyardStore", async () => {
+    it("preserves user preferences, attributes, hiddenAttributes, encrypted secrets, and profile when demoting a system admin in InMemoryLanyardStore", async () => {
       interface Prefs {
         leaderboardOptIn: boolean;
       }
       interface Attrs {
         pointsAllTime: number;
       }
-      interface Secrets {
+      interface HiddenAttrs {
         internalNotes: string;
       }
+      interface Secrets {
+        geminiKey: string;
+      }
 
-      const store = new InMemoryLanyardStore<TestRole, TestCapability, Prefs, Attrs, Secrets>();
+      const store = new InMemoryLanyardStore<TestRole, TestCapability, Prefs, Attrs, HiddenAttrs, Secrets>();
       const observedUsers: any[] = [];
       const unsubUser = store.subscribeToUser("u-hybrid", (u) => observedUsers.push(u));
 
-      // User is both a system admin and an attendee with preferences, attributes, and secrets
+      // User is both a system admin and an attendee with preferences, attributes, hiddenAttributes, and secrets
       await store.upsertSystemAdmin({
         uid: "u-hybrid",
         email: "hybrid@example.com",
@@ -861,7 +890,8 @@ describe("lanyard/core unit tests", () => {
       });
       await store.savePreferences("u-hybrid", { leaderboardOptIn: true });
       await store.updateUserAttributes("u-hybrid", { pointsAllTime: 250 });
-      await store.updateUserSecrets("u-hybrid", { internalNotes: "Great volunteer" });
+      await store.updateUserHiddenAttributes("u-hybrid", { internalNotes: "Great volunteer" });
+      await store.updateUserSecrets("u-hybrid", { geminiKey: "AIzaSyTest123" });
       await store.updateUserProfile("u-hybrid", {
         firstName: "UpdatedTesty",
         photoUrl: "https://example.com/testy.png"
@@ -886,9 +916,11 @@ describe("lanyard/core unit tests", () => {
         preferences: { leaderboardOptIn: true },
         attributes: { pointsAllTime: 250 }
       });
-      expect(await store.getUserSecrets("u-hybrid")).toEqual({ internalNotes: "Great volunteer" });
+      expect(await store.getUserHiddenAttributes("u-hybrid")).toEqual({ internalNotes: "Great volunteer" });
+      expect(await store.getUserSecretsStatus("u-hybrid")).toEqual({ geminiKey: true });
+      expect(await store.getUserSecrets("u-hybrid")).toEqual({ geminiKey: "AIzaSyTest123" });
 
-      // Scoped member attributes and secrets lifecycle
+      // Scoped member attributes, hiddenAttributes, and secrets lifecycle
       await expect(store.updateScopeMemberAttributes("ws-1", "missing-uid", { pointsAllTime: 10 })).rejects.toThrow(
         /does not exist/
       );
@@ -899,12 +931,22 @@ describe("lanyard/core unit tests", () => {
         capabilities: []
       });
       await store.updateScopeMemberAttributes("ws-1", "u-hybrid", { pointsAllTime: 99 });
-      await store.updateScopeMemberSecrets("ws-1", "u-hybrid", { internalNotes: "Scoped note" });
+      await store.updateScopeMemberHiddenAttributes("ws-1", "u-hybrid", { internalNotes: "Scoped note" });
+      await store.updateScopeMemberSecrets("ws-1", "u-hybrid", { geminiKey: "AIzaSyScoped456" });
       expect((await store.getScopeMember("ws-1", "u-hybrid"))?.attributes).toEqual({ pointsAllTime: 99 });
-      expect(await store.getScopeMemberSecrets("ws-1", "u-hybrid")).toEqual({ internalNotes: "Scoped note" });
+      expect(await store.getScopeMemberHiddenAttributes("ws-1", "u-hybrid")).toEqual({ internalNotes: "Scoped note" });
+      expect(await store.getScopeMemberSecretsStatus("ws-1", "u-hybrid")).toEqual({ geminiKey: true });
+      expect(await store.getScopeMemberSecrets("ws-1", "u-hybrid")).toEqual({ geminiKey: "AIzaSyScoped456" });
 
-      // Deleting scope member also cleans up scope secrets
+      // Clearing a secret with "" or null removes it from status & decrypted secrets
+      await store.updateScopeMemberSecrets("ws-1", "u-hybrid", { geminiKey: "" });
+      expect(await store.getScopeMemberSecretsStatus("ws-1", "u-hybrid")).toEqual({});
+      expect(await store.getScopeMemberSecrets("ws-1", "u-hybrid")).toEqual({});
+
+      // Deleting scope member also cleans up scope hiddenAttributes and secrets
+      await store.updateScopeMemberSecrets("ws-1", "u-hybrid", { geminiKey: "AIzaSyScoped789" });
       await store.deleteScopeMember("ws-1", "u-hybrid");
+      expect(await store.getScopeMemberHiddenAttributes("ws-1", "u-hybrid")).toEqual({});
       expect(await store.getScopeMemberSecrets("ws-1", "u-hybrid")).toEqual({});
 
       unsubUser();

@@ -787,6 +787,91 @@ export function createLanyardClient<
     return { ...preferencesStoreInternal.get() };
   }
 
+  /**
+   * Checks whether the current user can read `key` on `attributes` (either unscoped or within `scopeId`).
+   * Defaults `isSelf: true` when checking the current user's own attributes; pass `{ isSelf: false }`
+   * when checking whether the current user can read another user's/member's `attributes` key.
+   */
+  function canReadAttribute(
+    key: (keyof TAttributes & string) | string,
+    options?: string | { scopeId?: string; isSelf?: boolean }
+  ): boolean {
+    const currentUser = authStoreInternal.get().user;
+    if (!currentUser) return false;
+    const scopeId = typeof options === "string" ? options : options?.scopeId;
+    const isSelf = typeof options === "object" && options !== null ? (options.isSelf ?? true) : true;
+    if (scopeId !== undefined && !isValidResourceId(scopeId)) return false;
+    const isAdmin = Boolean(currentUser.isAdmin);
+    const subject = resolveTargetSubject(scopeId);
+    if (scopeId !== undefined && !isAdmin && !subject) return false;
+    if (policy) {
+      return policy.canReadAttribute(subject, key, { isSystemAdmin: isAdmin, isSelf });
+    }
+    return isAdmin || isSelf;
+  }
+
+  /**
+   * Checks whether the current user can write `key` on `attributes` (either unscoped or within `scopeId`).
+   */
+  function canWriteAttribute(key: (keyof TAttributes & string) | string, scopeId?: string): boolean {
+    const currentUser = authStoreInternal.get().user;
+    if (!currentUser) return false;
+    if (scopeId !== undefined && !isValidResourceId(scopeId)) return false;
+    const isAdmin = Boolean(currentUser.isAdmin);
+    const subject = resolveTargetSubject(scopeId);
+    if (!policy) return isAdmin;
+    return policy.canWriteAttribute(subject, key, isAdmin);
+  }
+
+  /**
+   * Checks whether the current user can read `key` on `hiddenAttributes` (either unscoped or within `scopeId`).
+   * Self-ownership never grants read access to `hiddenAttributes`.
+   */
+  function canReadHiddenAttribute(key: string, scopeId?: string): boolean {
+    const currentUser = authStoreInternal.get().user;
+    if (!currentUser) return false;
+    if (scopeId !== undefined && !isValidResourceId(scopeId)) return false;
+    const isAdmin = Boolean(currentUser.isAdmin);
+    const subject = resolveTargetSubject(scopeId);
+    if (!policy) return isAdmin;
+    return policy.canReadHiddenAttribute(subject, key, isAdmin);
+  }
+
+  /**
+   * Checks whether the current user can write `key` on `hiddenAttributes` (either unscoped or within `scopeId`).
+   * Self-ownership never grants write access to `hiddenAttributes`.
+   */
+  function canWriteHiddenAttribute(key: string, scopeId?: string): boolean {
+    const currentUser = authStoreInternal.get().user;
+    if (!currentUser) return false;
+    if (scopeId !== undefined && !isValidResourceId(scopeId)) return false;
+    const isAdmin = Boolean(currentUser.isAdmin);
+    const subject = resolveTargetSubject(scopeId);
+    if (!policy) return isAdmin;
+    return policy.canWriteHiddenAttribute(subject, key, isAdmin);
+  }
+
+  /**
+   * Checks whether the current user can write/clear `key` on write-only encrypted `secrets`
+   * (either unscoped or within `scopeId`).
+   * Defaults `isSelf: true` when checking user/member-owned secrets; pass `{ scopeId, isSelf: false }`
+   * when checking shared scope-level secrets (e.g. workspace BYOK API keys) or another user's secrets.
+   */
+  function canWriteSecret(key: string, options?: string | { scopeId?: string; isSelf?: boolean }): boolean {
+    const currentUser = authStoreInternal.get().user;
+    if (!currentUser) return false;
+    const scopeId = typeof options === "string" ? options : options?.scopeId;
+    const isSelf = typeof options === "object" && options !== null ? (options.isSelf ?? true) : true;
+    if (scopeId !== undefined && !isValidResourceId(scopeId)) return false;
+    const isAdmin = Boolean(currentUser.isAdmin);
+    const subject = resolveTargetSubject(scopeId);
+    if (scopeId !== undefined && !isAdmin && !subject) return false;
+    if (policy) {
+      return policy.canWriteSecret(subject, key, { isSystemAdmin: isAdmin, isSelf });
+    }
+    return isAdmin || isSelf;
+  }
+
   // --- Presence Tracking (5-minute localStorage-throttled) ---
 
   function getPresenceKeys(uid: string, scopeId?: string) {
@@ -957,6 +1042,11 @@ export function createLanyardClient<
     hasAllCapabilities,
     getAttributes,
     getPreferences,
+    canReadAttribute,
+    canWriteAttribute,
+    canReadHiddenAttribute,
+    canWriteHiddenAttribute,
+    canWriteSecret,
     recordActivity,
     getPresenceStatus,
     syncPresence,

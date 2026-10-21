@@ -4,9 +4,11 @@ import {
   sanitizeAvatarUrl,
   type LanyardServerStore,
   type ScopedMember,
+  type SecretCipher,
   type SystemAdminProfile,
   type UserRecord
 } from "../core/index.js";
+import { createSecretCipher, isEncryptedSecretData } from "./encryption.js";
 
 const FORBIDDEN_KEYS = new Set(["__proto__", "constructor", "prototype"]);
 
@@ -51,6 +53,13 @@ export interface FirestoreServerStoreConfig<TRole extends string = string> {
   usersCollection?: string;
   scopeCollection?: string;
   membersSubcollection?: string;
+  /**
+   * Master encryption key used to encrypt and decrypt write-only secrets at rest (`private/secrets`)
+   * with AES-256-GCM. Defaults to `process.env.MASTER_ENCRYPTION_KEY` if set.
+   */
+  encryptionKey?: string;
+  /** Optional custom `SecretCipher` instance (overrides `encryptionKey`). */
+  cipher?: SecretCipher;
 }
 
 /**
@@ -58,22 +67,23 @@ export interface FirestoreServerStoreConfig<TRole extends string = string> {
  *
  * Uses a single canonical `users/{uid}` collection for profile, presence, `isSystemAdmin`,
  * single-tenant `role`/`capabilities`, `preferences`, and `attributes`, plus isolated
- * `private/secrets` subdocuments (`users/{uid}/private/secrets` and
- * `{scopeCollection}/{scopeId}/{membersSubcollection}/{uid}/private/secrets`).
+ * `private/hiddenAttributes` and AES-256-GCM encrypted `private/secrets` subdocuments.
  */
 export class FirestoreServerStore<
   TRole extends string = string,
   TCapability extends string = string,
   TPreferences extends Record<string, any> = Record<string, any>,
   TAttributes extends Record<string, any> = Record<string, any>,
+  THiddenAttributes extends Record<string, any> = Record<string, any>,
   TSecrets extends Record<string, any> = Record<string, any>
-> implements LanyardServerStore<TRole, TCapability, TPreferences, TAttributes, TSecrets> {
+> implements LanyardServerStore<TRole, TCapability, TPreferences, TAttributes, THiddenAttributes, TSecrets> {
   private readonly db: Firestore;
   private readonly defaultRole: TRole;
   private readonly resolveRole?: (data: Record<string, any>) => TRole;
   private readonly usersCollection: string;
   private readonly scopeCollection: string;
   private readonly membersSubcollection: string;
+  private readonly cipher?: SecretCipher;
 
   constructor(config: FirestoreServerStoreConfig<TRole>) {
     this.db = config.db;
@@ -84,6 +94,18 @@ export class FirestoreServerStore<
     this.membersSubcollection = assertValidFirestoreDocId(
       config.membersSubcollection || "members",
       "membersSubcollection"
+    );
+    const key = config.encryptionKey || process.env.MASTER_ENCRYPTION_KEY;
+    this.cipher = config.cipher ?? (key ? createSecretCipher(key) : undefined);
+  }
+
+  private requireCipher(): SecretCipher {
+    if (this.cipher) return this.cipher;
+    if (process.env.MASTER_ENCRYPTION_KEY) {
+      return createSecretCipher(process.env.MASTER_ENCRYPTION_KEY);
+    }
+    throw new Error(
+      "Cannot encrypt or decrypt secrets: configure 'encryptionKey', 'cipher', or MASTER_ENCRYPTION_KEY on FirestoreServerStore."
     );
   }
 
@@ -99,6 +121,11 @@ export class FirestoreServerStore<
     return this.db.doc(`${this.usersCollection}/${cleanUid}`);
   }
 
+  private userHiddenAttributesDocRef(uid: string) {
+    const cleanUid = assertValidFirestoreDocId(uid, "uid");
+    return this.db.doc(`${this.usersCollection}/${cleanUid}/private/hiddenAttributes`);
+  }
+
   private userSecretsDocRef(uid: string) {
     const cleanUid = assertValidFirestoreDocId(uid, "uid");
     return this.db.doc(`${this.usersCollection}/${cleanUid}/private/secrets`);
@@ -110,12 +137,74 @@ export class FirestoreServerStore<
     return this.db.doc(`${this.scopeCollection}/${cleanScopeId}/${this.membersSubcollection}/${cleanUid}`);
   }
 
+  private memberHiddenAttributesDocRef(scopeId: string, uid: string) {
+    const cleanScopeId = assertValidFirestoreDocId(scopeId, "scopeId");
+    const cleanUid = assertValidFirestoreDocId(uid, "uid");
+    return this.db.doc(
+      `${this.scopeCollection}/${cleanScopeId}/${this.membersSubcollection}/${cleanUid}/private/hiddenAttributes`
+    );
+  }
+
   private memberSecretsDocRef(scopeId: string, uid: string) {
     const cleanScopeId = assertValidFirestoreDocId(scopeId, "scopeId");
     const cleanUid = assertValidFirestoreDocId(uid, "uid");
     return this.db.doc(
       `${this.scopeCollection}/${cleanScopeId}/${this.membersSubcollection}/${cleanUid}/private/secrets`
     );
+  }
+
+  private scopeSecretsDocRef(scopeId: string) {
+    const cleanScopeId = assertValidFirestoreDocId(scopeId, "scopeId");
+    return this.db.doc(`${this.scopeCollection}/${cleanScopeId}/private/secrets`);
+  }
+
+  private parseSecretsStatusFromDocData(data: Record<string, any>): Partial<Record<keyof TSecrets & string, boolean>> {
+    const status: Record<string, boolean> = {};
+    for (const [k, v] of Object.entries(data)) {
+      if (FORBIDDEN_KEYS.has(k) || k === "updatedAt") continue;
+      status[k] = isEncryptedSecretData(v) || (typeof v === "string" && v.length > 0);
+    }
+    return status as Partial<Record<keyof TSecrets & string, boolean>>;
+  }
+
+  private decryptSecretsFromDocData(data: Record<string, any>): Partial<Record<keyof TSecrets & string, string>> {
+    const out: Record<string, string> = {};
+    const entries = Object.entries(data).filter(([k]) => !FORBIDDEN_KEYS.has(k) && k !== "updatedAt");
+    if (entries.length === 0) return out as Partial<Record<keyof TSecrets & string, string>>;
+    const cipher = this.requireCipher();
+    for (const [k, v] of entries) {
+      if (isEncryptedSecretData(v)) {
+        out[k] = cipher.decrypt(v);
+      } else if (typeof v === "string" && v.length > 0) {
+        out[k] = v;
+      }
+    }
+    return out as Partial<Record<keyof TSecrets & string, string>>;
+  }
+
+  private async writeEncryptedSecretsToRef(
+    ref: FirebaseFirestore.DocumentReference,
+    patch: Partial<Record<keyof TSecrets & string, string | null>>
+  ): Promise<Partial<Record<keyof TSecrets & string, boolean>>> {
+    if (!patch || typeof patch !== "object" || Array.isArray(patch)) {
+      const snap = await ref.get();
+      return snap.exists ? this.parseSecretsStatusFromDocData(snap.data() || {}) : {};
+    }
+    const cipher = this.requireCipher();
+    const firestorePayload: Record<string, any> = {};
+    for (const [k, v] of Object.entries(patch)) {
+      if (FORBIDDEN_KEYS.has(k) || v === undefined) continue;
+      if (v === null || v === "") {
+        firestorePayload[k] = FieldValue.delete();
+      } else if (typeof v === "string") {
+        firestorePayload[k] = cipher.encrypt(v);
+      }
+    }
+    if (Object.keys(firestorePayload).length > 0) {
+      await ref.set(firestorePayload, { merge: true });
+    }
+    const snap = await ref.get();
+    return snap.exists ? this.parseSecretsStatusFromDocData(snap.data() || {}) : {};
   }
 
   private parseUserRecord(
@@ -182,17 +271,40 @@ export class FirestoreServerStore<
     return (await this.getUser(cleanUid))!;
   }
 
-  async getUserSecrets(uid: string): Promise<Partial<TSecrets>> {
-    const snap = await this.userSecretsDocRef(uid).get();
+  async getUserHiddenAttributes(uid: string): Promise<Partial<THiddenAttributes>> {
+    const snap = await this.userHiddenAttributesDocRef(uid).get();
     if (!snap.exists) return {};
-    return sanitizeObjectPatch<TSecrets>(snap.data() || {});
+    return sanitizeObjectPatch<THiddenAttributes>(snap.data() || {});
   }
 
-  async updateUserSecrets(uid: string, patch: Partial<TSecrets>): Promise<Partial<TSecrets>> {
-    const ref = this.userSecretsDocRef(uid);
-    const cleanPatch = sanitizeObjectPatch<TSecrets>(patch);
+  async updateUserHiddenAttributes(
+    uid: string,
+    patch: Partial<THiddenAttributes>
+  ): Promise<Partial<THiddenAttributes>> {
+    const ref = this.userHiddenAttributesDocRef(uid);
+    const cleanPatch = sanitizeObjectPatch<THiddenAttributes>(patch);
     await ref.set(cleanPatch, { merge: true });
-    return this.getUserSecrets(uid);
+    return this.getUserHiddenAttributes(uid);
+  }
+
+  async getUserSecrets(uid: string): Promise<Partial<Record<keyof TSecrets & string, string>>> {
+    const snap = await this.userSecretsDocRef(uid).get();
+    if (!snap.exists) return {};
+    return this.decryptSecretsFromDocData(snap.data() || {});
+  }
+
+  async getUserSecretsStatus(uid: string): Promise<Partial<Record<keyof TSecrets & string, boolean>>> {
+    const snap = await this.userSecretsDocRef(uid).get();
+    if (!snap.exists) return {};
+    return this.parseSecretsStatusFromDocData(snap.data() || {});
+  }
+
+  async updateUserSecrets(
+    uid: string,
+    patch: Partial<Record<keyof TSecrets & string, string | null>>
+  ): Promise<Partial<Record<keyof TSecrets & string, boolean>>> {
+    const ref = this.userSecretsDocRef(uid);
+    return this.writeEncryptedSecretsToRef(ref, patch);
   }
 
   async grantUserCapabilities(
@@ -390,17 +502,65 @@ export class FirestoreServerStore<
     return (await this.getScopeMember(cleanScopeId, cleanUid))!;
   }
 
-  async getScopeMemberSecrets(scopeId: string, uid: string): Promise<Partial<TSecrets>> {
-    const snap = await this.memberSecretsDocRef(scopeId, uid).get();
+  async getScopeMemberHiddenAttributes(scopeId: string, uid: string): Promise<Partial<THiddenAttributes>> {
+    const snap = await this.memberHiddenAttributesDocRef(scopeId, uid).get();
     if (!snap.exists) return {};
-    return sanitizeObjectPatch<TSecrets>(snap.data() || {});
+    return sanitizeObjectPatch<THiddenAttributes>(snap.data() || {});
   }
 
-  async updateScopeMemberSecrets(scopeId: string, uid: string, patch: Partial<TSecrets>): Promise<Partial<TSecrets>> {
-    const ref = this.memberSecretsDocRef(scopeId, uid);
-    const cleanPatch = sanitizeObjectPatch<TSecrets>(patch);
+  async updateScopeMemberHiddenAttributes(
+    scopeId: string,
+    uid: string,
+    patch: Partial<THiddenAttributes>
+  ): Promise<Partial<THiddenAttributes>> {
+    const ref = this.memberHiddenAttributesDocRef(scopeId, uid);
+    const cleanPatch = sanitizeObjectPatch<THiddenAttributes>(patch);
     await ref.set(cleanPatch, { merge: true });
-    return this.getScopeMemberSecrets(scopeId, uid);
+    return this.getScopeMemberHiddenAttributes(scopeId, uid);
+  }
+
+  async getScopeMemberSecrets(scopeId: string, uid: string): Promise<Partial<Record<keyof TSecrets & string, string>>> {
+    const snap = await this.memberSecretsDocRef(scopeId, uid).get();
+    if (!snap.exists) return {};
+    return this.decryptSecretsFromDocData(snap.data() || {});
+  }
+
+  async getScopeMemberSecretsStatus(
+    scopeId: string,
+    uid: string
+  ): Promise<Partial<Record<keyof TSecrets & string, boolean>>> {
+    const snap = await this.memberSecretsDocRef(scopeId, uid).get();
+    if (!snap.exists) return {};
+    return this.parseSecretsStatusFromDocData(snap.data() || {});
+  }
+
+  async updateScopeMemberSecrets(
+    scopeId: string,
+    uid: string,
+    patch: Partial<Record<keyof TSecrets & string, string | null>>
+  ): Promise<Partial<Record<keyof TSecrets & string, boolean>>> {
+    const ref = this.memberSecretsDocRef(scopeId, uid);
+    return this.writeEncryptedSecretsToRef(ref, patch);
+  }
+
+  async getScopeSecrets(scopeId: string): Promise<Partial<Record<keyof TSecrets & string, string>>> {
+    const snap = await this.scopeSecretsDocRef(scopeId).get();
+    if (!snap.exists) return {};
+    return this.decryptSecretsFromDocData(snap.data() || {});
+  }
+
+  async getScopeSecretsStatus(scopeId: string): Promise<Partial<Record<keyof TSecrets & string, boolean>>> {
+    const snap = await this.scopeSecretsDocRef(scopeId).get();
+    if (!snap.exists) return {};
+    return this.parseSecretsStatusFromDocData(snap.data() || {});
+  }
+
+  async updateScopeSecrets(
+    scopeId: string,
+    patch: Partial<Record<keyof TSecrets & string, string | null>>
+  ): Promise<Partial<Record<keyof TSecrets & string, boolean>>> {
+    const ref = this.scopeSecretsDocRef(scopeId);
+    return this.writeEncryptedSecretsToRef(ref, patch);
   }
 
   async grantScopeCapabilities(
@@ -445,6 +605,9 @@ export class FirestoreServerStore<
   }
 
   async deleteScopeMember(scopeId: string, uid: string): Promise<void> {
+    await this.memberHiddenAttributesDocRef(scopeId, uid)
+      .delete()
+      .catch(() => {});
     await this.memberSecretsDocRef(scopeId, uid)
       .delete()
       .catch(() => {});

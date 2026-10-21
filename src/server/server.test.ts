@@ -3,8 +3,12 @@ import { createPermissionPolicy, InMemoryLanyardStore } from "../core/index.js";
 import {
   assertNotProduction,
   createLanyardServer,
+  createSecretCipher,
+  decryptSecret,
+  encryptSecret,
   FakeAuthService,
   GoogleAuthService,
+  isEncryptedSecretData,
   type AdminAuthAdapter
 } from "./index.js";
 import { FirestoreServerStore } from "./firestore.js";
@@ -1135,9 +1139,16 @@ describe("lanyard/server unit tests", () => {
     expect(resUserRole.statusCode).toBe(403);
   });
 
-  it("enforces single-tenant roles/capabilities, field-level attributes/secrets permissions, and strict cross-tenant isolation", async () => {
+  it("enforces single-tenant roles/capabilities, field-level attributes/hiddenAttributes/secrets permissions, and strict cross-tenant isolation", async () => {
     type AppRole = "attendee" | "scanner" | "auditor" | "moderator" | "tenant_owner";
-    type AppCap = "write:points" | "write:badges" | "read:tier" | "write:tier" | "read:notes" | "write:notes";
+    type AppCap =
+      | "write:points"
+      | "write:badges"
+      | "read:tier"
+      | "write:tier"
+      | "read:notes"
+      | "write:notes"
+      | "write:ai_keys";
 
     interface AppPrefs {
       optIn: boolean;
@@ -1147,9 +1158,13 @@ describe("lanyard/server unit tests", () => {
       awardedBadges: string[];
       vipTier: string;
     }
-    interface AppSecrets {
+    interface AppHiddenAttrs {
       moderatorNotes: string;
       superAdminSecret: string;
+    }
+    interface AppSecrets {
+      geminiKey: string;
+      openaiKey: string;
     }
 
     const policy = createPermissionPolicy<AppRole, AppCap>({
@@ -1160,7 +1175,7 @@ describe("lanyard/server unit tests", () => {
         moderator: {
           weight: 30,
           inherits: ["scanner", "auditor"],
-          capabilities: ["write:badges", "write:tier", "write:notes"]
+          capabilities: ["write:badges", "write:tier", "write:notes", "write:ai_keys"]
         },
         tenant_owner: {
           weight: 40,
@@ -1173,14 +1188,18 @@ describe("lanyard/server unit tests", () => {
         awardedBadges: "write:badges",
         vipTier: { read: "read:tier", write: "write:tier" }
       },
-      secretCapabilities: {
+      hiddenAttributeCapabilities: {
         moderatorNotes: { read: "read:notes", write: "write:notes" }
+      },
+      secretCapabilities: {
+        geminiKey: { allowSelfWrite: true },
+        openaiKey: { write: "write:ai_keys", allowSelfWrite: false }
       }
     });
 
     const adminAuth = createFakeAdminAuth();
-    const store = new InMemoryLanyardStore<AppRole, AppCap, AppPrefs, AppAttrs, AppSecrets>();
-    const server = createLanyardServer<AppRole, AppCap, AppPrefs, AppAttrs, AppSecrets>({
+    const store = new InMemoryLanyardStore<AppRole, AppCap, AppPrefs, AppAttrs, AppHiddenAttrs, AppSecrets>();
+    const server = createLanyardServer<AppRole, AppCap, AppPrefs, AppAttrs, AppHiddenAttrs, AppSecrets>({
       adminAuth,
       store,
       policy,
@@ -1297,29 +1316,29 @@ describe("lanyard/server unit tests", () => {
       vipTier: "gold"
     });
 
-    // 3. Global User Secrets:
+    // 3. Global User HiddenAttributes:
     // - Moderator writes moderatorNotes; SystemAdmin writes superAdminSecret
-    await server.updateUserSecretsAs({
+    await server.updateUserHiddenAttributesAs({
       actorUid: moderator.uid,
       targetUid: attendee.uid,
       patch: { moderatorNotes: "Verified ID at booth" }
     });
-    await server.updateUserSecretsAs({
+    await server.updateUserHiddenAttributesAs({
       actorUid: "root-admin",
       isSystemAdmin: true,
       targetUid: attendee.uid,
       patch: { superAdminSecret: "classified-flag" }
     });
 
-    // - Self (`attendee`) CANNOT read or write their own secrets!
+    // - Self (`attendee`) CANNOT read or write their own hiddenAttributes!
     await expect(
-      server.readUserSecretsAs({
+      server.readUserHiddenAttributesAs({
         actorUid: attendee.uid,
         targetUid: attendee.uid
       })
     ).rejects.toThrow(/Forbidden/);
     await expect(
-      server.updateUserSecretsAs({
+      server.updateUserHiddenAttributesAs({
         actorUid: attendee.uid,
         targetUid: attendee.uid,
         patch: { moderatorNotes: "I am totally trustworthy" }
@@ -1328,23 +1347,23 @@ describe("lanyard/server unit tests", () => {
 
     // - Auditor can read `moderatorNotes` (redacting `superAdminSecret`), and CANNOT write `moderatorNotes`
     expect(
-      await server.readUserSecretsAs({
+      await server.readUserHiddenAttributesAs({
         actorUid: auditor.uid,
         targetUid: attendee.uid
       })
     ).toEqual({ moderatorNotes: "Verified ID at booth" });
 
     await expect(
-      server.updateUserSecretsAs({
+      server.updateUserHiddenAttributesAs({
         actorUid: auditor.uid,
         targetUid: attendee.uid,
         patch: { moderatorNotes: "Tampered by auditor" }
       })
     ).rejects.toThrow(/Forbidden/);
 
-    // - System Admin reads all secrets unredacted
+    // - System Admin reads all hiddenAttributes unredacted
     expect(
-      await server.readUserSecretsAs({
+      await server.readUserHiddenAttributesAs({
         actorUid: "root-admin",
         isSystemAdmin: true,
         targetUid: attendee.uid
@@ -1354,7 +1373,49 @@ describe("lanyard/server unit tests", () => {
       superAdminSecret: "classified-flag"
     });
 
-    // 4. STRICT CROSS-TENANT ISOLATION:
+    // 4. Write-Only Encrypted User & Scope Secrets:
+    // - Self (`attendee`) CAN write `geminiKey` (`allowSelfWrite: true`), receives boolean status, and server decrypts it
+    const userSecretStatus = await server.updateUserSecretsAs({
+      actorUid: attendee.uid,
+      targetUid: attendee.uid,
+      patch: { geminiKey: "AIzaSyPersonal123" }
+    });
+    expect(userSecretStatus).toEqual({ geminiKey: true });
+    expect(
+      await server.getUserSecretsStatusAs({
+        actorUid: attendee.uid,
+        targetUid: attendee.uid
+      })
+    ).toEqual({ geminiKey: true });
+    expect(await server.getDecryptedUserSecrets(attendee.uid)).toEqual({ geminiKey: "AIzaSyPersonal123" });
+
+    // - Self (`attendee`) CANNOT write `openaiKey` because `allowSelfWrite: false` and they lack `write:ai_keys`
+    await expect(
+      server.updateUserSecretsAs({
+        actorUid: attendee.uid,
+        targetUid: attendee.uid,
+        patch: { openaiKey: "sk-proj-unauthorized" }
+      })
+    ).rejects.toThrow(/Forbidden/);
+
+    // - Moderator (holding `write:ai_keys`) CAN write `openaiKey` and clear `geminiKey` with ""
+    expect(
+      await server.updateUserSecretsAs({
+        actorUid: moderator.uid,
+        targetUid: attendee.uid,
+        patch: { openaiKey: "sk-proj-mod123" }
+      })
+    ).toEqual({ geminiKey: true, openaiKey: true });
+    expect(
+      await server.updateUserSecretsAs({
+        actorUid: attendee.uid,
+        targetUid: attendee.uid,
+        patch: { geminiKey: "" }
+      })
+    ).toEqual({ openaiKey: true });
+    expect(await server.getDecryptedUserSecrets(attendee.uid)).toEqual({ openaiKey: "sk-proj-mod123" });
+
+    // 5. STRICT CROSS-TENANT ISOLATION:
     // Make `tenantOwnerA` a `tenant_owner` (with wildcard capabilities: "*") in `tenant-A` ONLY.
     const tenantOwnerA = await server.upsertScopeMemberByEmail({
       scopeId: "tenant-A",
@@ -1374,32 +1435,50 @@ describe("lanyard/server unit tests", () => {
       role: "attendee",
       attributes: { pointsAllTime: 10, awardedBadges: [], vipTier: "bronze" }
     });
-    await store.updateScopeMemberSecrets("tenant-B", attendee.uid, {
+    await store.updateScopeMemberHiddenAttributes("tenant-B", attendee.uid, {
       moderatorNotes: "Tenant B confidential note"
     });
+    await store.updateScopeSecrets("tenant-B", {
+      openaiKey: "sk-tenant-B-key"
+    });
 
-    // (a) `tenantOwnerA` can update attributes & secrets inside `tenant-A`:
+    // (a) `tenantOwnerA` can update attributes, hiddenAttributes, and scope secrets inside `tenant-A`:
     await server.updateScopeMemberAttributesAs({
       scopeId: "tenant-A",
       actorUid: tenantOwnerA.uid,
       targetUid: attendee.uid,
       patch: { pointsAllTime: 500 }
     });
-    await server.updateScopeMemberSecretsAs({
+    await server.updateScopeMemberHiddenAttributesAs({
       scopeId: "tenant-A",
       actorUid: tenantOwnerA.uid,
       targetUid: attendee.uid,
       patch: { moderatorNotes: "Tenant A note" }
     });
     expect(
-      await server.readScopeMemberSecretsAs({
+      await server.readScopeMemberHiddenAttributesAs({
         scopeId: "tenant-A",
         actorUid: tenantOwnerA.uid,
         targetUid: attendee.uid
       })
     ).toEqual({ moderatorNotes: "Tenant A note" });
 
-    // (b) `tenantOwnerA` CANNOT monkey with `tenant-B` attributes or secrets!
+    expect(
+      await server.updateScopeSecretsAs({
+        scopeId: "tenant-A",
+        actorUid: tenantOwnerA.uid,
+        patch: { openaiKey: "sk-tenant-A-key" }
+      })
+    ).toEqual({ openaiKey: true });
+    expect(
+      await server.getScopeSecretsStatusAs({
+        scopeId: "tenant-A",
+        actorUid: attendee.uid
+      })
+    ).toEqual({ openaiKey: true });
+    expect(await server.getDecryptedScopeSecrets("tenant-A")).toEqual({ openaiKey: "sk-tenant-A-key" });
+
+    // (b) `tenantOwnerA` CANNOT monkey with `tenant-B` attributes, hiddenAttributes, or secrets!
     await expect(
       server.updateScopeMemberAttributesAs({
         scopeId: "tenant-B",
@@ -1410,7 +1489,7 @@ describe("lanyard/server unit tests", () => {
     ).rejects.toThrow(/Forbidden/);
 
     await expect(
-      server.readScopeMemberSecretsAs({
+      server.readScopeMemberHiddenAttributesAs({
         scopeId: "tenant-B",
         actorUid: tenantOwnerA.uid,
         targetUid: attendee.uid
@@ -1418,7 +1497,7 @@ describe("lanyard/server unit tests", () => {
     ).rejects.toThrow(/Forbidden/);
 
     await expect(
-      server.updateScopeMemberSecretsAs({
+      server.updateScopeMemberHiddenAttributesAs({
         scopeId: "tenant-B",
         actorUid: tenantOwnerA.uid,
         targetUid: attendee.uid,
@@ -1426,7 +1505,22 @@ describe("lanyard/server unit tests", () => {
       })
     ).rejects.toThrow(/Forbidden/);
 
-    // (c) `tenantOwnerA` CANNOT monkey with global `users/{attendee.uid}` attributes or secrets!
+    await expect(
+      server.getScopeSecretsStatusAs({
+        scopeId: "tenant-B",
+        actorUid: tenantOwnerA.uid
+      })
+    ).rejects.toThrow(/Forbidden/);
+
+    await expect(
+      server.updateScopeSecretsAs({
+        scopeId: "tenant-B",
+        actorUid: tenantOwnerA.uid,
+        patch: { openaiKey: "sk-sabotage" }
+      })
+    ).rejects.toThrow(/Forbidden/);
+
+    // (c) `tenantOwnerA` CANNOT monkey with global `users/{attendee.uid}` attributes, hiddenAttributes, or secrets!
     await expect(
       server.updateUserAttributesAs({
         actorUid: tenantOwnerA.uid,
@@ -1436,9 +1530,17 @@ describe("lanyard/server unit tests", () => {
     ).rejects.toThrow(/Forbidden/);
 
     await expect(
-      server.readUserSecretsAs({
+      server.readUserHiddenAttributesAs({
         actorUid: tenantOwnerA.uid,
         targetUid: attendee.uid
+      })
+    ).rejects.toThrow(/Forbidden/);
+
+    await expect(
+      server.updateUserHiddenAttributesAs({
+        actorUid: tenantOwnerA.uid,
+        targetUid: attendee.uid,
+        patch: { moderatorNotes: "Global sabotage" }
       })
     ).rejects.toThrow(/Forbidden/);
 
@@ -1446,12 +1548,12 @@ describe("lanyard/server unit tests", () => {
       server.updateUserSecretsAs({
         actorUid: tenantOwnerA.uid,
         targetUid: attendee.uid,
-        patch: { moderatorNotes: "Global sabotage" }
+        patch: { openaiKey: "sk-global-sabotage" }
       })
     ).rejects.toThrow(/Forbidden/);
   });
 
-  it("tests FirestoreServerStore unified users/{uid}, private/secrets subdocuments, and admin demotion preservation", async () => {
+  it("tests FirestoreServerStore unified users/{uid}, private/hiddenAttributes, AES-256-GCM encrypted private/secrets, and admin demotion preservation", async () => {
     const docs = new Map<string, Record<string, any>>();
     const fakeDb: any = {
       doc(path: string) {
@@ -1466,8 +1568,15 @@ describe("lanyard/server unit tests", () => {
             };
           },
           async set(payload: Record<string, any>, options?: { merge?: boolean }) {
-            const current = options?.merge ? docs.get(path) || {} : {};
-            docs.set(path, { ...current, ...payload });
+            const current = options?.merge ? { ...(docs.get(path) || {}) } : {};
+            for (const [k, v] of Object.entries(payload)) {
+              if (v && typeof v === "object" && v.constructor?.name?.includes("Delete")) {
+                delete current[k];
+              } else {
+                current[k] = v;
+              }
+            }
+            docs.set(path, current);
           },
           async delete() {
             docs.delete(path);
@@ -1515,13 +1624,27 @@ describe("lanyard/server unit tests", () => {
       TestCap,
       { theme: string },
       { pointsAllTime: number },
-      { note: string }
+      { note: string },
+      { geminiKey: string; openaiKey: string }
     >({
       db: fakeDb,
-      defaultRole: "member"
+      defaultRole: "member",
+      encryptionKey: "test-master-encryption-key-for-lanyard"
     });
 
-    // 1. UserRecord + attributes + secrets + admin status on users/{uid} and users/{uid}/private/secrets
+    // 1. Direct AES-256-GCM cipher helper verification
+    const cipher = createSecretCipher("test-master-encryption-key-for-lanyard");
+    const encrypted = encryptSecret("AIzaSyDirectTest", "test-master-encryption-key-for-lanyard");
+    expect(isEncryptedSecretData(encrypted)).toBe(true);
+    expect(encrypted.ciphertext).not.toContain("AIzaSyDirectTest");
+    expect(decryptSecret(encrypted, "test-master-encryption-key-for-lanyard")).toBe("AIzaSyDirectTest");
+    expect(() => createSecretCipher("   ")).toThrow(/non-empty master encryption key/);
+    expect(() => decryptSecret({ ciphertext: "bad" } as any, "test-master-encryption-key-for-lanyard")).toThrow(
+      /Invalid encrypted secret payload/
+    );
+    expect(cipher.decrypt(cipher.encrypt("roundtrip-secret"))).toBe("roundtrip-secret");
+
+    // 2. UserRecord + attributes + hiddenAttributes + encrypted secrets on users/{uid}, private/hiddenAttributes, and private/secrets
     await fsStore.upsertUser({
       uid: "u-1",
       email: "u1@example.com",
@@ -1532,15 +1655,35 @@ describe("lanyard/server unit tests", () => {
       attributes: { pointsAllTime: 100 }
     });
     await fsStore.updateUserAttributes("u-1", { pointsAllTime: 250 });
-    await fsStore.updateUserSecrets("u-1", { note: "Top secret" });
+    await fsStore.updateUserHiddenAttributes("u-1", { note: "Top secret" });
+    const statusAfterWrite = await fsStore.updateUserSecrets("u-1", {
+      geminiKey: "AIzaSyLiveKey999",
+      openaiKey: "sk-proj-live999"
+    });
 
     expect(docs.get("users/u-1")?.attributes).toEqual({ pointsAllTime: 250 });
-    expect(docs.get("users/u-1")?.note).toBeUndefined(); // Secrets are NEVER stored on users/{uid}!
-    expect(docs.get("users/u-1/private/secrets")).toEqual({ note: "Top secret" });
-    expect(await fsStore.getUserSecrets("u-1")).toEqual({ note: "Top secret" });
+    expect(docs.get("users/u-1")?.note).toBeUndefined();
+    expect(docs.get("users/u-1")?.geminiKey).toBeUndefined();
+    expect(docs.get("users/u-1/private/hiddenAttributes")).toEqual({ note: "Top secret" });
+    expect(await fsStore.getUserHiddenAttributes("u-1")).toEqual({ note: "Top secret" });
+
+    // Verify raw Firestore `users/u-1/private/secrets` document stores AES-256-GCM `{ ciphertext, iv, tag }`, NEVER plaintext!
+    const rawUserSecretsDoc = docs.get("users/u-1/private/secrets");
+    expect(isEncryptedSecretData(rawUserSecretsDoc?.geminiKey)).toBe(true);
+    expect(JSON.stringify(rawUserSecretsDoc)).not.toContain("AIzaSyLiveKey999");
+    expect(statusAfterWrite).toEqual({ geminiKey: true, openaiKey: true });
+    expect(await fsStore.getUserSecretsStatus("u-1")).toEqual({ geminiKey: true, openaiKey: true });
+    expect(await fsStore.getUserSecrets("u-1")).toEqual({
+      geminiKey: "AIzaSyLiveKey999",
+      openaiKey: "sk-proj-live999"
+    });
+
+    // Clearing `openaiKey` with `""` deletes the field via FieldValue.delete()
+    expect(await fsStore.updateUserSecrets("u-1", { openaiKey: "" })).toEqual({ geminiKey: true });
+    expect(await fsStore.getUserSecrets("u-1")).toEqual({ geminiKey: "AIzaSyLiveKey999" });
     expect(await fsStore.listSystemAdmins()).toHaveLength(1);
 
-    // 2. Demoting admin via deleteSystemAdmin sets isSystemAdmin: false on users/u-1 while keeping attributes & preferences
+    // 3. Demoting admin via deleteSystemAdmin sets isSystemAdmin: false on users/u-1 while keeping attributes & preferences
     await fsStore.deleteSystemAdmin("u-1");
     expect(await fsStore.getSystemAdmin("u-1")).toBeNull();
     expect(await fsStore.listSystemAdmins()).toHaveLength(0);
@@ -1549,7 +1692,7 @@ describe("lanyard/server unit tests", () => {
     expect(afterDemote?.attributes).toEqual({ pointsAllTime: 250 });
     expect(afterDemote?.preferences).toEqual({ theme: "dark" });
 
-    // 3. Scoped member attributes & private/secrets subdocument lifecycle
+    // 4. Scoped member attributes, private/hiddenAttributes, private/secrets, and scope-level private/secrets lifecycle
     await fsStore.upsertScopeMember("ws-1", {
       uid: "u-1",
       email: "u1@example.com",
@@ -1557,16 +1700,35 @@ describe("lanyard/server unit tests", () => {
       capabilities: []
     });
     await fsStore.updateScopeMemberAttributes("ws-1", "u-1", { pointsAllTime: 77 });
-    await fsStore.updateScopeMemberSecrets("ws-1", "u-1", { note: "Workspace secret" });
+    await fsStore.updateScopeMemberHiddenAttributes("ws-1", "u-1", { note: "Workspace note" });
+    await fsStore.updateScopeMemberSecrets("ws-1", "u-1", { geminiKey: "AIzaSyMemberSecret" });
+    await fsStore.updateScopeSecrets("ws-1", { openaiKey: "sk-workspace-shared" });
 
     expect(docs.get("workspaces/ws-1/members/u-1")?.attributes).toEqual({ pointsAllTime: 77 });
-    expect(docs.get("workspaces/ws-1/members/u-1/private/secrets")).toEqual({ note: "Workspace secret" });
-    expect(await fsStore.getScopeMemberSecrets("ws-1", "u-1")).toEqual({ note: "Workspace secret" });
+    expect(docs.get("workspaces/ws-1/members/u-1/private/hiddenAttributes")).toEqual({ note: "Workspace note" });
+    expect(await fsStore.getScopeMemberHiddenAttributes("ws-1", "u-1")).toEqual({ note: "Workspace note" });
+    expect(isEncryptedSecretData(docs.get("workspaces/ws-1/members/u-1/private/secrets")?.geminiKey)).toBe(true);
+    expect(await fsStore.getScopeMemberSecretsStatus("ws-1", "u-1")).toEqual({ geminiKey: true });
+    expect(await fsStore.getScopeMemberSecrets("ws-1", "u-1")).toEqual({ geminiKey: "AIzaSyMemberSecret" });
 
-    // Deleting scoped member also deletes its private/secrets subdocument
+    expect(isEncryptedSecretData(docs.get("workspaces/ws-1/private/secrets")?.openaiKey)).toBe(true);
+    expect(await fsStore.getScopeSecretsStatus("ws-1")).toEqual({ openaiKey: true });
+    expect(await fsStore.getScopeSecrets("ws-1")).toEqual({ openaiKey: "sk-workspace-shared" });
+
+    // Deleting scoped member also deletes both its private/hiddenAttributes and private/secrets subdocuments
     await fsStore.deleteScopeMember("ws-1", "u-1");
     expect(docs.has("workspaces/ws-1/members/u-1")).toBe(false);
+    expect(docs.has("workspaces/ws-1/members/u-1/private/hiddenAttributes")).toBe(false);
     expect(docs.has("workspaces/ws-1/members/u-1/private/secrets")).toBe(false);
+
+    // FirestoreServerStore without encryptionKey throws a clear error if encrypted secrets are read/written
+    const unconfiguredCipherStore = new FirestoreServerStore({
+      db: fakeDb,
+      defaultRole: "member"
+    });
+    await expect(unconfiguredCipherStore.updateUserSecrets("u-1", { geminiKey: "fail" })).rejects.toThrow(
+      /configure 'encryptionKey', 'cipher', or MASTER_ENCRYPTION_KEY/
+    );
   });
 
   it("enforces single-tenant sibling role isolation, per-user capability overrides, atomic multi-key patch rejection, and role demotion on users/{uid}", async () => {
@@ -1589,7 +1751,7 @@ describe("lanyard/server unit tests", () => {
       readonlySystemBadge: string;
     }
 
-    interface SingleTenantSecrets {
+    interface SingleTenantHiddenAttrs {
       scannerAuditLog: string;
       merchPosPin: string;
       blindAuditHash: string;
@@ -1624,10 +1786,10 @@ describe("lanyard/server unit tests", () => {
         // Read-only for merch/moderator, writable ONLY by system admin (no write capability configured)
         readonlySystemBadge: { read: "read:merch" }
       },
-      secretCapabilities: {
+      hiddenAttributeCapabilities: {
         scannerAuditLog: { read: "read:scanner_log", write: "write:scanner_log" },
         merchPosPin: { read: "read:merch_Pin", write: "write:merch_Pin" },
-        // Write-only secret for moderator; readable ONLY by system admin
+        // Write-only hiddenAttribute for moderator; readable ONLY by system admin
         blindAuditHash: { write: "write:audit_hash" }
       }
     });
@@ -1638,14 +1800,14 @@ describe("lanyard/server unit tests", () => {
       SingleTenantCap,
       Record<string, unknown>,
       SingleTenantAttrs,
-      SingleTenantSecrets
+      SingleTenantHiddenAttrs
     >();
     const server = createLanyardServer<
       SingleTenantRole,
       SingleTenantCap,
       Record<string, unknown>,
       SingleTenantAttrs,
-      SingleTenantSecrets
+      SingleTenantHiddenAttrs
     >({
       adminAuth,
       store,
@@ -1691,7 +1853,7 @@ describe("lanyard/server unit tests", () => {
       targetUid: attendee.uid,
       patch: { pointsAllTime: 40 }
     });
-    await server.updateUserSecretsAs({
+    await server.updateUserHiddenAttributesAs({
       actorUid: scanner.uid,
       targetUid: attendee.uid,
       patch: { scannerAuditLog: "Scanned booth #4" }
@@ -1704,7 +1866,7 @@ describe("lanyard/server unit tests", () => {
       })
     ).rejects.toThrow(/Forbidden/);
     await expect(
-      server.updateUserSecretsAs({
+      server.updateUserHiddenAttributesAs({
         actorUid: scanner.uid,
         targetUid: attendee.uid,
         patch: { merchPosPin: "0000" }
@@ -1717,7 +1879,7 @@ describe("lanyard/server unit tests", () => {
       targetUid: attendee.uid,
       patch: { merchCreditBalance: 120 }
     });
-    await server.updateUserSecretsAs({
+    await server.updateUserHiddenAttributesAs({
       actorUid: merchSeller.uid,
       targetUid: attendee.uid,
       patch: { merchPosPin: "4821" }
@@ -1730,7 +1892,7 @@ describe("lanyard/server unit tests", () => {
       })
     ).rejects.toThrow(/Forbidden/);
 
-    // Reading attributes & secrets redacts each sibling's restricted fields:
+    // Reading attributes & hiddenAttributes redacts each sibling's restricted fields:
     expect(
       await server.readUserAttributesAs({
         actorUid: scanner.uid,
@@ -1753,13 +1915,13 @@ describe("lanyard/server unit tests", () => {
       readonlySystemBadge: "founding-member"
     });
     expect(
-      await server.readUserSecretsAs({
+      await server.readUserHiddenAttributesAs({
         actorUid: scanner.uid,
         targetUid: attendee.uid
       })
     ).toEqual({ scannerAuditLog: "Scanned booth #4" });
     expect(
-      await server.readUserSecretsAs({
+      await server.readUserHiddenAttributesAs({
         actorUid: merchSeller.uid,
         targetUid: attendee.uid
       })
@@ -1774,15 +1936,15 @@ describe("lanyard/server unit tests", () => {
     );
     expect(resScannerAsMerch.statusCode).toBe(403);
 
-    // 2. Write-only secret & Read-only attribute enforcement:
+    // 2. Write-only hiddenAttribute & Read-only attribute enforcement:
     // Moderator can write `blindAuditHash`, but CANNOT read `blindAuditHash` back (only systemAdmin can read it)
-    await server.updateUserSecretsAs({
+    await server.updateUserHiddenAttributesAs({
       actorUid: moderator.uid,
       targetUid: attendee.uid,
       patch: { blindAuditHash: "sha256:abcdef" }
     });
     expect(
-      await server.readUserSecretsAs({
+      await server.readUserHiddenAttributesAs({
         actorUid: moderator.uid,
         targetUid: attendee.uid
       })
@@ -1792,7 +1954,7 @@ describe("lanyard/server unit tests", () => {
       // blindAuditHash is redacted for non-system-admins!
     });
     expect(
-      await server.readUserSecretsAs({
+      await server.readUserHiddenAttributesAs({
         actorUid: "sys-admin",
         isSystemAdmin: true,
         targetUid: attendee.uid
@@ -1825,15 +1987,15 @@ describe("lanyard/server unit tests", () => {
     expect((await store.getUser(attendee.uid))?.attributes?.pointsAllTime).toBe(40);
     expect((await store.getUser(attendee.uid))?.attributes?.awardedBadges).toEqual(["welcome"]);
 
-    // Same atomic guarantee for secrets on users/{uid}/private/secrets:
+    // Same atomic guarantee for hiddenAttributes on users/{uid}/private/hiddenAttributes:
     await expect(
-      server.updateUserSecretsAs({
+      server.updateUserHiddenAttributesAs({
         actorUid: scanner.uid,
         targetUid: attendee.uid,
         patch: { scannerAuditLog: "Valid", merchPosPin: "9999" }
       })
     ).rejects.toThrow(/Forbidden/);
-    expect(await store.getUserSecrets(attendee.uid)).toEqual({
+    expect(await store.getUserHiddenAttributes(attendee.uid)).toEqual({
       scannerAuditLog: "Scanned booth #4",
       merchPosPin: "4821",
       blindAuditHash: "sha256:abcdef"
@@ -1948,7 +2110,7 @@ describe("lanyard/server unit tests", () => {
       })
     ).rejects.toThrow(/Forbidden/);
     expect(
-      await server.readUserSecretsAs({
+      await server.readUserHiddenAttributesAs({
         actorUid: moderator.uid,
         targetUid: attendee.uid
       })

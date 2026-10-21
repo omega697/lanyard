@@ -1483,6 +1483,81 @@ describe("lanyard/client unit tests", () => {
     );
     expect(await store.getScopeMember("ws-nonmember", "u-dual")).toBeNull();
 
+    // 4. Client-side 4-tier property permission checks (canReadAttribute, canWriteAttribute, canReadHiddenAttribute, canWriteHiddenAttribute, canWriteSecret):
+    const fourTierPolicy = createPermissionPolicy<TestRole, TestCap>({
+      roles: {
+        owner: { weight: 30, inherits: ["manager"], capabilities: "*" },
+        manager: { weight: 20, inherits: ["member"], capabilities: ["edit_content", "invite_members"] },
+        member: { weight: 10, capabilities: [] }
+      },
+      attributeCapabilities: {
+        points: "edit_content",
+        tier: { read: "invite_members", write: "invite_members" }
+      },
+      hiddenAttributeCapabilities: {
+        moderatorNotes: { read: "invite_members", write: "edit_content" }
+      },
+      secretCapabilities: {
+        personalGeminiKey: { allowSelfWrite: true },
+        workspaceOpenaiKey: { write: "invite_members", allowSelfWrite: false }
+      }
+    });
+
+    const clientFourTier = createLanyardClient<TestRole, TestCap, TestPrefs, CustomAttrs>({
+      store,
+      policy: fourTierPolicy,
+      defaultPreferences: DEFAULT_PREFS,
+      storageKeyPrefix: "fourtierapp"
+    });
+
+    // Before sign-in, all permission checks return false
+    expect(clientFourTier.canReadAttribute("points")).toBe(false);
+    expect(clientFourTier.canWriteAttribute("points")).toBe(false);
+    expect(clientFourTier.canReadHiddenAttribute("moderatorNotes")).toBe(false);
+    expect(clientFourTier.canWriteHiddenAttribute("moderatorNotes")).toBe(false);
+    expect(clientFourTier.canWriteSecret("personalGeminiKey")).toBe(false);
+
+    clientFourTier.setActiveUser({
+      uid: "u-dual",
+      email: "dual@example.com",
+      emailVerified: true,
+      displayName: "Dualy McDual",
+      photoUrl: null,
+      isAnonymous: false,
+      isAdmin: false,
+      providerIds: ["google.com"]
+    });
+
+    // Unscoped ('u-dual' is 'member' with ad-hoc ['edit_content']):
+    // - Attributes: self can read own 'tier' (isSelf defaults to true), cannot read another user's 'tier' ({ isSelf: false }), can write 'points' (has 'edit_content'), cannot write 'tier' (lacks 'invite_members')
+    expect(clientFourTier.canReadAttribute("tier")).toBe(true);
+    expect(clientFourTier.canReadAttribute("tier", { isSelf: false })).toBe(false);
+    expect(clientFourTier.canWriteAttribute("points")).toBe(true);
+    expect(clientFourTier.canWriteAttribute("tier")).toBe(false);
+    // - HiddenAttributes: lacks 'invite_members' so cannot read 'moderatorNotes', but has 'edit_content' so CAN write 'moderatorNotes'
+    expect(clientFourTier.canReadHiddenAttribute("moderatorNotes")).toBe(false);
+    expect(clientFourTier.canWriteHiddenAttribute("moderatorNotes")).toBe(true);
+    // - Secrets: can write own 'personalGeminiKey' (allowSelfWrite: true), cannot write 'workspaceOpenaiKey' (allowSelfWrite: false, lacks 'invite_members')
+    expect(clientFourTier.canWriteSecret("personalGeminiKey")).toBe(true);
+    expect(clientFourTier.canWriteSecret("workspaceOpenaiKey")).toBe(false);
+
+    // Scoped in 'ws-alpha' ('u-dual' is 'manager' -> has 'edit_content' + 'invite_members'):
+    expect(clientFourTier.canReadAttribute("tier", { scopeId: "ws-alpha", isSelf: false })).toBe(true);
+    expect(clientFourTier.canWriteAttribute("tier", "ws-alpha")).toBe(true);
+    expect(clientFourTier.canReadHiddenAttribute("moderatorNotes", "ws-alpha")).toBe(true);
+    expect(clientFourTier.canWriteHiddenAttribute("moderatorNotes", "ws-alpha")).toBe(true);
+    expect(clientFourTier.canWriteSecret("workspaceOpenaiKey", { scopeId: "ws-alpha", isSelf: false })).toBe(true);
+
+    // Scoped in 'ws-beta' ('u-dual' is 'owner' -> capabilities: '*'):
+    expect(clientFourTier.canWriteAttribute("tier", "ws-beta")).toBe(true);
+    expect(clientFourTier.canWriteSecret("workspaceOpenaiKey", { scopeId: "ws-beta", isSelf: false })).toBe(true);
+
+    // Non-member scope ('ws-unknown') or invalid scopeId ('../bad') returns false
+    expect(clientFourTier.canReadAttribute("points", "ws-unknown")).toBe(false);
+    expect(clientFourTier.canWriteSecret("personalGeminiKey", "ws-unknown")).toBe(false);
+    expect(clientFourTier.canWriteSecret("personalGeminiKey", "../bad")).toBe(false);
+
+    clientFourTier.destroy();
     client.destroy();
   });
 });

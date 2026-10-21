@@ -17,10 +17,11 @@ Like a conference or workplace lanyard, `lanyard` answers two questions everywhe
 - **Unified Generic Role & Capability Policy (`createPermissionPolicy<TRole, TCapability>`)**:
   - **Global System Admin (`admin: true`)**: Checked via Firebase Auth custom claims for zero-read security rules and fast JWT checks, mirrored on `users/{uid}` (`isSystemAdmin: true`) for single-query directory listing, instant revocation checks, avatars, and presence.
   - **Explicit Role Inheritance (`inherits`)**: Each role in `TRole` defines its hierarchy `weight`, optional `inherits: readonly TRole[]` (supporting DAGs and sibling roles with cycle detection), implied `capabilities` (`"*"` or `readonly TCapability[]`), and `trackPresence` (`boolean`) in one place.
-  - **Three-Tier User & Member Properties (`preferences`, `attributes`, `secrets`)**:
+  - **Four-Tier Custom User & Member Properties (`preferences`, `attributes`, `hiddenAttributes`, `secrets`)**:
     - **`preferences`** (`TPreferences`): Self-readable and self-writable custom properties (stored inline on `users/{uid}.preferences` and `{scope}/{scopeId}/members/{uid}.preferences`).
     - **`attributes`** (`TAttributes`): Self-readable custom properties that only system admins or roles holding the configured capability in `attributeCapabilities` can write (e.g., points, badges, quotas).
-    - **`secrets`** (`TSecrets`): Restricted properties that **not even the user themselves can read or write**—accessible only to system admins or roles holding the configured `read` / `write` capability in `secretCapabilities` (stored in isolated `users/{uid}/private/secrets` and `{scope}/{scopeId}/members/{uid}/private/secrets` subdocuments in Firestore).
+    - **`hiddenAttributes`** (`THiddenAttributes`): Properties _about_ a user that **not even the user themselves can read or write**—accessible only to system admins or roles holding the configured `read` / `write` capability in `hiddenAttributeCapabilities` (stored in isolated `users/{uid}/private/hiddenAttributes` and `{scope}/{scopeId}/members/{uid}/private/hiddenAttributes` subdocuments).
+    - **`secrets`** (`TSecrets`): **Write-only AES-256-GCM encrypted secrets** owned by the user or workspace (e.g., BYOK AI API keys or OAuth tokens). Stored encrypted at rest (`{ ciphertext, iv, tag }`) in `private/secrets`, never readable back out to any client, with boolean status checks (`getUserSecretsStatusAs`, `getScopeSecretsStatusAs`) for the UI and server-only decryption (`getDecryptedUserSecrets`, `getDecryptedScopeSecrets`) for backend API calls.
   - **Single-Listener Multiplexing**: `FirestoreClientStore` multiplexes `onSnapshot` listeners on `users/{uid}` so subscribing to user profile, `attributes`, `preferences`, and admin status only ever opens **1 Firestore document listener**.
 - **Smart Avatar Tracking & Fallback Resolution**:
   - **Provider Fallback**: When a user signs up via Magic Email Link (`user.photoURL === null`) and later links Google or GitHub, `normalizeFirebaseUser` automatically extracts their avatar from `user.providerData[].photoURL` and sanitizes the URL.
@@ -103,8 +104,12 @@ export const workspacePolicy = createPermissionPolicy<WorkspaceRole, WorkspaceCa
   attributeCapabilities: {
     pointsAllTime: "edit_content" // Self-readable; writable by roles with 'edit_content' (or system admins)
   },
+  hiddenAttributeCapabilities: {
+    internalNotes: { read: "invite_members", write: "edit_content" } // Hidden from user; gated by capabilities
+  },
   secretCapabilities: {
-    internalNotes: { read: "invite_members", write: "edit_content" } // Never self-readable; gated by capabilities
+    geminiKey: { allowSelfWrite: true }, // User-owned write-only encrypted secret
+    workspaceOpenaiKey: { write: "billing", allowSelfWrite: false } // Role-gated write-only encrypted secret
   }
 });
 
@@ -360,7 +365,7 @@ function hasScopeCapability(scopeId, capability, rolesImplyingCapability) {
   );
 }
 
-// Example unified users/{uid} & private/secrets rules:
+// Example unified users/{uid} & private subdocuments rules:
 match /users/{uid} {
   allow read: if isOwner(uid) || isAdmin();
   allow create: if isAdmin() || (
@@ -378,7 +383,7 @@ match /users/{uid} {
     (!('uid' in request.resource.data) || request.resource.data.uid == uid)
   );
 
-  match /private/secrets {
+  match /private/{docId} {
     allow read, write: if isAdmin();
   }
 }
@@ -397,8 +402,12 @@ match /workspaces/{scopeId}/members/{memberUid} {
     request.resource.data.diff(resource.data).affectedKeys().hasOnly(['lastSeen', 'photoUrl', 'preferences'])
   );
 
-  match /private/secrets {
+  match /private/hiddenAttributes {
     allow read, write: if hasScopeCapability(scopeId, 'invite_members', ['owner', 'manager']);
+  }
+
+  match /private/secrets {
+    allow read, write: if false; // Write-only encrypted secrets are managed exclusively via Admin SDK on the server
   }
 }
 ```

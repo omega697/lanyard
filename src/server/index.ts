@@ -11,6 +11,8 @@ import {
   type UserRecord
 } from "../core/index.js";
 
+export * from "./encryption.js";
+
 export interface AuthenticatedUser {
   uid: string;
   email: string;
@@ -174,13 +176,14 @@ export interface LanyardServerConfig<
   TCapability extends string = string,
   TPreferences extends Record<string, any> = Record<string, any>,
   TAttributes extends Record<string, any> = Record<string, any>,
+  THiddenAttributes extends Record<string, any> = Record<string, any>,
   TSecrets extends Record<string, any> = Record<string, any>
 > {
   /** Firebase Admin Auth instance (or lightweight `AdminAuthAdapter` test double). */
   adminAuth: AdminAuthAdapter;
   /** Backing storage adapter implementing `LanyardServerStore` (e.g. `FirestoreServerStore` or `InMemoryLanyardStore`). */
-  store: LanyardServerStore<TRole, TCapability, TPreferences, TAttributes, TSecrets>;
-  /** Application permission policy defining role hierarchy, inheritance, capabilities, and attribute/secret rules. */
+  store: LanyardServerStore<TRole, TCapability, TPreferences, TAttributes, THiddenAttributes, TSecrets>;
+  /** Application permission policy defining role hierarchy, inheritance, capabilities, and attribute/hiddenAttribute/secret rules. */
   policy: PermissionPolicy<TRole, TCapability>;
   /** Optional override for token verification (defaults to `new GoogleAuthService(adminAuth)`). */
   authService?: AuthService;
@@ -192,15 +195,16 @@ export interface LanyardServerConfig<
  * Creates a storage-agnostic Lanyard server instance providing Express authentication/authorization
  * middleware (`checkAuth`, `requireAdmin`, `requireUserRole`, `requireUserCapability`,
  * `requireScopeRole`, `requireScopeCapability`), deterministic UID & role provisioning helpers,
- * and capability-gated `attributes` / `secrets` accessors.
+ * and capability-gated `attributes`, `hiddenAttributes`, and encrypted `secrets` accessors.
  */
 export function createLanyardServer<
   TRole extends string = string,
   TCapability extends string = string,
   TPreferences extends Record<string, any> = Record<string, any>,
   TAttributes extends Record<string, any> = Record<string, any>,
+  THiddenAttributes extends Record<string, any> = Record<string, any>,
   TSecrets extends Record<string, any> = Record<string, any>
->(config: LanyardServerConfig<TRole, TCapability, TPreferences, TAttributes, TSecrets>) {
+>(config: LanyardServerConfig<TRole, TCapability, TPreferences, TAttributes, THiddenAttributes, TSecrets>) {
   const {
     adminAuth,
     store,
@@ -788,55 +792,60 @@ export function createLanyardServer<
   }
 
   /**
-   * Reads a user's global `secrets` (`users/{targetUid}/private/secrets`), returning only keys
+   * Reads a user's global `hiddenAttributes` (`users/{targetUid}/private/hiddenAttributes`), returning only keys
    * the caller (`actorUid`) holds the required `read` capability for (or all keys if `isSystemAdmin`).
-   * Throws `Forbidden` if a non-admin caller has no readable secret keys and no read capability.
+   * Self-ownership (`actorUid === targetUid`) never grants read access to `hiddenAttributes`.
+   * Throws `Forbidden` if a non-admin caller has no readable hiddenAttribute keys and no read capability.
    */
-  async function readUserSecretsAs(params: {
+  async function readUserHiddenAttributesAs(params: {
     actorUid: string;
     isSystemAdmin?: boolean;
     targetUid: string;
-  }): Promise<Partial<TSecrets>> {
+  }): Promise<Partial<THiddenAttributes>> {
     assertValidResourceId(params.actorUid, "actorUid");
     assertValidResourceId(params.targetUid, "targetUid");
-    if (typeof store.getUserSecrets !== "function") {
-      throw new Error("Backing store does not implement getUserSecrets");
+    if (typeof store.getUserHiddenAttributes !== "function") {
+      throw new Error("Backing store does not implement getUserHiddenAttributes");
     }
     const { isAdmin, userRecord: actorRecord } = await resolveEffectiveAdminStatus(
       params.actorUid,
       Boolean(params.isSystemAdmin)
     );
-    const rawSecrets = await store.getUserSecrets(params.targetUid);
-    const filtered = policy.filterReadableSecrets<TSecrets>(actorRecord, rawSecrets, isAdmin);
-    if (!isAdmin && Object.keys(rawSecrets).length > 0 && Object.keys(filtered).length === 0) {
-      throw new Error("Forbidden: Insufficient permissions to read user secrets");
+    const rawHiddenAttributes = await store.getUserHiddenAttributes(params.targetUid);
+    const filtered = policy.filterReadableHiddenAttributes<THiddenAttributes>(
+      actorRecord,
+      rawHiddenAttributes,
+      isAdmin
+    );
+    if (!isAdmin && Object.keys(rawHiddenAttributes).length > 0 && Object.keys(filtered).length === 0) {
+      throw new Error("Forbidden: Insufficient permissions to read user hiddenAttributes");
     }
     return filtered;
   }
 
   /**
-   * Updates a user's global `secrets` (`users/{targetUid}/private/secrets`) after verifying
+   * Updates a user's global `hiddenAttributes` (`users/{targetUid}/private/hiddenAttributes`) after verifying
    * the caller (`actorUid`) holds the required `write` capability for every key in `patch` (or is an active system admin).
    */
-  async function updateUserSecretsAs(params: {
+  async function updateUserHiddenAttributesAs(params: {
     actorUid: string;
     isSystemAdmin?: boolean;
     targetUid: string;
-    patch: Partial<TSecrets>;
-  }): Promise<Partial<TSecrets>> {
+    patch: Partial<THiddenAttributes>;
+  }): Promise<Partial<THiddenAttributes>> {
     assertValidResourceId(params.actorUid, "actorUid");
     assertValidResourceId(params.targetUid, "targetUid");
-    if (typeof store.updateUserSecrets !== "function") {
-      throw new Error("Backing store does not implement updateUserSecrets");
+    if (typeof store.updateUserHiddenAttributes !== "function") {
+      throw new Error("Backing store does not implement updateUserHiddenAttributes");
     }
     const { isAdmin, userRecord: actorRecord } = await resolveEffectiveAdminStatus(
       params.actorUid,
       Boolean(params.isSystemAdmin)
     );
-    if (!policy.canWriteSecretsPatch(actorRecord, params.patch as Record<string, any>, isAdmin)) {
-      throw new Error("Forbidden: Insufficient permissions to update the requested user secrets");
+    if (!policy.canWriteHiddenAttributesPatch(actorRecord, params.patch as Record<string, any>, isAdmin)) {
+      throw new Error("Forbidden: Insufficient permissions to update the requested user hiddenAttributes");
     }
-    return store.updateUserSecrets(params.targetUid, params.patch);
+    return store.updateUserHiddenAttributes(params.targetUid, params.patch);
   }
 
   /**
@@ -891,45 +900,200 @@ export function createLanyardServer<
   }
 
   /**
-   * Reads a scoped member's `secrets` within `scopeId`, strictly checking the caller's membership
-   * in `scopeId` (or active system admin status).
+   * Reads a scoped member's `hiddenAttributes` within `scopeId`, strictly checking the caller's membership
+   * in `scopeId` (or active system admin status). Self-ownership (`actorUid === targetUid`) never grants read access.
    */
-  async function readScopeMemberSecretsAs(params: {
+  async function readScopeMemberHiddenAttributesAs(params: {
     scopeId: string;
     actorUid: string;
     isSystemAdmin?: boolean;
     targetUid: string;
-  }): Promise<Partial<TSecrets>> {
+  }): Promise<Partial<THiddenAttributes>> {
     assertValidResourceId(params.scopeId, "scopeId");
     assertValidResourceId(params.actorUid, "actorUid");
     assertValidResourceId(params.targetUid, "targetUid");
-    if (typeof store.getScopeMemberSecrets !== "function") {
-      throw new Error("Backing store does not implement getScopeMemberSecrets");
+    if (typeof store.getScopeMemberHiddenAttributes !== "function") {
+      throw new Error("Backing store does not implement getScopeMemberHiddenAttributes");
     }
     const { isAdmin } = await resolveEffectiveAdminStatus(params.actorUid, Boolean(params.isSystemAdmin));
     const actorMember = await store.getScopeMember(params.scopeId, params.actorUid);
     if (!isAdmin && !actorMember) {
       throw new Error(`Forbidden: Caller is not a member of scope '${params.scopeId}'`);
     }
-    const rawSecrets = await store.getScopeMemberSecrets(params.scopeId, params.targetUid);
-    const filtered = policy.filterReadableSecrets<TSecrets>(actorMember, rawSecrets, isAdmin);
-    if (!isAdmin && Object.keys(rawSecrets).length > 0 && Object.keys(filtered).length === 0) {
-      throw new Error(`Forbidden: Insufficient permissions to read member secrets in scope '${params.scopeId}'`);
+    const rawHiddenAttributes = await store.getScopeMemberHiddenAttributes(params.scopeId, params.targetUid);
+    const filtered = policy.filterReadableHiddenAttributes<THiddenAttributes>(
+      actorMember,
+      rawHiddenAttributes,
+      isAdmin
+    );
+    if (!isAdmin && Object.keys(rawHiddenAttributes).length > 0 && Object.keys(filtered).length === 0) {
+      throw new Error(
+        `Forbidden: Insufficient permissions to read member hiddenAttributes in scope '${params.scopeId}'`
+      );
     }
     return filtered;
   }
 
   /**
-   * Updates a scoped member's `secrets` within `scopeId`, strictly checking the caller's membership
+   * Updates a scoped member's `hiddenAttributes` within `scopeId`, strictly checking the caller's membership
    * and capabilities in `scopeId` (or active system admin status).
+   */
+  async function updateScopeMemberHiddenAttributesAs(params: {
+    scopeId: string;
+    actorUid: string;
+    isSystemAdmin?: boolean;
+    targetUid: string;
+    patch: Partial<THiddenAttributes>;
+  }): Promise<Partial<THiddenAttributes>> {
+    assertValidResourceId(params.scopeId, "scopeId");
+    assertValidResourceId(params.actorUid, "actorUid");
+    assertValidResourceId(params.targetUid, "targetUid");
+    if (typeof store.updateScopeMemberHiddenAttributes !== "function") {
+      throw new Error("Backing store does not implement updateScopeMemberHiddenAttributes");
+    }
+    const { isAdmin } = await resolveEffectiveAdminStatus(params.actorUid, Boolean(params.isSystemAdmin));
+    const actorMember = await store.getScopeMember(params.scopeId, params.actorUid);
+    if (!policy.canWriteHiddenAttributesPatch(actorMember, params.patch as Record<string, any>, isAdmin)) {
+      throw new Error(
+        `Forbidden: Insufficient permissions to update member hiddenAttributes in scope '${params.scopeId}'`
+      );
+    }
+    return store.updateScopeMemberHiddenAttributes(params.scopeId, params.targetUid, params.patch);
+  }
+
+  // --- Write-Only Encrypted Secrets Operations ---
+
+  /**
+   * Returns a boolean status map (`{ [key]: boolean }`) indicating which secrets are configured
+   * on `users/{targetUid}/private/secrets` without ever exposing or decrypting secret values.
+   * Allowed for the user themselves (`actorUid === targetUid`), any actor who can write at least one
+   * secret key in the status map, or an active system admin.
+   */
+  async function getUserSecretsStatusAs(params: {
+    actorUid: string;
+    isSystemAdmin?: boolean;
+    targetUid: string;
+  }): Promise<Partial<Record<keyof TSecrets & string, boolean>>> {
+    assertValidResourceId(params.actorUid, "actorUid");
+    assertValidResourceId(params.targetUid, "targetUid");
+    if (typeof store.getUserSecretsStatus !== "function") {
+      throw new Error("Backing store does not implement getUserSecretsStatus");
+    }
+    const { isAdmin, userRecord: actorRecord } = await resolveEffectiveAdminStatus(
+      params.actorUid,
+      Boolean(params.isSystemAdmin)
+    );
+    const isSelf = params.actorUid === params.targetUid;
+    const rawStatus = await store.getUserSecretsStatus(params.targetUid);
+    if (isAdmin || isSelf) {
+      return rawStatus;
+    }
+    const filtered: Partial<Record<keyof TSecrets & string, boolean>> = {};
+    for (const [key, isConfigured] of Object.entries(rawStatus)) {
+      if (policy.canWriteSecret(actorRecord, key, { isSystemAdmin: isAdmin, isSelf })) {
+        filtered[key as keyof TSecrets & string] = Boolean(isConfigured);
+      }
+    }
+    if (Object.keys(rawStatus).length > 0 && Object.keys(filtered).length === 0) {
+      throw new Error("Forbidden: Insufficient permissions to inspect user secrets status");
+    }
+    return filtered;
+  }
+
+  /**
+   * Encrypts and writes (or clears when `""` or `null` is passed) user secrets on
+   * `users/{targetUid}/private/secrets`. Returns the updated boolean status map (`{ [key]: boolean }`)
+   * and NEVER returns plaintext or ciphertext values.
+   */
+  async function updateUserSecretsAs(params: {
+    actorUid: string;
+    isSystemAdmin?: boolean;
+    targetUid: string;
+    patch: Partial<Record<keyof TSecrets & string, string | null | undefined>>;
+  }): Promise<Partial<Record<keyof TSecrets & string, boolean>>> {
+    assertValidResourceId(params.actorUid, "actorUid");
+    assertValidResourceId(params.targetUid, "targetUid");
+    if (typeof store.updateUserSecrets !== "function") {
+      throw new Error("Backing store does not implement updateUserSecrets");
+    }
+    const { isAdmin, userRecord: actorRecord } = await resolveEffectiveAdminStatus(
+      params.actorUid,
+      Boolean(params.isSystemAdmin)
+    );
+    const isSelf = params.actorUid === params.targetUid;
+    if (
+      !policy.canWriteSecretsPatch(actorRecord, params.patch as Record<string, any>, { isSystemAdmin: isAdmin, isSelf })
+    ) {
+      throw new Error("Forbidden: Insufficient permissions to update the requested user secrets");
+    }
+    return store.updateUserSecrets(params.targetUid, params.patch);
+  }
+
+  /**
+   * Server-only helper that decrypts and returns plaintext secrets from `users/{uid}/private/secrets`
+   * for backend services making external API calls (e.g. BYOK AI keys or OAuth tokens).
+   * Never expose the return value of this method in client HTTP responses.
+   */
+  async function getDecryptedUserSecrets(uid: string): Promise<Partial<Record<keyof TSecrets & string, string>>> {
+    assertValidResourceId(uid, "uid");
+    if (typeof store.getUserSecrets !== "function") {
+      throw new Error("Backing store does not implement getUserSecrets");
+    }
+    return store.getUserSecrets(uid);
+  }
+
+  /**
+   * Returns a boolean status map (`{ [key]: boolean }`) indicating which secrets are configured
+   * on `{scopeCollection}/{scopeId}/{membersSubcollection}/{targetUid}/private/secrets`.
+   */
+  async function getScopeMemberSecretsStatusAs(params: {
+    scopeId: string;
+    actorUid: string;
+    isSystemAdmin?: boolean;
+    targetUid: string;
+  }): Promise<Partial<Record<keyof TSecrets & string, boolean>>> {
+    assertValidResourceId(params.scopeId, "scopeId");
+    assertValidResourceId(params.actorUid, "actorUid");
+    assertValidResourceId(params.targetUid, "targetUid");
+    if (typeof store.getScopeMemberSecretsStatus !== "function") {
+      throw new Error("Backing store does not implement getScopeMemberSecretsStatus");
+    }
+    const { isAdmin } = await resolveEffectiveAdminStatus(params.actorUid, Boolean(params.isSystemAdmin));
+    const actorMember = await store.getScopeMember(params.scopeId, params.actorUid);
+    if (!isAdmin && !actorMember) {
+      throw new Error(`Forbidden: Caller is not a member of scope '${params.scopeId}'`);
+    }
+    const isSelf = Boolean(actorMember && params.actorUid === params.targetUid);
+    const rawStatus = await store.getScopeMemberSecretsStatus(params.scopeId, params.targetUid);
+    if (isAdmin || isSelf) {
+      return rawStatus;
+    }
+    const filtered: Partial<Record<keyof TSecrets & string, boolean>> = {};
+    for (const [key, isConfigured] of Object.entries(rawStatus)) {
+      if (policy.canWriteSecret(actorMember, key, { isSystemAdmin: isAdmin, isSelf })) {
+        filtered[key as keyof TSecrets & string] = Boolean(isConfigured);
+      }
+    }
+    if (Object.keys(rawStatus).length > 0 && Object.keys(filtered).length === 0) {
+      throw new Error(
+        `Forbidden: Insufficient permissions to inspect member secrets status in scope '${params.scopeId}'`
+      );
+    }
+    return filtered;
+  }
+
+  /**
+   * Encrypts and writes (or clears when `""` or `null` is passed) scoped member secrets on
+   * `{scopeCollection}/{scopeId}/{membersSubcollection}/{targetUid}/private/secrets`.
+   * Returns the updated boolean status map (`{ [key]: boolean }`).
    */
   async function updateScopeMemberSecretsAs(params: {
     scopeId: string;
     actorUid: string;
     isSystemAdmin?: boolean;
     targetUid: string;
-    patch: Partial<TSecrets>;
-  }): Promise<Partial<TSecrets>> {
+    patch: Partial<Record<keyof TSecrets & string, string | null | undefined>>;
+  }): Promise<Partial<Record<keyof TSecrets & string, boolean>>> {
     assertValidResourceId(params.scopeId, "scopeId");
     assertValidResourceId(params.actorUid, "actorUid");
     assertValidResourceId(params.targetUid, "targetUid");
@@ -938,10 +1102,96 @@ export function createLanyardServer<
     }
     const { isAdmin } = await resolveEffectiveAdminStatus(params.actorUid, Boolean(params.isSystemAdmin));
     const actorMember = await store.getScopeMember(params.scopeId, params.actorUid);
-    if (!policy.canWriteSecretsPatch(actorMember, params.patch as Record<string, any>, isAdmin)) {
+    const isSelf = Boolean(actorMember && params.actorUid === params.targetUid);
+    if (
+      !policy.canWriteSecretsPatch(actorMember, params.patch as Record<string, any>, { isSystemAdmin: isAdmin, isSelf })
+    ) {
       throw new Error(`Forbidden: Insufficient permissions to update member secrets in scope '${params.scopeId}'`);
     }
     return store.updateScopeMemberSecrets(params.scopeId, params.targetUid, params.patch);
+  }
+
+  /**
+   * Server-only helper that decrypts and returns plaintext secrets from
+   * `{scopeCollection}/{scopeId}/{membersSubcollection}/{uid}/private/secrets`.
+   * Never expose the return value of this method in client HTTP responses.
+   */
+  async function getDecryptedScopeMemberSecrets(
+    scopeId: string,
+    uid: string
+  ): Promise<Partial<Record<keyof TSecrets & string, string>>> {
+    assertValidResourceId(scopeId, "scopeId");
+    assertValidResourceId(uid, "uid");
+    if (typeof store.getScopeMemberSecrets !== "function") {
+      throw new Error("Backing store does not implement getScopeMemberSecrets");
+    }
+    return store.getScopeMemberSecrets(scopeId, uid);
+  }
+
+  /**
+   * Returns a boolean status map (`{ [key]: boolean }`) indicating which scope-level secrets are configured
+   * on `{scopeCollection}/{scopeId}/private/secrets` (e.g. BYOK workspace API keys).
+   * Allowed for any member of `scopeId` or an active system admin.
+   */
+  async function getScopeSecretsStatusAs(params: {
+    scopeId: string;
+    actorUid: string;
+    isSystemAdmin?: boolean;
+  }): Promise<Partial<Record<keyof TSecrets & string, boolean>>> {
+    assertValidResourceId(params.scopeId, "scopeId");
+    assertValidResourceId(params.actorUid, "actorUid");
+    if (typeof store.getScopeSecretsStatus !== "function") {
+      throw new Error("Backing store does not implement getScopeSecretsStatus");
+    }
+    const { isAdmin } = await resolveEffectiveAdminStatus(params.actorUid, Boolean(params.isSystemAdmin));
+    const actorMember = await store.getScopeMember(params.scopeId, params.actorUid);
+    if (!isAdmin && !actorMember) {
+      throw new Error(`Forbidden: Caller is not a member of scope '${params.scopeId}'`);
+    }
+    return store.getScopeSecretsStatus(params.scopeId);
+  }
+
+  /**
+   * Encrypts and writes (or clears when `""` or `null` is passed) scope-level secrets on
+   * `{scopeCollection}/{scopeId}/private/secrets` (e.g. BYOK workspace API keys).
+   * Requires the caller to hold the configured `write` capability in `secretCapabilities` within `scopeId`
+   * (or be an active system admin). Note: `isSelf` is always `false` for shared scope-level secrets.
+   */
+  async function updateScopeSecretsAs(params: {
+    scopeId: string;
+    actorUid: string;
+    isSystemAdmin?: boolean;
+    patch: Partial<Record<keyof TSecrets & string, string | null | undefined>>;
+  }): Promise<Partial<Record<keyof TSecrets & string, boolean>>> {
+    assertValidResourceId(params.scopeId, "scopeId");
+    assertValidResourceId(params.actorUid, "actorUid");
+    if (typeof store.updateScopeSecrets !== "function") {
+      throw new Error("Backing store does not implement updateScopeSecrets");
+    }
+    const { isAdmin } = await resolveEffectiveAdminStatus(params.actorUid, Boolean(params.isSystemAdmin));
+    const actorMember = await store.getScopeMember(params.scopeId, params.actorUid);
+    if (
+      !policy.canWriteSecretsPatch(actorMember, params.patch as Record<string, any>, {
+        isSystemAdmin: isAdmin,
+        isSelf: false
+      })
+    ) {
+      throw new Error(`Forbidden: Insufficient permissions to update secrets in scope '${params.scopeId}'`);
+    }
+    return store.updateScopeSecrets(params.scopeId, params.patch);
+  }
+
+  /**
+   * Server-only helper that decrypts and returns plaintext scope-level secrets from
+   * `{scopeCollection}/{scopeId}/private/secrets`.
+   * Never expose the return value of this method in client HTTP responses.
+   */
+  async function getDecryptedScopeSecrets(scopeId: string): Promise<Partial<Record<keyof TSecrets & string, string>>> {
+    assertValidResourceId(scopeId, "scopeId");
+    if (typeof store.getScopeSecrets !== "function") {
+      throw new Error("Backing store does not implement getScopeSecrets");
+    }
+    return store.getScopeSecrets(scopeId);
   }
 
   return {
@@ -962,11 +1212,20 @@ export function createLanyardServer<
     revokeScopeCapabilities,
     readUserAttributesAs,
     updateUserAttributesAs,
-    readUserSecretsAs,
-    updateUserSecretsAs,
+    readUserHiddenAttributesAs,
+    updateUserHiddenAttributesAs,
     readScopeMemberAttributesAs,
     updateScopeMemberAttributesAs,
-    readScopeMemberSecretsAs,
-    updateScopeMemberSecretsAs
+    readScopeMemberHiddenAttributesAs,
+    updateScopeMemberHiddenAttributesAs,
+    getUserSecretsStatusAs,
+    updateUserSecretsAs,
+    getDecryptedUserSecrets,
+    getScopeMemberSecretsStatusAs,
+    updateScopeMemberSecretsAs,
+    getDecryptedScopeMemberSecrets,
+    getScopeSecretsStatusAs,
+    updateScopeSecretsAs,
+    getDecryptedScopeSecrets
   };
 }

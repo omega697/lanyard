@@ -17,6 +17,11 @@ interface NormalizedFieldRule<TCapability extends string> {
   write?: TCapability;
 }
 
+interface NormalizedSecretRule<TCapability extends string> {
+  write?: TCapability;
+  allowSelfWrite?: boolean;
+}
+
 /**
  * Creates a reusable `PermissionPolicy<TRole, TCapability>` that defines an application's
  * role hierarchy (`weight`), explicit role inheritance (`inherits`), role-implied capabilities (`capabilities`),
@@ -131,7 +136,7 @@ export function createPermissionPolicy<TRole extends string = string, TCapabilit
     });
   }
 
-  // Normalize attributeCapabilities & secretCapabilities
+  // Normalize attributeCapabilities, hiddenAttributeCapabilities & secretCapabilities
   const attrRules = Object.create(null) as Record<string, NormalizedFieldRule<TCapability>>;
   if (config.attributeCapabilities && typeof config.attributeCapabilities === "object") {
     for (const [key, rule] of Object.entries(config.attributeCapabilities)) {
@@ -148,17 +153,32 @@ export function createPermissionPolicy<TRole extends string = string, TCapabilit
     }
   }
 
-  const secretRules = Object.create(null) as Record<string, NormalizedFieldRule<TCapability>>;
+  const hiddenAttrRules = Object.create(null) as Record<string, NormalizedFieldRule<TCapability>>;
+  if (config.hiddenAttributeCapabilities && typeof config.hiddenAttributeCapabilities === "object") {
+    for (const [key, rule] of Object.entries(config.hiddenAttributeCapabilities)) {
+      if (!isSafeKey(key) || !rule) continue;
+      if (typeof rule === "string") {
+        // String shorthand on hiddenAttributeCapabilities gates BOTH read and write
+        hiddenAttrRules[key] = Object.freeze({ read: rule as TCapability, write: rule as TCapability });
+      } else if (typeof rule === "object") {
+        hiddenAttrRules[key] = Object.freeze({
+          ...(rule.read ? { read: rule.read } : {}),
+          ...(rule.write ? { write: rule.write } : {})
+        });
+      }
+    }
+  }
+
+  const secretRules = Object.create(null) as Record<string, NormalizedSecretRule<TCapability>>;
   if (config.secretCapabilities && typeof config.secretCapabilities === "object") {
     for (const [key, rule] of Object.entries(config.secretCapabilities)) {
       if (!isSafeKey(key) || !rule) continue;
       if (typeof rule === "string") {
-        // String shorthand on secretCapabilities gates BOTH read and write
-        secretRules[key] = Object.freeze({ read: rule as TCapability, write: rule as TCapability });
+        secretRules[key] = Object.freeze({ write: rule as TCapability });
       } else if (typeof rule === "object") {
         secretRules[key] = Object.freeze({
-          ...(rule.read ? { read: rule.read } : {}),
-          ...(rule.write ? { write: rule.write } : {})
+          ...(rule.write ? { write: rule.write } : {}),
+          ...(rule.allowSelfWrite !== undefined ? { allowSelfWrite: Boolean(rule.allowSelfWrite) } : {})
         });
       }
     }
@@ -301,38 +321,72 @@ export function createPermissionPolicy<TRole extends string = string, TCapabilit
     return keys.every((k) => canWriteAttribute(actor, k, isSystemAdmin));
   }
 
-  function canReadSecret(
+  function canReadHiddenAttribute(
     actor: PolicySubject<TRole, TCapability> | null | undefined,
     key: string,
     isSystemAdmin = false
   ): boolean {
     if (!isSafeKey(key)) return false;
     if (isSystemAdmin) return true;
-    const rule = Object.hasOwn(secretRules, key) ? secretRules[key] : undefined;
+    const rule = Object.hasOwn(hiddenAttrRules, key) ? hiddenAttrRules[key] : undefined;
     if (!rule?.read) return false;
     return hasCapability(actor, rule.read, false);
   }
 
-  function canWriteSecret(
+  function canWriteHiddenAttribute(
     actor: PolicySubject<TRole, TCapability> | null | undefined,
     key: string,
     isSystemAdmin = false
   ): boolean {
     if (!isSafeKey(key)) return false;
     if (isSystemAdmin) return true;
-    const rule = Object.hasOwn(secretRules, key) ? secretRules[key] : undefined;
+    const rule = Object.hasOwn(hiddenAttrRules, key) ? hiddenAttrRules[key] : undefined;
     if (!rule?.write) return false;
     return hasCapability(actor, rule.write, false);
   }
 
-  function canWriteSecretsPatch(
+  function canWriteHiddenAttributesPatch(
     actor: PolicySubject<TRole, TCapability> | null | undefined,
     patch: Record<string, any>,
     isSystemAdmin = false
   ): boolean {
     const keys = extractPatchKeys(patch);
     if (!keys) return false;
-    return keys.every((k) => canWriteSecret(actor, k, isSystemAdmin));
+    return keys.every((k) => canWriteHiddenAttribute(actor, k, isSystemAdmin));
+  }
+
+  function canWriteSecret(
+    actor: PolicySubject<TRole, TCapability> | null | undefined,
+    key: string,
+    options: boolean | { isSystemAdmin?: boolean; isSelf?: boolean } = false
+  ): boolean {
+    if (!isSafeKey(key)) return false;
+    const isSystemAdmin = typeof options === "boolean" ? options : Boolean(options?.isSystemAdmin);
+    const isSelf = typeof options === "object" && options !== null ? Boolean(options.isSelf) : false;
+
+    if (isSystemAdmin) return true;
+    const rule = Object.hasOwn(secretRules, key) ? secretRules[key] : undefined;
+    if (!rule) {
+      // Unconfigured secret keys default to user-owned (`isSelf === true`)
+      return isSelf;
+    }
+    if (isSelf && rule.allowSelfWrite !== false) {
+      return true;
+    }
+    if (rule.write && hasCapability(actor, rule.write, false)) {
+      return true;
+    }
+    return false;
+  }
+
+  function canWriteSecretsPatch(
+    actor: PolicySubject<TRole, TCapability> | null | undefined,
+    patch: Record<string, any>,
+    options: boolean | { isSystemAdmin?: boolean; isSelf?: boolean } = false
+  ): boolean {
+    const keys = extractPatchKeys(patch);
+    if (!keys) return false;
+    return keys.every((k) => canWriteSecret(actor, k, options));
   }
 
   function filterReadableAttributes<TAttributes extends Record<string, any>>(
@@ -352,21 +406,21 @@ export function createPermissionPolicy<TRole extends string = string, TCapabilit
     return result as Partial<TAttributes>;
   }
 
-  function filterReadableSecrets<TSecrets extends Record<string, any>>(
+  function filterReadableHiddenAttributes<THiddenAttributes extends Record<string, any>>(
     actor: PolicySubject<TRole, TCapability> | null | undefined,
-    secrets: Partial<TSecrets> | null | undefined,
+    hiddenAttributes: Partial<THiddenAttributes> | null | undefined,
     isSystemAdmin = false
-  ): Partial<TSecrets> {
+  ): Partial<THiddenAttributes> {
     const result: Record<string, any> = {};
-    if (!secrets || typeof secrets !== "object" || Array.isArray(secrets)) {
-      return result as Partial<TSecrets>;
+    if (!hiddenAttributes || typeof hiddenAttributes !== "object" || Array.isArray(hiddenAttributes)) {
+      return result as Partial<THiddenAttributes>;
     }
-    for (const [k, v] of Object.entries(secrets)) {
-      if (canReadSecret(actor, k, isSystemAdmin)) {
+    for (const [k, v] of Object.entries(hiddenAttributes)) {
+      if (canReadHiddenAttribute(actor, k, isSystemAdmin)) {
         result[k] = v;
       }
     }
-    return result as Partial<TSecrets>;
+    return result as Partial<THiddenAttributes>;
   }
 
   return Object.freeze({
@@ -384,10 +438,12 @@ export function createPermissionPolicy<TRole extends string = string, TCapabilit
     canReadAttribute,
     canWriteAttribute,
     canWriteAttributesPatch,
-    canReadSecret,
+    canReadHiddenAttribute,
+    canWriteHiddenAttribute,
+    canWriteHiddenAttributesPatch,
     canWriteSecret,
     canWriteSecretsPatch,
     filterReadableAttributes,
-    filterReadableSecrets
+    filterReadableHiddenAttributes
   });
 }

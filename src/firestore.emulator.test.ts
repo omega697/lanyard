@@ -25,7 +25,7 @@ import { FirestoreClientStore } from "./client/firestore.js";
 import { createLanyardClient } from "./client/index.js";
 import { createPermissionPolicy, type LanyardReadable } from "./core/index.js";
 import { FirestoreServerStore } from "./server/firestore.js";
-import { createLanyardServer, FakeAuthService } from "./server/index.js";
+import { createLanyardServer, FakeAuthService, isEncryptedSecretData } from "./server/index.js";
 
 const EMULATOR_JAR = join(homedir(), ".cache", "firebase", "emulators", "cloud-firestore-emulator-v1.21.0.jar");
 
@@ -203,7 +203,7 @@ describe.skipIf(!existsSync(EMULATOR_JAR))(
       }
     });
 
-    it("enforces single-tenant multi-role hierarchy, sibling role isolation, field-level attributes/secrets, and live client reactivity on real Firestore", async () => {
+    it("enforces single-tenant multi-role hierarchy, sibling role isolation, field-level attributes/hiddenAttributes, AES-256-GCM encrypted secrets, and live client reactivity on real Firestore", async () => {
       type Role = "attendee" | "scanner" | "merch_seller" | "auditor" | "moderator";
       type Cap =
         | "view:schedule"
@@ -215,7 +215,8 @@ describe.skipIf(!existsSync(EMULATOR_JAR))(
         | "write:scanner_log"
         | "read:merch_pin"
         | "write:merch_pin"
-        | "write:audit_hash";
+        | "write:audit_hash"
+        | "write:ai_keys";
 
       interface Prefs {
         leaderboardOptIn?: boolean;
@@ -227,11 +228,15 @@ describe.skipIf(!existsSync(EMULATOR_JAR))(
         awardedBadges: string[];
         readonlySystemBadge: string;
       }
-      interface Secrets {
+      interface HiddenAttrs {
         scannerAuditLog: string;
         merchPosPin: string;
         blindAuditHash: string;
         superAdminSecret: string;
+      }
+      interface Secrets {
+        geminiKey: string;
+        openaiKey: string;
       }
 
       const policy = createPermissionPolicy<Role, Cap>({
@@ -258,7 +263,7 @@ describe.skipIf(!existsSync(EMULATOR_JAR))(
           moderator: {
             weight: 30,
             inherits: ["scanner", "merch_seller", "auditor"],
-            capabilities: ["write:badges", "write:audit_hash"]
+            capabilities: ["write:badges", "write:audit_hash", "write:ai_keys"]
           }
         },
         attributeCapabilities: {
@@ -267,17 +272,22 @@ describe.skipIf(!existsSync(EMULATOR_JAR))(
           awardedBadges: "write:badges",
           readonlySystemBadge: { read: "read:merch" }
         },
-        secretCapabilities: {
+        hiddenAttributeCapabilities: {
           scannerAuditLog: { read: "read:scanner_log", write: "write:scanner_log" },
           merchPosPin: { read: "read:merch_pin", write: "write:merch_pin" },
           blindAuditHash: { write: "write:audit_hash" }
+        },
+        secretCapabilities: {
+          geminiKey: { allowSelfWrite: true },
+          openaiKey: { write: "write:ai_keys", allowSelfWrite: false }
         }
       });
 
-      const serverStore = new FirestoreServerStore<Role, Cap, Prefs, Attrs, Secrets>({
+      const serverStore = new FirestoreServerStore<Role, Cap, Prefs, Attrs, HiddenAttrs, Secrets>({
         db: adminDb,
         defaultRole: "attendee",
-        usersCollection: "users_st"
+        usersCollection: "users_st",
+        encryptionKey: "emulator-test-master-encryption-key"
       });
       const clientStore = new FirestoreClientStore<Role, Cap, Prefs, Attrs>({
         db: clientDb,
@@ -286,7 +296,7 @@ describe.skipIf(!existsSync(EMULATOR_JAR))(
       });
 
       const adminAuth = createFakeAdminAuth();
-      const server = createLanyardServer<Role, Cap, Prefs, Attrs, Secrets>({
+      const server = createLanyardServer<Role, Cap, Prefs, Attrs, HiddenAttrs, Secrets>({
         adminAuth,
         store: serverStore,
         policy,
@@ -359,7 +369,7 @@ describe.skipIf(!existsSync(EMULATOR_JAR))(
         targetUid: attendee.uid,
         patch: { pointsAllTime: 35 }
       });
-      await server.updateUserSecretsAs({
+      await server.updateUserHiddenAttributesAs({
         actorUid: scanner.uid,
         targetUid: attendee.uid,
         patch: { scannerAuditLog: "Checked in at Main Hall" }
@@ -370,7 +380,7 @@ describe.skipIf(!existsSync(EMULATOR_JAR))(
       expect(updatedAttrs.merchCreditBalance).toBe(100);
       expect(updatedAttrs.awardedBadges).toEqual(["registered"]);
 
-      // Verify secrets in `users_st/{uid}/private/secrets` NEVER leak into `userRecordStore` or `attributesStore`
+      // Verify hiddenAttributes in `users_st/{uid}/private/hiddenAttributes` NEVER leak into `userRecordStore` or `attributesStore`
       expect((client.userRecordStore.get() as any)?.scannerAuditLog).toBeUndefined();
       expect((client.attributesStore.get() as any)?.scannerAuditLog).toBeUndefined();
 
@@ -380,7 +390,7 @@ describe.skipIf(!existsSync(EMULATOR_JAR))(
         targetUid: attendee.uid,
         patch: { merchCreditBalance: 80 }
       });
-      await server.updateUserSecretsAs({
+      await server.updateUserHiddenAttributesAs({
         actorUid: merchSeller.uid,
         targetUid: attendee.uid,
         patch: { merchPosPin: "7744" }
@@ -393,7 +403,7 @@ describe.skipIf(!existsSync(EMULATOR_JAR))(
         })
       ).rejects.toThrow(/Forbidden/);
 
-      // Sibling attribute & secret read redaction from real Firestore:
+      // Sibling attribute & hiddenAttribute read redaction from real Firestore:
       expect(
         await server.readUserAttributesAs({
           actorUid: scanner.uid,
@@ -404,7 +414,7 @@ describe.skipIf(!existsSync(EMULATOR_JAR))(
         awardedBadges: ["registered"]
       });
       expect(
-        await server.readUserSecretsAs({
+        await server.readUserHiddenAttributesAs({
           actorUid: scanner.uid,
           targetUid: attendee.uid
         })
@@ -412,7 +422,7 @@ describe.skipIf(!existsSync(EMULATOR_JAR))(
         scannerAuditLog: "Checked in at Main Hall"
       });
       expect(
-        await server.readUserSecretsAs({
+        await server.readUserHiddenAttributesAs({
           actorUid: merchSeller.uid,
           targetUid: attendee.uid
         })
@@ -433,29 +443,29 @@ describe.skipIf(!existsSync(EMULATOR_JAR))(
         readonlySystemBadge: "pioneer"
       });
       await expect(
-        server.updateUserSecretsAs({
+        server.updateUserHiddenAttributesAs({
           actorUid: auditor.uid,
           targetUid: attendee.uid,
           patch: { scannerAuditLog: "Auditor tamper" }
         })
       ).rejects.toThrow(/Forbidden/);
 
-      // 4. Write-only secret (`blindAuditHash`) & superAdmin secret on real Firestore:
-      await server.updateUserSecretsAs({
+      // 4. Write-only hiddenAttribute (`blindAuditHash`), superAdmin hiddenAttribute, & AES-256-GCM encrypted `secrets` on real Firestore:
+      await server.updateUserHiddenAttributesAs({
         actorUid: moderator.uid,
         targetUid: attendee.uid,
         patch: { blindAuditHash: "sha256:998877" }
       });
-      await server.updateUserSecretsAs({
+      await server.updateUserHiddenAttributesAs({
         actorUid: "root-admin",
         isSystemAdmin: true,
         targetUid: attendee.uid,
         patch: { superAdminSecret: "root-eyes-only" }
       });
 
-      // Moderator reads both sibling secrets via diamond inheritance, while `blindAuditHash` and `superAdminSecret` are redacted
+      // Moderator reads both sibling hiddenAttributes via diamond inheritance, while `blindAuditHash` and `superAdminSecret` are redacted
       expect(
-        await server.readUserSecretsAs({
+        await server.readUserHiddenAttributesAs({
           actorUid: moderator.uid,
           targetUid: attendee.uid
         })
@@ -464,9 +474,9 @@ describe.skipIf(!existsSync(EMULATOR_JAR))(
         merchPosPin: "7744"
       });
 
-      // System admin reads all 4 secret fields from real Firestore
+      // System admin reads all 4 hiddenAttribute fields from real Firestore
       expect(
-        await server.readUserSecretsAs({
+        await server.readUserHiddenAttributesAs({
           actorUid: "root-admin",
           isSystemAdmin: true,
           targetUid: attendee.uid
@@ -477,6 +487,33 @@ describe.skipIf(!existsSync(EMULATOR_JAR))(
         blindAuditHash: "sha256:998877",
         superAdminSecret: "root-eyes-only"
       });
+
+      // Write-only AES-256-GCM encrypted user secrets on real Firestore (`users_st/{uid}/private/secrets`):
+      const secretStatus1 = await server.updateUserSecretsAs({
+        actorUid: attendee.uid,
+        targetUid: attendee.uid,
+        patch: { geminiKey: "AIzaSyRealFirestoreKey123" }
+      });
+      expect(secretStatus1).toEqual({ geminiKey: true });
+
+      // Inspect raw Firestore document directly via Admin SDK to prove AES-256-GCM encryption at rest!
+      const rawSecretSnap = await adminDb.doc(`users_st/${attendee.uid}/private/secrets`).get();
+      const rawSecretData = rawSecretSnap.data();
+      expect(isEncryptedSecretData(rawSecretData?.geminiKey)).toBe(true);
+      expect(JSON.stringify(rawSecretData)).not.toContain("AIzaSyRealFirestoreKey123");
+
+      // Server decrypts it cleanly via getDecryptedUserSecrets, and clearing with "" deletes the field via FieldValue.delete()
+      expect(await server.getDecryptedUserSecrets(attendee.uid)).toEqual({
+        geminiKey: "AIzaSyRealFirestoreKey123"
+      });
+      expect(
+        await server.updateUserSecretsAs({
+          actorUid: attendee.uid,
+          targetUid: attendee.uid,
+          patch: { geminiKey: "" }
+        })
+      ).toEqual({});
+      expect(await server.getDecryptedUserSecrets(attendee.uid)).toEqual({});
 
       // 5. Client self-service preferences & profile updates on real Firestore preserve role, capabilities, and attributes
       await client.updatePreferences({ leaderboardOptIn: true, theme: "dark" });
@@ -614,9 +651,9 @@ describe.skipIf(!existsSync(EMULATOR_JAR))(
       client.destroy();
     });
 
-    it("enforces multi-tenant capabilities, FieldValue.arrayUnion/arrayRemove, collectionGroup memberships, and secret cleanup on real Firestore", async () => {
+    it("enforces multi-tenant capabilities, FieldValue.arrayUnion/arrayRemove, collectionGroup memberships, and hiddenAttribute/secret cleanup on real Firestore", async () => {
       type Role = "member" | "manager" | "owner";
-      type Cap = "edit:content" | "manage:billing" | "read:notes" | "write:notes";
+      type Cap = "edit:content" | "manage:billing" | "read:notes" | "write:notes" | "manage:secrets";
 
       const policy = createPermissionPolicy<Role, Cap>({
         roles: {
@@ -627,8 +664,11 @@ describe.skipIf(!existsSync(EMULATOR_JAR))(
         attributeCapabilities: {
           quotaTier: "manage:billing"
         },
-        secretCapabilities: {
+        hiddenAttributeCapabilities: {
           internalNotes: { read: "read:notes", write: "write:notes" }
+        },
+        secretCapabilities: {
+          geminiKey: { write: "manage:secrets", allowSelfWrite: false }
         }
       });
 
@@ -637,13 +677,15 @@ describe.skipIf(!existsSync(EMULATOR_JAR))(
         Cap,
         Record<string, any>,
         { quotaTier: string },
-        { internalNotes: string }
+        { internalNotes: string },
+        { geminiKey: string }
       >({
         db: adminDb,
         defaultRole: "member",
         usersCollection: "users_mt",
         scopeCollection: "orgs_mt",
-        membersSubcollection: "members_mt"
+        membersSubcollection: "members_mt",
+        encryptionKey: "emulator-mt-master-key"
       });
       const clientStore = new FirestoreClientStore<Role, Cap, Record<string, any>, { quotaTier: string }>({
         db: clientDb,
@@ -659,7 +701,8 @@ describe.skipIf(!existsSync(EMULATOR_JAR))(
         Cap,
         Record<string, any>,
         { quotaTier: string },
-        { internalNotes: string }
+        { internalNotes: string },
+        { geminiKey: string }
       >({
         adminAuth,
         store: serverStore,
@@ -716,25 +759,47 @@ describe.skipIf(!existsSync(EMULATOR_JAR))(
       expect(membershipsState.memberships.map((m) => m.scopeId).sort()).toEqual(["org-1", "org-2"]);
 
       // 3. Cross-tenant isolation on real Firestore:
-      // Worker is `owner` in `org-2` (can write secrets in `org-2`), but only `member` with `["manage:billing"]` in `org-1`
-      await server.updateScopeMemberSecretsAs({
+      // Worker is `owner` in `org-2` (can write hiddenAttributes and scope secrets in `org-2`),
+      // but only `member` with `["manage:billing"]` in `org-1`
+      await server.updateScopeMemberHiddenAttributesAs({
         scopeId: "org-2",
         actorUid: m1.uid,
         targetUid: m1.uid,
         patch: { internalNotes: "Org 2 note" }
       });
+      await server.updateScopeMemberSecretsAs({
+        scopeId: "org-2",
+        actorUid: m1.uid,
+        targetUid: m1.uid,
+        patch: { geminiKey: "AIzaSyMemberKeyOrg2" }
+      });
+      await server.updateScopeSecretsAs({
+        scopeId: "org-2",
+        actorUid: m1.uid,
+        patch: { geminiKey: "AIzaSySharedOrg2" }
+      });
+      expect(await server.getDecryptedScopeSecrets("org-2")).toEqual({ geminiKey: "AIzaSySharedOrg2" });
+
       await expect(
-        server.updateScopeMemberSecretsAs({
+        server.updateScopeMemberHiddenAttributesAs({
           scopeId: "org-1",
           actorUid: m1.uid,
           targetUid: m1.uid,
           patch: { internalNotes: "Unauthorized Org 1 note" }
         })
       ).rejects.toThrow(/Forbidden/);
+      await expect(
+        server.updateScopeSecretsAs({
+          scopeId: "org-1",
+          actorUid: m1.uid,
+          patch: { geminiKey: "AIzaSyUnauthorizedOrg1" }
+        })
+      ).rejects.toThrow(/Forbidden/);
 
-      // 4. Deleting scope member in `org-2` also deletes `orgs_mt/org-2/members_mt/{uid}/private/secrets` in real Firestore
+      // 4. Deleting scope member in `org-2` also deletes both `private/hiddenAttributes` and `private/secrets` in real Firestore
       await serverStore.deleteScopeMember("org-2", m1.uid);
       expect(await serverStore.getScopeMember("org-2", m1.uid)).toBeNull();
+      expect(await serverStore.getScopeMemberHiddenAttributes("org-2", m1.uid)).toEqual({});
       expect(await serverStore.getScopeMemberSecrets("org-2", m1.uid)).toEqual({});
 
       client.destroy();
@@ -795,7 +860,7 @@ service cloud.firestore {
         (!('uid' in request.resource.data) || request.resource.data.uid == uid)
       );
 
-      match /private/secrets {
+      match /private/{docId} {
         allow read, write: if isAdmin();
       }
     }
@@ -812,8 +877,12 @@ service cloud.firestore {
         request.resource.data.diff(resource.data).affectedKeys().hasOnly(['lastSeen', 'photoUrl', 'preferences'])
       );
 
-      match /private/secrets {
+      match /private/hiddenAttributes {
         allow read, write: if hasScopeCapability(scopeId, 'invite_members', ['owner', 'manager']);
+      }
+
+      match /private/secrets {
+        allow read, write: if false;
       }
     }
   }
@@ -861,12 +930,20 @@ service cloud.firestore {
           compactMode: boolean;
         }
 
-        const serverStore = new FirestoreServerStore<Role, Cap, Prefs, { badge: string }, { secretNote: string }>({
+        const serverStore = new FirestoreServerStore<
+          Role,
+          Cap,
+          Prefs,
+          { badge: string },
+          { secretNote: string },
+          { geminiKey: string }
+        >({
           db: adminDb,
           defaultRole: "member",
           usersCollection: "users",
           scopeCollection: "workspaces",
-          membersSubcollection: "members"
+          membersSubcollection: "members",
+          encryptionKey: "emulator-rules-test-key"
         });
 
         const memberStore = new FirestoreClientStore<Role, Cap, Prefs, { badge: string }>({
@@ -944,8 +1021,12 @@ service cloud.firestore {
           role: "owner",
           capabilities: []
         });
-        await serverStore.updateUserSecrets("u-member", { secretNote: "Top secret global note" });
-        await serverStore.updateScopeMemberSecrets("org-A", "u-member", { secretNote: "Top secret org-A note" });
+        await serverStore.updateUserHiddenAttributes("u-member", { secretNote: "Top secret global note" });
+        await serverStore.updateScopeMemberHiddenAttributes("org-A", "u-member", {
+          secretNote: "Top secret org-A note"
+        });
+        await serverStore.updateUserSecrets("u-member", { geminiKey: "AIzaSyGlobalSecret" });
+        await serverStore.updateScopeMemberSecrets("org-A", "u-member", { geminiKey: "AIzaSyOrgASecret" });
 
         // 3. Direct client `subscribeToUserMemberships` (`collectionGroup` query) & `subscribeToScopeMembers` under Security Rules
         const membershipsList: any[] = [];
@@ -1034,17 +1115,26 @@ service cloud.firestore {
           code: "permission-denied"
         });
 
-        // Attack C: Non-admin user tries to read or write their own `users/u-member/private/secrets` or scoped `private/secrets`
+        // Attack C: Non-admin user tries to read or write their own `private/hiddenAttributes` or `private/secrets`
+        await expect(
+          clientGetDoc(clientDoc(memberClient.db, "users", "u-member", "private", "hiddenAttributes"))
+        ).rejects.toMatchObject({ code: "permission-denied" });
+        await expect(
+          clientSetDoc(clientDoc(memberClient.db, "users", "u-member", "private", "hiddenAttributes"), {
+            secretNote: "hacked"
+          })
+        ).rejects.toMatchObject({ code: "permission-denied" });
         await expect(
           clientGetDoc(clientDoc(memberClient.db, "users", "u-member", "private", "secrets"))
         ).rejects.toMatchObject({ code: "permission-denied" });
         await expect(
-          clientSetDoc(clientDoc(memberClient.db, "users", "u-member", "private", "secrets"), {
-            secrets: { secretNote: "hacked" }
-          })
+          clientGetDoc(
+            clientDoc(memberClient.db, "workspaces", "org-A", "members", "u-member", "private", "hiddenAttributes")
+          )
         ).rejects.toMatchObject({ code: "permission-denied" });
+        // Even manager cannot read raw `private/secrets` directly from the client SDK!
         await expect(
-          clientGetDoc(clientDoc(memberClient.db, "workspaces", "org-A", "members", "u-member", "private", "secrets"))
+          clientGetDoc(clientDoc(mgrClient.db, "workspaces", "org-A", "members", "u-member", "private", "secrets"))
         ).rejects.toMatchObject({ code: "permission-denied" });
 
         // Attack D: Scoped member tries to self-escalate `role`, `capabilities`, or `attributes` on `workspaces/org-A/members/u-member`
@@ -1059,7 +1149,7 @@ service cloud.firestore {
           })
         ).rejects.toMatchObject({ code: "permission-denied" });
 
-        // Attack E: Manager of `org-A` (`u-mgr`) tries to read or write `org-B` members or secrets (cross-tenant isolation)
+        // Attack E: Manager of `org-A` (`u-mgr`) tries to read or write `org-B` members or hiddenAttributes (cross-tenant isolation)
         await expect(
           clientGetDoc(clientDoc(mgrClient.db, "workspaces", "org-B", "members", "u-other"))
         ).rejects.toMatchObject({ code: "permission-denied" });
@@ -1070,16 +1160,16 @@ service cloud.firestore {
           })
         ).rejects.toMatchObject({ code: "permission-denied" });
 
-        // Positive Verification: Manager of `org-A` CAN read/write `org-A` member secrets, and System Admin CAN read/write global `private/secrets`
-        const orgASecretSnap = await clientGetDoc(
-          clientDoc(mgrClient.db, "workspaces", "org-A", "members", "u-member", "private", "secrets")
+        // Positive Verification: Manager of `org-A` CAN read/write `org-A` member `private/hiddenAttributes`, and System Admin CAN read/write global `private/hiddenAttributes`
+        const orgAHiddenSnap = await clientGetDoc(
+          clientDoc(mgrClient.db, "workspaces", "org-A", "members", "u-member", "private", "hiddenAttributes")
         );
-        expect(orgASecretSnap.data()).toEqual({ secretNote: "Top secret org-A note" });
+        expect(orgAHiddenSnap.data()).toEqual({ secretNote: "Top secret org-A note" });
 
-        const globalSecretSnap = await clientGetDoc(
-          clientDoc(sysAdminClient.db, "users", "u-member", "private", "secrets")
+        const globalHiddenSnap = await clientGetDoc(
+          clientDoc(sysAdminClient.db, "users", "u-member", "private", "hiddenAttributes")
         );
-        expect(globalSecretSnap.data()).toEqual({ secretNote: "Top secret global note" });
+        expect(globalHiddenSnap.data()).toEqual({ secretNote: "Top secret global note" });
       } finally {
         await terminate(memberClient.db);
         await deleteClientApp(memberClient.app);

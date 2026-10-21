@@ -37,9 +37,9 @@ export interface RoleDefinition<TRole extends string = string, TCapability exten
 }
 
 /**
- * Specifies the required capability for reading and/or writing a specific attribute or secret field.
- * If a string `TCapability` is passed directly, it is treated as `{ write: capability }` for attributes,
- * or `{ read: capability, write: capability }` for secrets.
+ * Specifies the required capability for reading and/or writing a specific `attributes` or `hiddenAttributes` field.
+ * If a string `TCapability` is passed directly, it is treated as `{ write: capability }` for `attributes`,
+ * or `{ read: capability, write: capability }` for `hiddenAttributes`.
  */
 export type FieldCapabilityRule<TCapability extends string = string> =
   | TCapability
@@ -49,11 +49,40 @@ export type FieldCapabilityRule<TCapability extends string = string> =
     };
 
 /**
+ * Specifies who is allowed to set or clear a write-only encrypted secret field (e.g., an API key or OAuth token).
+ * Encrypted secrets can NEVER be read back out to any client—only boolean configured status is exposed,
+ * and only trusted server-side code can decrypt them.
+ */
+export type SecretCapabilityRule<TCapability extends string = string> =
+  | TCapability
+  | {
+      write?: TCapability;
+      allowSelfWrite?: boolean;
+    };
+
+/**
+ * AES-256-GCM encrypted secret payload stored at rest in `private/secrets`.
+ */
+export interface EncryptedSecretData {
+  ciphertext: string;
+  iv: string;
+  tag: string;
+}
+
+/**
+ * Cipher interface for encrypting and decrypting write-only secrets at rest.
+ */
+export interface SecretCipher {
+  encrypt(plaintext: string): EncryptedSecretData;
+  decrypt(encrypted: EncryptedSecretData): string;
+}
+
+/**
  * Configuration for creating a custom `PermissionPolicy<TRole, TCapability>`.
  *
  * Consuming applications define their own role hierarchy (`TRole`) and orthogonal capabilities (`TCapability`),
  * along with role inheritance (`inherits`), implied capabilities, presence tracking, and field-level
- * capability rules for `attributes` and `secrets`.
+ * capability rules for `attributes`, `hiddenAttributes`, and write-only encrypted `secrets`.
  */
 export interface PermissionPolicyConfig<TRole extends string = string, TCapability extends string = string> {
   /**
@@ -68,15 +97,20 @@ export interface PermissionPolicyConfig<TRole extends string = string, TCapabili
   defaultRole?: TRole;
   /**
    * Optional capability rules governing who can read or write specific keys in `attributes`
-   * (beyond global system admins).
+   * (beyond global system admins). `self` can always read their own `attributes`.
    */
   attributeCapabilities?: Record<string, FieldCapabilityRule<TCapability>>;
   /**
-   * Optional capability rules governing who can read or write specific keys in `secrets`
-   * (beyond global system admins). Secrets are never readable or writable by `self` unless
-   * the caller holds the required capability or is a system admin.
+   * Optional capability rules governing who can read or write specific keys in `hiddenAttributes`
+   * (properties about a user that are hidden from the user and only readable/writable by authorized roles or system admins).
    */
-  secretCapabilities?: Record<string, FieldCapabilityRule<TCapability>>;
+  hiddenAttributeCapabilities?: Record<string, FieldCapabilityRule<TCapability>>;
+  /**
+   * Optional capability rules governing who can write/clear specific keys in write-only encrypted `secrets`.
+   * If a key is not listed in `secretCapabilities`, `isSelf = true` (the user themselves) or `isSystemAdmin = true`
+   * is allowed to set/clear their own secret by default.
+   */
+  secretCapabilities?: Record<string, SecretCapabilityRule<TCapability>>;
 }
 
 /**
@@ -185,34 +219,53 @@ export interface PermissionPolicy<TRole extends string = string, TCapability ext
   ): boolean;
 
   /**
-   * Evaluates whether the caller can read a specific `secrets` key.
-   * `self` NEVER grants read access to `secrets`. Only `isSystemAdmin = true` or an actor holding
-   * the configured `read` capability for `key` in `secretCapabilities` is permitted.
+   * Evaluates whether the caller can read a specific `hiddenAttributes` key.
+   * `self` NEVER grants read access to `hiddenAttributes`. Only `isSystemAdmin = true` or an actor holding
+   * the configured `read` capability for `key` in `hiddenAttributeCapabilities` is permitted.
    */
-  canReadSecret(
+  canReadHiddenAttribute(
     actor: PolicySubject<TRole, TCapability> | null | undefined,
     key: string,
     isSystemAdmin?: boolean
   ): boolean;
 
   /**
-   * Evaluates whether the caller can write a specific `secrets` key.
-   * `self` NEVER grants write access to `secrets`. Only `isSystemAdmin = true` or an actor holding
-   * the configured `write` capability for `key` in `secretCapabilities` is permitted.
+   * Evaluates whether the caller can write a specific `hiddenAttributes` key.
+   * `self` NEVER grants write access to `hiddenAttributes`. Only `isSystemAdmin = true` or an actor holding
+   * the configured `write` capability for `key` in `hiddenAttributeCapabilities` is permitted.
+   */
+  canWriteHiddenAttribute(
+    actor: PolicySubject<TRole, TCapability> | null | undefined,
+    key: string,
+    isSystemAdmin?: boolean
+  ): boolean;
+
+  /**
+   * Evaluates whether the caller can write all keys in the provided `hiddenAttributes` patch.
+   */
+  canWriteHiddenAttributesPatch(
+    actor: PolicySubject<TRole, TCapability> | null | undefined,
+    patch: Record<string, any>,
+    isSystemAdmin?: boolean
+  ): boolean;
+
+  /**
+   * Evaluates whether the caller can write or clear a specific write-only encrypted `secrets` key.
+   * Encrypted secrets can NEVER be read back out to any client.
    */
   canWriteSecret(
     actor: PolicySubject<TRole, TCapability> | null | undefined,
     key: string,
-    isSystemAdmin?: boolean
+    options?: boolean | { isSystemAdmin?: boolean; isSelf?: boolean }
   ): boolean;
 
   /**
-   * Evaluates whether the caller can write all keys in the provided `secrets` patch.
+   * Evaluates whether the caller can write or clear all keys in the provided `secrets` patch.
    */
   canWriteSecretsPatch(
     actor: PolicySubject<TRole, TCapability> | null | undefined,
     patch: Record<string, any>,
-    isSystemAdmin?: boolean
+    options?: boolean | { isSystemAdmin?: boolean; isSelf?: boolean }
   ): boolean;
 
   /**
@@ -225,13 +278,13 @@ export interface PermissionPolicy<TRole extends string = string, TCapability ext
   ): Partial<TAttributes>;
 
   /**
-   * Returns a shallow copy of `secrets` containing only the keys that `actor` is permitted to read.
+   * Returns a shallow copy of `hiddenAttributes` containing only the keys that `actor` is permitted to read.
    */
-  filterReadableSecrets<TSecrets extends Record<string, any>>(
+  filterReadableHiddenAttributes<THiddenAttributes extends Record<string, any>>(
     actor: PolicySubject<TRole, TCapability> | null | undefined,
-    secrets: Partial<TSecrets> | null | undefined,
+    hiddenAttributes: Partial<THiddenAttributes> | null | undefined,
     isSystemAdmin?: boolean
-  ): Partial<TSecrets>;
+  ): Partial<THiddenAttributes>;
 }
 
 /**
@@ -447,6 +500,7 @@ export interface LanyardServerStore<
   TCapability extends string = string,
   TPreferences extends Record<string, any> = Record<string, any>,
   TAttributes extends Record<string, any> = Record<string, any>,
+  THiddenAttributes extends Record<string, any> = Record<string, any>,
   TSecrets extends Record<string, any> = Record<string, any>
 > {
   // --- Global User (`users/{uid}`) & System Admin Operations ---
@@ -456,8 +510,25 @@ export interface LanyardServerStore<
     uid: string,
     patch: Partial<TAttributes>
   ): Promise<UserRecord<TRole, TCapability, TPreferences, TAttributes>>;
-  getUserSecrets?(uid: string): Promise<Partial<TSecrets>>;
-  updateUserSecrets?(uid: string, patch: Partial<TSecrets>): Promise<Partial<TSecrets>>;
+  getUserHiddenAttributes?(uid: string): Promise<Partial<THiddenAttributes>>;
+  updateUserHiddenAttributes?(uid: string, patch: Partial<THiddenAttributes>): Promise<Partial<THiddenAttributes>>;
+  /**
+   * Server-only: Retrieves decrypted secrets for `uid` (used by backend services when calling external APIs).
+   * Never expose the return value of `getUserSecrets` to a client response.
+   */
+  getUserSecrets?(uid: string): Promise<Partial<Record<keyof TSecrets & string, string>>>;
+  /**
+   * Returns a client-safe boolean map indicating which secret keys are currently configured for `uid`.
+   */
+  getUserSecretsStatus?(uid: string): Promise<Partial<Record<keyof TSecrets & string, boolean>>>;
+  /**
+   * Encrypts and saves non-empty secret strings for `uid`, or deletes keys whose value is `""` or `null`.
+   * Returns the updated client-safe boolean status map.
+   */
+  updateUserSecrets?(
+    uid: string,
+    patch: Partial<Record<keyof TSecrets & string, string | null | undefined>>
+  ): Promise<Partial<Record<keyof TSecrets & string, boolean>>>;
   /**
    * Optional: Additively grants `capabilities` to global `users/{uid}` without clobbering existing capabilities.
    * If the user does not yet exist, initializes the record using `fallbackUser`.
@@ -492,8 +563,49 @@ export interface LanyardServerStore<
     uid: string,
     patch: Partial<TAttributes>
   ): Promise<ScopedMember<TRole, TCapability, TPreferences, TAttributes>>;
-  getScopeMemberSecrets?(scopeId: string, uid: string): Promise<Partial<TSecrets>>;
-  updateScopeMemberSecrets?(scopeId: string, uid: string, patch: Partial<TSecrets>): Promise<Partial<TSecrets>>;
+  getScopeMemberHiddenAttributes?(scopeId: string, uid: string): Promise<Partial<THiddenAttributes>>;
+  updateScopeMemberHiddenAttributes?(
+    scopeId: string,
+    uid: string,
+    patch: Partial<THiddenAttributes>
+  ): Promise<Partial<THiddenAttributes>>;
+  /**
+   * Server-only: Retrieves decrypted secrets for member `(scopeId, uid)`.
+   * Never expose the return value of `getScopeMemberSecrets` to a client response.
+   */
+  getScopeMemberSecrets?(scopeId: string, uid: string): Promise<Partial<Record<keyof TSecrets & string, string>>>;
+  /**
+   * Returns a client-safe boolean map indicating which secret keys are currently configured for member `(scopeId, uid)`.
+   */
+  getScopeMemberSecretsStatus?(
+    scopeId: string,
+    uid: string
+  ): Promise<Partial<Record<keyof TSecrets & string, boolean>>>;
+  /**
+   * Encrypts and saves non-empty secret strings for member `(scopeId, uid)`, or deletes keys whose value is `""` or `null`.
+   * Returns the updated client-safe boolean status map.
+   */
+  updateScopeMemberSecrets?(
+    scopeId: string,
+    uid: string,
+    patch: Partial<Record<keyof TSecrets & string, string | null | undefined>>
+  ): Promise<Partial<Record<keyof TSecrets & string, boolean>>>;
+  /**
+   * Server-only: Retrieves decrypted scope-wide secrets (`{scopeCollection}/{scopeId}/private/secrets`).
+   */
+  getScopeSecrets?(scopeId: string): Promise<Partial<Record<keyof TSecrets & string, string>>>;
+  /**
+   * Returns a client-safe boolean map indicating which scope-wide secret keys are currently configured for `scopeId`.
+   */
+  getScopeSecretsStatus?(scopeId: string): Promise<Partial<Record<keyof TSecrets & string, boolean>>>;
+  /**
+   * Encrypts and saves non-empty scope-wide secret strings for `scopeId`, or deletes keys whose value is `""` or `null`.
+   * Returns the updated client-safe boolean status map.
+   */
+  updateScopeSecrets?(
+    scopeId: string,
+    patch: Partial<Record<keyof TSecrets & string, string | null | undefined>>
+  ): Promise<Partial<Record<keyof TSecrets & string, boolean>>>;
   /**
    * Additively grants `capabilities` to `(scopeId, uid)` without clobbering existing capabilities.
    * If the member does not yet exist in `scopeId`, initializes the record using `fallbackMember`.
