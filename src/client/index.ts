@@ -590,7 +590,50 @@ export function createLanyardClient<
 
   // --- Self-Service Profile & Preferences ---
 
-  async function updatePreferences(patch: Partial<TPreferences>, syncToStore = true): Promise<void> {
+  async function updateScopePreferences(
+    scopeId: string,
+    patch: Partial<TPreferences>,
+    syncToStore = true
+  ): Promise<void> {
+    if (!isValidResourceId(scopeId)) {
+      throw new Error("Invalid scopeId");
+    }
+    const cleanPatch = sanitizePreferencesObject<TPreferences>(patch);
+    membershipsStoreInternal.update((state) => ({
+      ...state,
+      memberships: state.memberships.map((m) =>
+        m.scopeId === scopeId
+          ? {
+              ...m,
+              preferences: {
+                ...(m.preferences || {}),
+                ...cleanPatch
+              }
+            }
+          : m
+      )
+    }));
+
+    const currentUser = authStoreInternal.get().user;
+    if (syncToStore && currentUser?.uid) {
+      if (typeof store.saveScopePreferences !== "function") {
+        throw new Error("Backing store does not implement saveScopePreferences");
+      }
+      await store.saveScopePreferences(scopeId, currentUser.uid, cleanPatch);
+    }
+  }
+
+  async function updatePreferences(
+    patch: Partial<TPreferences>,
+    options: boolean | { syncToStore?: boolean; scopeId?: string } = true
+  ): Promise<void> {
+    const syncToStore = typeof options === "boolean" ? options : (options?.syncToStore ?? true);
+    const scopeId = typeof options === "object" && options !== null ? options.scopeId : undefined;
+
+    if (scopeId !== undefined) {
+      return updateScopePreferences(scopeId, patch, syncToStore);
+    }
+
     const cleanPatch = sanitizePreferencesObject<TPreferences>(patch);
     preferencesStoreInternal.update((current) => {
       const updated = { ...current, ...cleanPatch };
@@ -617,6 +660,131 @@ export function createLanyardClient<
       throw new Error("Backing store does not implement updateUserProfile");
     }
     await store.updateUserProfile(currentUser.uid, patch);
+  }
+
+  // --- Unified Role, Capability, and Custom Property Accessors (Unscoped & Scoped) ---
+
+  function resolveTargetSubject(
+    scopeId?: string
+  ):
+    | UserRecord<TRole, TCapability, TPreferences, TAttributes>
+    | ScopedMember<TRole, TCapability, TPreferences, TAttributes>
+    | null {
+    if (scopeId !== undefined) {
+      if (!isValidResourceId(scopeId)) return null;
+      return membershipsStoreInternal.get().memberships.find((m) => m.scopeId === scopeId) || null;
+    }
+    return userRecordStoreInternal.get();
+  }
+
+  function getRole(scopeId?: string): TRole | null {
+    const subject = resolveTargetSubject(scopeId);
+    return subject?.role ?? null;
+  }
+
+  function hasMinimumRole(minimumRole: TRole, scopeId?: string): boolean {
+    const currentUser = authStoreInternal.get().user;
+    if (!currentUser) return false;
+    const isAdmin = Boolean(currentUser.isAdmin);
+    const subject = resolveTargetSubject(scopeId);
+    if (policy) {
+      return policy.hasMinimumRole(subject, minimumRole, isAdmin);
+    }
+    if (isAdmin) return true;
+    return subject?.role === minimumRole;
+  }
+
+  function hasRole(minimumRole: TRole, scopeId?: string): boolean {
+    return hasMinimumRole(minimumRole, scopeId);
+  }
+
+  function getCapabilities(scopeId?: string): TCapability[] {
+    const currentUser = authStoreInternal.get().user;
+    if (!currentUser) return [];
+    const isAdmin = Boolean(currentUser.isAdmin);
+    const subject = resolveTargetSubject(scopeId);
+    const result = new Set<TCapability>(subject?.capabilities || []);
+    if (policy) {
+      if (isAdmin) {
+        for (const caps of Object.values(policy.roleCapabilities) as Array<readonly TCapability[] | "*" | undefined>) {
+          if (Array.isArray(caps)) {
+            for (const c of caps) result.add(c);
+          }
+        }
+      } else if (subject?.role && Object.hasOwn(policy.roleCapabilities, subject.role)) {
+        const roleCaps = policy.roleCapabilities[subject.role];
+        if (roleCaps === "*") {
+          for (const caps of Object.values(policy.roleCapabilities) as Array<
+            readonly TCapability[] | "*" | undefined
+          >) {
+            if (Array.isArray(caps)) {
+              for (const c of caps) result.add(c);
+            }
+          }
+        } else if (Array.isArray(roleCaps)) {
+          for (const c of roleCaps) result.add(c);
+        }
+      }
+    }
+    return Array.from(result);
+  }
+
+  function hasCapability(capability: TCapability, scopeId?: string): boolean {
+    const currentUser = authStoreInternal.get().user;
+    if (!currentUser) return false;
+    const isAdmin = Boolean(currentUser.isAdmin);
+    const subject = resolveTargetSubject(scopeId);
+    if (policy) {
+      return policy.hasCapability(subject, capability, isAdmin);
+    }
+    if (isAdmin) return true;
+    return Boolean(subject?.capabilities?.includes(capability));
+  }
+
+  function hasAnyCapability(capabilities: readonly TCapability[], scopeId?: string): boolean {
+    const currentUser = authStoreInternal.get().user;
+    if (!currentUser) return false;
+    const isAdmin = Boolean(currentUser.isAdmin);
+    const subject = resolveTargetSubject(scopeId);
+    if (policy) {
+      return policy.hasAnyCapability(subject, capabilities, isAdmin);
+    }
+    if (isAdmin) return true;
+    if (capabilities.length === 0) return true;
+    return capabilities.some((c) => Boolean(subject?.capabilities?.includes(c)));
+  }
+
+  function hasAllCapabilities(capabilities: readonly TCapability[], scopeId?: string): boolean {
+    const currentUser = authStoreInternal.get().user;
+    if (!currentUser) return false;
+    const isAdmin = Boolean(currentUser.isAdmin);
+    const subject = resolveTargetSubject(scopeId);
+    if (policy) {
+      return policy.hasAllCapabilities(subject, capabilities, isAdmin);
+    }
+    if (isAdmin) return true;
+    return capabilities.every((c) => Boolean(subject?.capabilities?.includes(c)));
+  }
+
+  function getAttributes(scopeId?: string): Partial<TAttributes> {
+    if (scopeId !== undefined) {
+      if (!isValidResourceId(scopeId)) return {};
+      const membership = membershipsStoreInternal.get().memberships.find((m) => m.scopeId === scopeId);
+      return sanitizePreferencesObject<TAttributes>(membership?.attributes || {});
+    }
+    return { ...attributesStoreInternal.get() };
+  }
+
+  function getPreferences(scopeId?: string): TPreferences {
+    if (scopeId !== undefined) {
+      if (!isValidResourceId(scopeId)) return { ...defaultPreferences };
+      const membership = membershipsStoreInternal.get().memberships.find((m) => m.scopeId === scopeId);
+      return {
+        ...defaultPreferences,
+        ...sanitizePreferencesObject<TPreferences>(membership?.preferences || {})
+      };
+    }
+    return { ...preferencesStoreInternal.get() };
   }
 
   // --- Presence Tracking (5-minute localStorage-throttled) ---
@@ -778,7 +946,17 @@ export function createLanyardClient<
     getSignInMethodsForEmail,
     sendEmailUpdateVerification,
     updatePreferences,
+    updateScopePreferences,
     updateProfile,
+    getRole,
+    hasRole,
+    hasMinimumRole,
+    getCapabilities,
+    hasCapability,
+    hasAnyCapability,
+    hasAllCapabilities,
+    getAttributes,
+    getPreferences,
     recordActivity,
     getPresenceStatus,
     syncPresence,

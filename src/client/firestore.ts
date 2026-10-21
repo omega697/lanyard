@@ -280,6 +280,20 @@ export class FirestoreClientStore<
     );
   }
 
+  async saveScopePreferences(scopeId: string, uid: string, patch: Partial<TPreferences>): Promise<void> {
+    const cleanScopeId = assertValidFirestoreDocId(scopeId, "scopeId");
+    const cleanUid = assertValidFirestoreDocId(uid, "uid");
+    const cleanPatch = sanitizeObjectPatch<TPreferences>(patch);
+    if (Object.keys(cleanPatch).length === 0) return;
+
+    const memberRef = doc(this.db, this.scopeCollection, cleanScopeId, this.membersSubcollection, cleanUid);
+    const dotPayload: Record<string, any> = {};
+    for (const [k, v] of Object.entries(cleanPatch)) {
+      dotPayload[`preferences.${k}`] = v;
+    }
+    await updateDoc(memberRef, dotPayload);
+  }
+
   async updateUserProfile(uid: string, patch: UserProfilePatch): Promise<void> {
     const cleanUid = assertValidFirestoreDocId(uid, "uid");
     if (!patch || typeof patch !== "object" || Array.isArray(patch)) return;

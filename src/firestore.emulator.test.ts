@@ -962,7 +962,7 @@ service cloud.firestore {
             .sort()
         ).toEqual(["u-member", "u-mgr"]);
 
-        // 4. Scoped `syncAvatar` and `recordPresenceHeartbeat` update existing scoped member doc without creating phantom docs
+        // 4. Scoped `syncAvatar`, `recordPresenceHeartbeat`, and `saveScopePreferences` update existing scoped member doc without creating phantom docs
         await memberStore.syncAvatar({
           uid: "u-member",
           scopeId: "org-A",
@@ -973,13 +973,16 @@ service cloud.firestore {
           scopeId: "org-A",
           lastSeenIso: "2026-10-21T12:05:00.000Z"
         });
+        await memberStore.saveScopePreferences("org-A", "u-member", { theme: "dark", compactMode: false });
+        await memberStore.saveScopePreferences("org-A", "u-member", { compactMode: true });
         await new Promise((r) => setTimeout(r, 150));
 
         const updatedOrgAMember = rosterList.at(-1)?.find((m: any) => m.uid === "u-member");
         expect(updatedOrgAMember?.photoUrl).toBe("https://example.com/scoped-avatar.png");
         expect(updatedOrgAMember?.lastSeen).toBe("2026-10-21T12:05:00.000Z");
+        expect(updatedOrgAMember?.preferences).toEqual({ theme: "dark", compactMode: true });
 
-        // Calling scoped `syncAvatar` or `recordPresenceHeartbeat` on a scope where user is NOT a member (`org-B`) must fail and NEVER create a phantom member doc
+        // Calling scoped `syncAvatar`, `recordPresenceHeartbeat`, or `saveScopePreferences` on a scope where user is NOT a member (`org-B`) must fail and NEVER create a phantom member doc
         await expect(
           memberStore.syncAvatar({
             uid: "u-member",
@@ -994,7 +997,16 @@ service cloud.firestore {
             lastSeenIso: "2026-10-21T12:05:00.000Z"
           })
         ).rejects.toThrow();
+        await expect(
+          memberStore.saveScopePreferences("org-B", "u-member", { theme: "dark", compactMode: true })
+        ).rejects.toThrow();
         expect(await serverStore.getScopeMember("org-B", "u-member")).toBeNull();
+
+        // Also verify `grantUserCapabilities` and `revokeUserCapabilities` on global `users/u-member` in real Firestore
+        await serverStore.grantUserCapabilities("u-member", ["edit:content"]);
+        expect((await serverStore.getUser("u-member"))?.capabilities).toEqual(["edit:content"]);
+        await serverStore.revokeUserCapabilities("u-member", ["edit:content"]);
+        expect((await serverStore.getUser("u-member"))?.capabilities).toEqual([]);
 
         unsubMemberships();
         unsubRoster();

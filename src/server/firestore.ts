@@ -195,6 +195,48 @@ export class FirestoreServerStore<
     return this.getUserSecrets(uid);
   }
 
+  async grantUserCapabilities(
+    uid: string,
+    capabilities: readonly TCapability[],
+    fallbackUser?: Omit<UserRecord<TRole, TCapability, TPreferences, TAttributes>, "capabilities">
+  ): Promise<UserRecord<TRole, TCapability, TPreferences, TAttributes>> {
+    const cleanUid = assertValidFirestoreDocId(uid, "uid");
+    const ref = this.userDocRef(cleanUid);
+    const snap = await ref.get();
+    if (!snap.exists) {
+      if (!fallbackUser) {
+        throw new Error(`User '${cleanUid}' does not exist`);
+      }
+      const created: UserRecord<TRole, TCapability, TPreferences, TAttributes> = {
+        ...fallbackUser,
+        ...(fallbackUser.photoUrl !== undefined ? { photoUrl: sanitizeAvatarUrl(fallbackUser.photoUrl) } : {}),
+        uid: cleanUid,
+        role: fallbackUser.role ?? this.defaultRole,
+        capabilities: Array.from(new Set(capabilities))
+      };
+      await ref.set(stripUndefinedFields(created), { merge: true });
+      return created;
+    }
+
+    if (capabilities.length > 0) {
+      await ref.update({
+        capabilities: FieldValue.arrayUnion(...capabilities)
+      });
+    }
+    return (await this.getUser(cleanUid))!;
+  }
+
+  async revokeUserCapabilities(uid: string, capabilities: readonly TCapability[]): Promise<void> {
+    if (capabilities.length === 0) return;
+    const cleanUid = assertValidFirestoreDocId(uid, "uid");
+    const ref = this.userDocRef(cleanUid);
+    const snap = await ref.get();
+    if (!snap.exists) return;
+    await ref.update({
+      capabilities: FieldValue.arrayRemove(...capabilities)
+    });
+  }
+
   async getSystemAdmin(uid: string): Promise<SystemAdminProfile | null> {
     const snap = await this.userDocRef(uid).get();
     if (!snap.exists) return null;

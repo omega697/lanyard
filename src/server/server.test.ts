@@ -1839,11 +1839,10 @@ describe("lanyard/server unit tests", () => {
       blindAuditHash: "sha256:abcdef"
     });
 
-    // 4. Per-user ad-hoc capability overrides on users/{uid}:
+    // 4. Per-user ad-hoc capability overrides on users/{uid} using atomic grantUserCapabilitiesByEmail & revokeUserCapabilities:
     // Grant `attendee` an individual `write:points` capability without promoting their role from `attendee`
-    await server.upsertUserByEmail({
+    await server.grantUserCapabilitiesByEmail({
       email: "attendee@example.com",
-      role: "attendee",
       capabilities: ["write:points"]
     });
     await server.updateUserAttributesAs({
@@ -1854,11 +1853,7 @@ describe("lanyard/server unit tests", () => {
     expect((await store.getUser(attendee.uid))?.attributes?.pointsAllTime).toBe(55);
 
     // Revoke the ad-hoc capability on `attendee` -> immediately blocked again
-    await server.upsertUserByEmail({
-      email: "attendee@example.com",
-      role: "attendee",
-      capabilities: []
-    });
+    await server.revokeUserCapabilities(attendee.uid, ["write:points"]);
     await expect(
       server.updateUserAttributesAs({
         actorUid: attendee.uid,
@@ -1866,6 +1861,77 @@ describe("lanyard/server unit tests", () => {
         patch: { pointsAllTime: 70 }
       })
     ).rejects.toThrow(/Forbidden/);
+
+    // Also verify scoped `readScopeMemberAttributesAs` enforces scope membership and field-level read rules
+    await server.upsertScopeMemberByEmail({
+      scopeId: "event-2026",
+      email: "attendee@example.com",
+      role: "attendee",
+      attributes: {
+        pointsAllTime: 88,
+        awardedBadges: ["scoped-badge"],
+        merchCreditBalance: 35,
+        readonlySystemBadge: "vip"
+      }
+    });
+    await server.upsertScopeMemberByEmail({
+      scopeId: "event-2026",
+      email: "scanner@example.com",
+      role: "scanner"
+    });
+    await server.upsertScopeMemberByEmail({
+      scopeId: "event-2026",
+      email: "mod@example.com",
+      role: "moderator"
+    });
+
+    // Self in scope can read all their own attributes (`isSelf: true`)
+    expect(
+      await server.readScopeMemberAttributesAs({
+        scopeId: "event-2026",
+        actorUid: attendee.uid,
+        targetUid: attendee.uid
+      })
+    ).toEqual({
+      pointsAllTime: 88,
+      awardedBadges: ["scoped-badge"],
+      merchCreditBalance: 35,
+      readonlySystemBadge: "vip"
+    });
+
+    // Scanner in scope can read attributes without restricted `read` capability (`pointsAllTime`, `awardedBadges`),
+    // whereas Moderator in scope also inherits `read:merch` and can read `merchCreditBalance` & `readonlySystemBadge`!
+    expect(
+      await server.readScopeMemberAttributesAs({
+        scopeId: "event-2026",
+        actorUid: scanner.uid,
+        targetUid: attendee.uid
+      })
+    ).toEqual({
+      pointsAllTime: 88,
+      awardedBadges: ["scoped-badge"]
+    });
+    expect(
+      await server.readScopeMemberAttributesAs({
+        scopeId: "event-2026",
+        actorUid: moderator.uid,
+        targetUid: attendee.uid
+      })
+    ).toEqual({
+      pointsAllTime: 88,
+      awardedBadges: ["scoped-badge"],
+      merchCreditBalance: 35,
+      readonlySystemBadge: "vip"
+    });
+
+    // Non-member of `event-2026` (`merchSeller`) is rejected with Forbidden
+    await expect(
+      server.readScopeMemberAttributesAs({
+        scopeId: "event-2026",
+        actorUid: merchSeller.uid,
+        targetUid: attendee.uid
+      })
+    ).rejects.toThrow(/Forbidden: Caller is not a member of scope/);
 
     // 5. Role demotion on users/{uid}:
     // Demote `moderator` down to `scanner` -> immediately loses access to `merchPosPin` and `awardedBadges`,

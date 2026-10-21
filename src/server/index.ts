@@ -611,6 +611,45 @@ export function createLanyardServer<
     return (await store.getUser(uid))!;
   }
 
+  async function grantUserCapabilitiesByEmail(params: {
+    email: string;
+    capabilities: readonly TCapability[];
+    firstName?: string;
+    lastName?: string;
+    role?: TRole;
+  }): Promise<UserRecord<TRole, TCapability, TPreferences, TAttributes>> {
+    const targetRole = params.role ?? policy.defaultRole;
+    if (typeof targetRole !== "string" || !Object.hasOwn(policy.roles, targetRole)) {
+      throw new Error(`Invalid role '${String(targetRole)}': role is not defined in policy.roles`);
+    }
+    if (typeof store.grantUserCapabilities !== "function") {
+      throw new Error("Backing store does not implement grantUserCapabilities");
+    }
+    const displayName =
+      [params.firstName?.trim(), params.lastName?.trim()].filter(Boolean).join(" ") || params.email.trim();
+    const { uid, email: cleanEmail } = await getOrProvisionUidByEmail({
+      email: params.email,
+      displayName
+    });
+
+    return store.grantUserCapabilities(uid, params.capabilities, {
+      uid,
+      email: cleanEmail,
+      firstName: params.firstName?.trim(),
+      lastName: params.lastName?.trim(),
+      displayName,
+      role: targetRole
+    });
+  }
+
+  async function revokeUserCapabilities(uid: string, capabilities: readonly TCapability[]): Promise<void> {
+    assertValidResourceId(uid, "uid");
+    if (typeof store.revokeUserCapabilities !== "function") {
+      throw new Error("Backing store does not implement revokeUserCapabilities");
+    }
+    await store.revokeUserCapabilities(uid, capabilities);
+  }
+
   async function upsertScopeMemberByEmail(params: {
     scopeId: string;
     email: string;
@@ -801,6 +840,31 @@ export function createLanyardServer<
   }
 
   /**
+   * Reads a scoped member's `attributes` within `scopeId`, filtering out any keys the caller (`actorUid`)
+   * is not permitted to read in that exact `scopeId` (or returning all keys if `isSystemAdmin`).
+   */
+  async function readScopeMemberAttributesAs(params: {
+    scopeId: string;
+    actorUid: string;
+    isSystemAdmin?: boolean;
+    targetUid: string;
+  }): Promise<Partial<TAttributes>> {
+    assertValidResourceId(params.scopeId, "scopeId");
+    assertValidResourceId(params.actorUid, "actorUid");
+    assertValidResourceId(params.targetUid, "targetUid");
+    const { isAdmin } = await resolveEffectiveAdminStatus(params.actorUid, Boolean(params.isSystemAdmin));
+    const actorMember = await store.getScopeMember(params.scopeId, params.actorUid);
+    if (!isAdmin && !actorMember) {
+      throw new Error(`Forbidden: Caller is not a member of scope '${params.scopeId}'`);
+    }
+    const targetMember = await store.getScopeMember(params.scopeId, params.targetUid);
+    return policy.filterReadableAttributes<TAttributes>(actorMember, targetMember?.attributes, {
+      isSystemAdmin: isAdmin,
+      isSelf: Boolean(actorMember && params.actorUid === params.targetUid)
+    });
+  }
+
+  /**
    * Updates a scoped member's `attributes` within `scopeId` after verifying the caller (`actorUid`)
    * holds the required write capability **within that exact `scopeId`** (or is an active system admin).
    * Roles in other scopes grant zero privileges in `scopeId`.
@@ -891,6 +955,8 @@ export function createLanyardServer<
     getOrProvisionUidByEmail,
     setSystemAdminStatus,
     upsertUserByEmail,
+    grantUserCapabilitiesByEmail,
+    revokeUserCapabilities,
     upsertScopeMemberByEmail,
     grantScopeCapabilitiesByEmail,
     revokeScopeCapabilities,
@@ -898,6 +964,7 @@ export function createLanyardServer<
     updateUserAttributesAs,
     readUserSecretsAs,
     updateUserSecretsAs,
+    readScopeMemberAttributesAs,
     updateScopeMemberAttributesAs,
     readScopeMemberSecretsAs,
     updateScopeMemberSecretsAs

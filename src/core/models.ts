@@ -392,6 +392,8 @@ export interface LanyardClientStore<
   subscribeToPreferences(uid: string, onChange: (prefs: Partial<TPreferences>) => void): () => void;
   /** Persist a partial update to a user's global preferences. */
   savePreferences(uid: string, patch: Partial<TPreferences>): Promise<void>;
+  /** Optional: Persist a partial update to a user's tenant-scoped preferences within `scopeId`. */
+  saveScopePreferences?(scopeId: string, uid: string, patch: Partial<TPreferences>): Promise<void>;
 
   /** Optional: Subscribe to the full global `UserRecord` (`users/{uid}`) including `attributes`, `preferences`, and `role`. */
   subscribeToUser?(
@@ -456,6 +458,19 @@ export interface LanyardServerStore<
   ): Promise<UserRecord<TRole, TCapability, TPreferences, TAttributes>>;
   getUserSecrets?(uid: string): Promise<Partial<TSecrets>>;
   updateUserSecrets?(uid: string, patch: Partial<TSecrets>): Promise<Partial<TSecrets>>;
+  /**
+   * Optional: Additively grants `capabilities` to global `users/{uid}` without clobbering existing capabilities.
+   * If the user does not yet exist, initializes the record using `fallbackUser`.
+   */
+  grantUserCapabilities?(
+    uid: string,
+    capabilities: readonly TCapability[],
+    fallbackUser?: Omit<UserRecord<TRole, TCapability, TPreferences, TAttributes>, "capabilities">
+  ): Promise<UserRecord<TRole, TCapability, TPreferences, TAttributes>>;
+  /**
+   * Optional: Removes the specified `capabilities` from global `users/{uid}` while preserving all other capabilities.
+   */
+  revokeUserCapabilities?(uid: string, capabilities: readonly TCapability[]): Promise<void>;
 
   getSystemAdmin(uid: string): Promise<SystemAdminProfile | null>;
   listSystemAdmins(): Promise<SystemAdminProfile[]>;

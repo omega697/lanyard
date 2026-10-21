@@ -1363,4 +1363,126 @@ describe("lanyard/client unit tests", () => {
     client.destroy();
     vi.restoreAllMocks();
   });
+
+  it("supports unified custom role, capability, preference, and attribute accessors and updates across both unscoped and scoped modes", async () => {
+    interface CustomAttrs {
+      points: number;
+      tier: string;
+    }
+
+    const store = new InMemoryLanyardStore<TestRole, TestCap, TestPrefs, CustomAttrs>();
+
+    // Global unscoped record: role = 'member' with ad-hoc ['edit_content'], preferences = { theme: 'dark' }, attributes = { points: 42, tier: 'silver' }
+    await store.upsertUser({
+      uid: "u-dual",
+      email: "dual@example.com",
+      role: "member",
+      capabilities: ["edit_content"],
+      preferences: { theme: "dark" },
+      attributes: { points: 42, tier: "silver" }
+    });
+
+    // Scoped record in 'ws-alpha': role = 'manager', preferences = { use12h: false }, attributes = { points: 100, tier: 'gold' }
+    await store.upsertScopeMember("ws-alpha", {
+      uid: "u-dual",
+      email: "dual@example.com",
+      role: "manager",
+      capabilities: [],
+      preferences: { use12h: false },
+      attributes: { points: 100, tier: "gold" }
+    });
+
+    // Scoped record in 'ws-beta': role = 'owner', attributes = { points: 999, tier: 'platinum' }
+    await store.upsertScopeMember("ws-beta", {
+      uid: "u-dual",
+      email: "dual@example.com",
+      role: "owner",
+      capabilities: [],
+      attributes: { points: 999, tier: "platinum" }
+    });
+
+    const client = createLanyardClient<TestRole, TestCap, TestPrefs, CustomAttrs>({
+      store,
+      policy: TEST_POLICY,
+      defaultPreferences: DEFAULT_PREFS,
+      storageKeyPrefix: "dualapp"
+    });
+
+    // Before sign-in, all role/capability checks return false/null/empty
+    expect(client.getRole()).toBeNull();
+    expect(client.getRole("ws-alpha")).toBeNull();
+    expect(client.hasRole("member")).toBe(false);
+    expect(client.hasCapability("edit_content")).toBe(false);
+    expect(client.getCapabilities()).toEqual([]);
+
+    client.setActiveUser({
+      uid: "u-dual",
+      email: "dual@example.com",
+      emailVerified: true,
+      displayName: "Dualy McDual",
+      photoUrl: null,
+      isAnonymous: false,
+      isAdmin: false,
+      providerIds: ["google.com"]
+    });
+
+    // 1. Unscoped (single-tenant) role, capability, preference, and attribute checks:
+    expect(client.getRole()).toBe("member");
+    expect(client.hasRole("member")).toBe(true);
+    expect(client.hasMinimumRole("manager")).toBe(false);
+    expect(client.hasCapability("edit_content")).toBe(true);
+    expect(client.hasCapability("invite_members")).toBe(false);
+    expect(client.hasAnyCapability(["invite_members", "edit_content"])).toBe(true);
+    expect(client.hasAllCapabilities(["edit_content"])).toBe(true);
+    expect(client.hasAllCapabilities(["edit_content", "invite_members"])).toBe(false);
+    expect(client.getCapabilities()).toEqual(["edit_content"]);
+    expect(client.getAttributes()).toEqual({ points: 42, tier: "silver" });
+    expect(client.getPreferences()).toEqual({ theme: "dark", use12h: true });
+
+    // 2. Scoped ('ws-alpha' and 'ws-beta') role, capability, preference, and attribute checks:
+    expect(client.getRole("ws-alpha")).toBe("manager");
+    expect(client.hasRole("manager", "ws-alpha")).toBe(true);
+    expect(client.hasRole("owner", "ws-alpha")).toBe(false);
+    expect(client.hasCapability("invite_members", "ws-alpha")).toBe(true);
+    expect(client.hasCapability("edit_content", "ws-alpha")).toBe(true);
+    expect(client.getCapabilities("ws-alpha").sort()).toEqual(["edit_content", "invite_members"]);
+    expect(client.getAttributes("ws-alpha")).toEqual({ points: 100, tier: "gold" });
+    expect(client.getPreferences("ws-alpha")).toEqual({ theme: "system", use12h: false });
+
+    expect(client.getRole("ws-beta")).toBe("owner");
+    expect(client.hasRole("owner", "ws-beta")).toBe(true);
+    expect(client.hasCapability("invite_members", "ws-beta")).toBe(true);
+    expect(client.getAttributes("ws-beta")).toEqual({ points: 999, tier: "platinum" });
+
+    // Unknown or invalid scopeId returns safe defaults
+    expect(client.getRole("ws-unknown")).toBeNull();
+    expect(client.getRole("../invalid")).toBeNull();
+    expect(client.getAttributes("ws-unknown")).toEqual({});
+    expect(client.getPreferences("ws-unknown")).toEqual(DEFAULT_PREFS);
+
+    // 3. Updating scoped preferences via both `updateScopePreferences` and `updatePreferences(patch, { scopeId })`:
+    await client.updateScopePreferences("ws-alpha", { theme: "dark" });
+    expect(client.getPreferences("ws-alpha")).toEqual({ theme: "dark", use12h: false });
+    expect((await store.getScopeMember("ws-alpha", "u-dual"))?.preferences).toEqual({
+      theme: "dark",
+      use12h: false
+    });
+
+    await client.updatePreferences({ use12h: true }, { scopeId: "ws-alpha" });
+    expect(client.getPreferences("ws-alpha")).toEqual({ theme: "dark", use12h: true });
+
+    // Global preferences remain independent of scoped preferences
+    expect(client.getPreferences()).toEqual({ theme: "dark", use12h: true });
+    await client.updatePreferences({ theme: "light" });
+    expect(client.getPreferences()).toEqual({ theme: "light", use12h: true });
+    expect(client.getPreferences("ws-alpha")).toEqual({ theme: "dark", use12h: true });
+
+    // Calling updateScopePreferences on a non-member scope throws and never creates a phantom member
+    await expect(client.updateScopePreferences("ws-nonmember", { theme: "dark" })).rejects.toThrow(
+      /does not exist in scope/
+    );
+    expect(await store.getScopeMember("ws-nonmember", "u-dual")).toBeNull();
+
+    client.destroy();
+  });
 });

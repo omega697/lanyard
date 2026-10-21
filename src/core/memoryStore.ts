@@ -93,6 +93,23 @@ export class InMemoryLanyardStore<
     this.notifyUserAndPrefListeners(uid);
   }
 
+  async saveScopePreferences(scopeId: string, uid: string, patch: Partial<TPreferences>): Promise<void> {
+    assertValidResourceId(scopeId, "scopeId");
+    assertValidResourceId(uid, "uid");
+    const existing = await this.getScopeMember(scopeId, uid);
+    if (!existing) {
+      throw new Error(`Member '${uid}' does not exist in scope '${scopeId}'.`);
+    }
+    const updated: ScopedMember<TRole, TCapability, TPreferences, TAttributes> = {
+      ...existing,
+      preferences: {
+        ...(existing.preferences || {}),
+        ...sanitizePatch(patch)
+      }
+    };
+    await this.upsertScopeMember(scopeId, updated);
+  }
+
   subscribeToUser(
     uid: string,
     onChange: (user: UserRecord<TRole, TCapability, TPreferences, TAttributes> | null) => void
@@ -295,6 +312,45 @@ export class InMemoryLanyardStore<
     const updated = { ...current, ...sanitizePatch(patch) };
     this.userSecrets.set(uid, updated);
     return { ...updated };
+  }
+
+  async grantUserCapabilities(
+    uid: string,
+    capabilities: readonly TCapability[],
+    fallbackUser?: Omit<UserRecord<TRole, TCapability, TPreferences, TAttributes>, "capabilities">
+  ): Promise<UserRecord<TRole, TCapability, TPreferences, TAttributes>> {
+    assertValidResourceId(uid, "uid");
+    const existing = await this.getUser(uid);
+    if (!existing && !fallbackUser) {
+      throw new Error(`User '${uid}' does not exist and no fallbackUser was provided.`);
+    }
+    const base = existing || {
+      ...fallbackUser!,
+      uid,
+      capabilities: [] as TCapability[]
+    };
+    const mergedCapabilities = Array.from(new Set([...(base.capabilities || []), ...capabilities]));
+    const updated: UserRecord<TRole, TCapability, TPreferences, TAttributes> = {
+      ...base,
+      uid,
+      capabilities: mergedCapabilities,
+      updatedAt: new Date().toISOString()
+    };
+    await this.upsertUser(updated);
+    return (await this.getUser(uid))!;
+  }
+
+  async revokeUserCapabilities(uid: string, capabilities: readonly TCapability[]): Promise<void> {
+    assertValidResourceId(uid, "uid");
+    const existing = await this.getUser(uid);
+    if (!existing) return;
+    const revokeSet = new Set(capabilities);
+    const remaining = (existing.capabilities || []).filter((c) => !revokeSet.has(c));
+    await this.upsertUser({
+      ...existing,
+      capabilities: remaining,
+      updatedAt: new Date().toISOString()
+    });
   }
 
   async getSystemAdmin(uid: string): Promise<SystemAdminProfile | null> {
