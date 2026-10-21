@@ -1,12 +1,10 @@
 import { describe, it, expect, vi } from "vitest";
 import { createPermissionPolicy, InMemoryLanyardStore } from "../core/index.js";
 import {
-  assertNotProduction,
   createLanyardServer,
   createSecretCipher,
   decryptSecret,
   encryptSecret,
-  FakeAuthService,
   GoogleAuthService,
   isEncryptedSecretData,
   type AdminAuthAdapter
@@ -68,6 +66,22 @@ function createFakeAdminAuth(): AdminAuthAdapter & {
           uid: "u-no-email"
         };
       }
+      if (idToken === "inviter-token") {
+        return {
+          uid: "u-inviter",
+          email: "inviter@example.com",
+          email_verified: true,
+          picture: "https://example.com/inviter-oauth.png"
+        };
+      }
+      if (idToken === "mgr-token") {
+        return {
+          uid: "u-mgr",
+          email: "mgr@example.com",
+          email_verified: true,
+          picture: "https://example.com/mgr-oauth.png"
+        };
+      }
       throw new Error("Invalid token");
     },
     async getUserByEmail(email: string) {
@@ -113,6 +127,12 @@ function createMockRes() {
     json(payload: any) {
       res.body = payload;
       return res;
+    },
+    send(payload?: any) {
+      if (payload !== undefined) {
+        res.body = payload;
+      }
+      return res;
     }
   };
   return res;
@@ -146,52 +166,13 @@ describe("lanyard/server unit tests", () => {
     expect(unverifiedUser?.emailVerified).toBe(false);
   });
 
-  it("enforces FakeAuthService production guards, Bearer header requirements, and adminAuth fallback", async () => {
-    const origNodeEnv = process.env.NODE_ENV;
-    const origKService = process.env.K_SERVICE;
-    try {
-      process.env.NODE_ENV = "production";
-      expect(() => assertNotProduction("FakeAuthService")).toThrow(/SECURITY VIOLATION/);
-
-      process.env.NODE_ENV = "development";
-      process.env.K_SERVICE = "my-prod-service";
-      expect(() => assertNotProduction("FakeAuthService")).toThrow(/SECURITY VIOLATION/);
-    } finally {
-      process.env.NODE_ENV = origNodeEnv;
-      if (origKService) process.env.K_SERVICE = origKService;
-      else delete process.env.K_SERVICE;
-    }
-
-    const adminAuth = createFakeAdminAuth();
-    const fakeAuth = new FakeAuthService(adminAuth);
-
-    // Rejects x-mock-user-email if Authorization: Bearer header is missing
-    await expect(fakeAuth.verifyToken(undefined, { "x-mock-user-email": "alice@example.com" })).rejects.toThrow(
-      /Missing Authorization header/
-    );
-    await expect(fakeAuth.verifyToken("Bearer   ", { "x-mock-user-email": "alice@example.com" })).rejects.toThrow(
-      /Missing Authorization header/
-    );
-
-    // Default mock-uid-<email> when x-mock-user-uid is omitted
-    const mockUser = await fakeAuth.verifyToken("Bearer mock", {
-      "x-mock-user-email": "  Alice@Example.com "
-    });
-    expect(mockUser?.uid).toBe("mock-uid-alice@example.com");
-
-    // Falls back to GoogleAuthService when no x-mock-user-email header is provided
-    const fallbackUser = await fakeAuth.verifyToken("Bearer valid-token", {});
-    expect(fallbackUser?.uid).toBe("u-verified");
-  });
-
   it("provisions UIDs by email, manages system admins, and grants/revokes multi-capabilities", async () => {
     const adminAuth = createFakeAdminAuth();
     const store = new InMemoryLanyardStore<TestRole, TestCap>();
     const server = createLanyardServer<TestRole, TestCap>({
       adminAuth,
       store,
-      policy: TEST_POLICY,
-      authService: new FakeAuthService()
+      policy: TEST_POLICY
     });
 
     await expect(server.getOrProvisionUidByEmail({ email: "not-an-email" })).rejects.toThrow(/Valid email/);
@@ -283,8 +264,7 @@ describe("lanyard/server unit tests", () => {
     const server = createLanyardServer<TestRole, TestCap>({
       adminAuth,
       store,
-      policy: TEST_POLICY,
-      authService: new FakeAuthService()
+      policy: TEST_POLICY
     });
 
     // Unauthenticated checkAuth -> 401
@@ -292,9 +272,9 @@ describe("lanyard/server unit tests", () => {
     await server.checkAuth({ headers: {} } as any, resUnauth, () => {});
     expect(resUnauth.statusCode).toBe(401);
 
-    // Invalid credentials throw in checkAuth -> 401
+    // Invalid token in checkAuth -> 401
     const resBadHeader = createMockRes();
-    await server.checkAuth({ headers: { "x-mock-user-email": "x@example.com" } } as any, resBadHeader, () => {});
+    await server.checkAuth({ headers: { authorization: "Bearer invalid-token" } } as any, resBadHeader, () => {});
     expect(resBadHeader.statusCode).toBe(401);
 
     // requireAdmin rejects non-admin (403) and auto-seeds brand-new admin
@@ -386,10 +366,7 @@ describe("lanyard/server unit tests", () => {
     // u-inviter passes requireScopeCapability("invite_members") and array ["edit_content", "invite_members"], and syncs photoUrl
     const reqInviter: any = {
       headers: {
-        authorization: "Bearer mock",
-        "x-mock-user-email": "inviter@example.com",
-        "x-mock-user-uid": "u-inviter",
-        "x-mock-user-photo-url": "https://example.com/inviter-oauth.png"
+        authorization: "Bearer inviter-token"
       },
       params: { scopeId: "ws-1" }
     };
@@ -405,10 +382,7 @@ describe("lanyard/server unit tests", () => {
     // u-mgr passes requireScopeRole("manager") and syncs photoUrl
     const reqMgr: any = {
       headers: {
-        authorization: "Bearer mock",
-        "x-mock-user-email": "mgr@example.com",
-        "x-mock-user-uid": "u-mgr",
-        "x-mock-user-photo-url": "https://example.com/mgr-oauth.png"
+        authorization: "Bearer mgr-token"
       },
       params: { scopeId: "ws-1" }
     };
@@ -550,8 +524,7 @@ describe("lanyard/server unit tests", () => {
     const server = createLanyardServer<TestRole, TestCap>({
       adminAuth,
       store,
-      policy: TEST_POLICY,
-      authService: new FakeAuthService()
+      policy: TEST_POLICY
     });
 
     await store.upsertSystemAdmin({
@@ -627,8 +600,7 @@ describe("lanyard/server unit tests", () => {
     const server = createLanyardServer<TestRole, TestCap>({
       adminAuth,
       store,
-      policy: TEST_POLICY,
-      authService: new FakeAuthService()
+      policy: TEST_POLICY
     });
 
     // 1. Simulate concurrent getOrProvisionUidByEmail race where getUserByEmail initially throws user-not-found,
@@ -695,8 +667,7 @@ describe("lanyard/server unit tests", () => {
     const server = createLanyardServer<TestRole, TestCap>({
       adminAuth,
       store,
-      policy: TEST_POLICY,
-      authService: new FakeAuthService()
+      policy: TEST_POLICY
     });
 
     // User is 'owner' in ws-A, but only 'member' with ['invite_members'] in ws-B, and not a member of ws-C
@@ -831,34 +802,12 @@ describe("lanyard/server unit tests", () => {
     await strictAuth.verifyToken("Bearer valid-token");
     expect(verifySpy).toHaveBeenCalledWith("valid-token", true);
 
-    // 3. FakeAuthService.verifyToken re-checks assertNotProduction on every invocation (including FUNCTION_TARGET)
-    const fakeAuth = new FakeAuthService(adminAuth);
-    const origFnTarget = process.env.FUNCTION_TARGET;
-    try {
-      process.env.FUNCTION_TARGET = "apiHandler";
-      await expect(fakeAuth.verifyToken("Bearer mock", { "x-mock-user-email": "alice@example.com" })).rejects.toThrow(
-        /SECURITY VIOLATION/
-      );
-    } finally {
-      if (origFnTarget !== undefined) process.env.FUNCTION_TARGET = origFnTarget;
-      else delete process.env.FUNCTION_TARGET;
-    }
-
-    // FakeAuthService rejects path-traversal x-mock-user-uid
-    await expect(
-      fakeAuth.verifyToken("Bearer mock", {
-        "x-mock-user-email": "alice@example.com",
-        "x-mock-user-uid": "../system_admins/root"
-      })
-    ).rejects.toThrow(/Invalid x-mock-user-uid/);
-
-    // 4. requireScopeRole and requireScopeCapability reject path-traversal scopeId with 400
+    // 3. requireScopeRole and requireScopeCapability reject path-traversal scopeId with 400
     // and never leak internal database error details in 500 responses
     const server = createLanyardServer<TestRole, TestCap>({
       adminAuth,
       store,
-      policy: TEST_POLICY,
-      authService: fakeAuth
+      policy: TEST_POLICY
     });
     const requireMgr = server.requireScopeRole("manager");
     const requireEdit = server.requireScopeCapability("edit_content");
@@ -958,36 +907,14 @@ describe("lanyard/server unit tests", () => {
     ).rejects.toThrow(/role is not defined in policy\.roles/);
   });
 
-  it("covers FIREBASE_CONFIG emulator interplay, non-fatal requireAdmin store errors, requireScopeCapability 500 sanitization, and FirestoreServerStore photoUrl sanitization", async () => {
-    // 1. FIREBASE_CONFIG without FIREBASE_AUTH_EMULATOR_HOST throws SECURITY VIOLATION, but succeeds when emulator host is set
-    const origFbConfig = process.env.FIREBASE_CONFIG;
-    const origAuthEmu = process.env.FIREBASE_AUTH_EMULATOR_HOST;
-    try {
-      process.env.FIREBASE_CONFIG = '{"projectId":"prod-proj"}';
-      delete process.env.FIREBASE_AUTH_EMULATOR_HOST;
-      expect(() => assertNotProduction("FakeAuthService")).toThrow(/SECURITY VIOLATION/);
-
-      process.env.FIREBASE_AUTH_EMULATOR_HOST = "127.0.0.1:9099";
-      expect(() => assertNotProduction("FakeAuthService")).not.toThrow();
-    } finally {
-      if (origFbConfig !== undefined) process.env.FIREBASE_CONFIG = origFbConfig;
-      else delete process.env.FIREBASE_CONFIG;
-      if (origAuthEmu !== undefined) process.env.FIREBASE_AUTH_EMULATOR_HOST = origAuthEmu;
-      else delete process.env.FIREBASE_AUTH_EMULATOR_HOST;
-    }
-
-    // 2. FakeAuthService without adminAuth fallback returns null when no x-mock-user-email header is present
-    const standaloneFakeAuth = new FakeAuthService();
-    expect(await standaloneFakeAuth.verifyToken("Bearer some-token", {})).toBeNull();
-
-    // 3. requireAdmin continues (calls next()) even if the backing directory store throws a transient error
+  it("covers non-fatal requireAdmin store errors, requireScopeCapability 500 sanitization, and FirestoreServerStore photoUrl sanitization", async () => {
+    // 1. requireAdmin continues (calls next()) even if the backing directory store throws a transient error
     const adminAuth = createFakeAdminAuth();
     const store = new InMemoryLanyardStore<TestRole, TestCap>();
     const server = createLanyardServer<TestRole, TestCap>({
       adminAuth,
       store,
-      policy: TEST_POLICY,
-      authService: standaloneFakeAuth
+      policy: TEST_POLICY
     });
 
     vi.spyOn(store, "getSystemAdmin").mockRejectedValueOnce(new Error("Transient directory outage"));
@@ -1071,8 +998,7 @@ describe("lanyard/server unit tests", () => {
     const server = createLanyardServer<TestRole, TestCap, Prefs, Attrs>({
       adminAuth,
       store,
-      policy: TEST_POLICY,
-      authService: new FakeAuthService()
+      policy: TEST_POLICY
     });
 
     // 1. Provision user who is both an attendee (with points & preferences) and promoted to system admin
@@ -1202,8 +1128,7 @@ describe("lanyard/server unit tests", () => {
     const server = createLanyardServer<AppRole, AppCap, AppPrefs, AppAttrs, AppHiddenAttrs, AppSecrets>({
       adminAuth,
       store,
-      policy,
-      authService: new FakeAuthService()
+      policy
     });
 
     // Provision single-tenant users
@@ -1811,8 +1736,7 @@ describe("lanyard/server unit tests", () => {
     >({
       adminAuth,
       store,
-      policy,
-      authService: new FakeAuthService()
+      policy
     });
 
     const attendee = await server.upsertUserByEmail({
@@ -2124,5 +2048,204 @@ describe("lanyard/server unit tests", () => {
       patch: { pointsAllTime: 65 }
     });
     expect((await store.getUser(attendee.uid))?.attributes?.pointsAllTime).toBe(65);
+  });
+
+  it("enforces per-member scoped secrets (updateScopeMemberSecretsAs, getScopeMemberSecretsStatusAs, getDecryptedScopeMemberSecrets) for self and delegated writers", async () => {
+    type ScopeRole = "coordinator" | "lead";
+    type ScopeCap = "manage:oauth_secrets";
+    interface ScopeMemberSecrets {
+      gmailRefreshToken: string;
+      calendarRefreshToken: string;
+      managedBotToken: string;
+    }
+
+    const policy = createPermissionPolicy<ScopeRole, ScopeCap>({
+      roles: {
+        coordinator: { weight: 10, capabilities: [] },
+        lead: { weight: 20, inherits: ["coordinator"], capabilities: ["manage:oauth_secrets"] }
+      },
+      secretCapabilities: {
+        // Coordinator can connect/disconnect their own Gmail/Calendar OAuth tokens, and a lead can also manage them
+        gmailRefreshToken: { write: "manage:oauth_secrets", allowSelfWrite: true },
+        calendarRefreshToken: { write: "manage:oauth_secrets", allowSelfWrite: true },
+        // Only a lead with manage:oauth_secrets (not self-coordinator) can set managedBotToken
+        managedBotToken: { write: "manage:oauth_secrets", allowSelfWrite: false }
+      }
+    });
+
+    const store = new InMemoryLanyardStore<
+      ScopeRole,
+      ScopeCap,
+      Record<string, any>,
+      Record<string, any>,
+      Record<string, any>,
+      ScopeMemberSecrets
+    >();
+    const adminAuth = createFakeAdminAuth();
+    const server = createLanyardServer<
+      ScopeRole,
+      ScopeCap,
+      Record<string, any>,
+      Record<string, any>,
+      Record<string, any>,
+      ScopeMemberSecrets
+    >({
+      adminAuth,
+      store,
+      policy
+    });
+
+    const coordA = await server.upsertScopeMemberByEmail({
+      scopeId: "camp-1",
+      email: "coord-a@example.com",
+      role: "coordinator"
+    });
+    const coordB = await server.upsertScopeMemberByEmail({
+      scopeId: "camp-1",
+      email: "coord-b@example.com",
+      role: "coordinator"
+    });
+    const lead = await server.upsertScopeMemberByEmail({
+      scopeId: "camp-1",
+      email: "lead@example.com",
+      role: "lead"
+    });
+
+    // 1. Coordinator A can write and clear their own `gmailRefreshToken` (`allowSelfWrite: true`)
+    const statusAfterSelfWrite = await server.updateScopeMemberSecretsAs({
+      scopeId: "camp-1",
+      actorUid: coordA.uid,
+      targetUid: coordA.uid,
+      patch: { gmailRefreshToken: "1//0g-refresh-token-a" }
+    });
+    expect(statusAfterSelfWrite).toEqual({ gmailRefreshToken: true });
+    expect(
+      await server.getScopeMemberSecretsStatusAs({
+        scopeId: "camp-1",
+        actorUid: coordA.uid,
+        targetUid: coordA.uid
+      })
+    ).toEqual({ gmailRefreshToken: true });
+    expect(await server.getDecryptedScopeMemberSecrets("camp-1", coordA.uid)).toEqual({
+      gmailRefreshToken: "1//0g-refresh-token-a"
+    });
+
+    // 2. Coordinator A CANNOT write `managedBotToken` on themselves (`allowSelfWrite: false`)
+    await expect(
+      server.updateScopeMemberSecretsAs({
+        scopeId: "camp-1",
+        actorUid: coordA.uid,
+        targetUid: coordA.uid,
+        patch: { managedBotToken: "bot-secret-xyz" }
+      })
+    ).rejects.toThrow(/Forbidden/);
+
+    // 3. Peer Coordinator B CANNOT write or check status of Coordinator A's secrets (`isSelf: false`, lacks capability)
+    await expect(
+      server.updateScopeMemberSecretsAs({
+        scopeId: "camp-1",
+        actorUid: coordB.uid,
+        targetUid: coordA.uid,
+        patch: { gmailRefreshToken: "hijacked-token" }
+      })
+    ).rejects.toThrow(/Forbidden/);
+    await expect(
+      server.getScopeMemberSecretsStatusAs({
+        scopeId: "camp-1",
+        actorUid: coordB.uid,
+        targetUid: coordA.uid
+      })
+    ).rejects.toThrow(/Forbidden/);
+
+    // 4. Lead (`manage:oauth_secrets`) CAN write `managedBotToken` and `calendarRefreshToken` on Coordinator A (`isSelf: false`)
+    await server.updateScopeMemberSecretsAs({
+      scopeId: "camp-1",
+      actorUid: lead.uid,
+      targetUid: coordA.uid,
+      patch: {
+        calendarRefreshToken: "1//0g-cal-token-a",
+        managedBotToken: "bot-secret-123"
+      }
+    });
+    expect(await server.getDecryptedScopeMemberSecrets("camp-1", coordA.uid)).toEqual({
+      gmailRefreshToken: "1//0g-refresh-token-a",
+      calendarRefreshToken: "1//0g-cal-token-a",
+      managedBotToken: "bot-secret-123"
+    });
+
+    // 5. Coordinator A can clear their own `gmailRefreshToken` by passing `""` or `null`
+    await server.updateScopeMemberSecretsAs({
+      scopeId: "camp-1",
+      actorUid: coordA.uid,
+      targetUid: coordA.uid,
+      patch: { gmailRefreshToken: null }
+    });
+    expect(await server.getDecryptedScopeMemberSecrets("camp-1", coordA.uid)).toEqual({
+      calendarRefreshToken: "1//0g-cal-token-a",
+      managedBotToken: "bot-secret-123"
+    });
+  });
+
+  it("validates AES-256-GCM encryption edge cases (missing key, key mismatch, tampered ciphertext/tag)", async () => {
+    // 1. Empty or whitespace master key throws a clear error
+    expect(() => createSecretCipher("")).toThrow(/non-empty master encryption key is required/);
+    expect(() => createSecretCipher("   ")).toThrow(/non-empty master encryption key is required/);
+    expect(() => encryptSecret("secret", "")).toThrow(/non-empty master encryption key is required/);
+
+    // 2. Round-trip encryption produces unique IVs for identical plaintexts
+    const cipherA = createSecretCipher("master-key-alpha");
+    const enc1 = cipherA.encrypt("same-plaintext");
+    const enc2 = cipherA.encrypt("same-plaintext");
+    expect(isEncryptedSecretData(enc1)).toBe(true);
+    expect(enc1.iv).not.toBe(enc2.iv);
+    expect(enc1.ciphertext).not.toBe(enc2.ciphertext);
+    expect(cipherA.decrypt(enc1)).toBe("same-plaintext");
+    expect(cipherA.decrypt(enc2)).toBe("same-plaintext");
+
+    // 3. Decrypting with a different key (e.g. wrong key) fails GCM authentication
+    const cipherB = createSecretCipher("master-key-beta");
+    expect(() => cipherB.decrypt(enc1)).toThrow();
+    expect(() => decryptSecret(enc1, "master-key-beta")).toThrow();
+
+    // 4. Tampering with ciphertext or auth tag fails GCM verification
+    const tamperedCiphertext = {
+      ...enc1,
+      ciphertext: enc1.ciphertext.slice(0, -2) + (enc1.ciphertext.endsWith("ff") ? "00" : "ff")
+    };
+    expect(() => cipherA.decrypt(tamperedCiphertext)).toThrow();
+
+    const tamperedTag = {
+      ...enc1,
+      tag: enc1.tag.slice(0, -2) + (enc1.tag.endsWith("ff") ? "00" : "ff")
+    };
+    expect(() => cipherA.decrypt(tamperedTag)).toThrow();
+
+    // 5. Malformed payloads are rejected by isEncryptedSecretData and decrypt()
+    expect(isEncryptedSecretData(null)).toBe(false);
+    expect(isEncryptedSecretData("plaintext")).toBe(false);
+    expect(isEncryptedSecretData({ ciphertext: "abc", iv: "", tag: "def" })).toBe(false);
+    expect(() => cipherA.decrypt({ ciphertext: "abc", iv: "", tag: "" })).toThrow(/Invalid encrypted secret payload/);
+
+    // 6. FirestoreServerStore without encryptionKey or MASTER_ENCRYPTION_KEY throws when writing secrets
+    const prevMasterKey = process.env.MASTER_ENCRYPTION_KEY;
+    delete process.env.MASTER_ENCRYPTION_KEY;
+    try {
+      const storeWithoutKey = new FirestoreServerStore({
+        db: {
+          doc: () => ({
+            get: async () => ({ exists: false, data: () => ({}) }),
+            set: async () => {}
+          })
+        } as any,
+        defaultRole: "member"
+      });
+      await expect(storeWithoutKey.updateUserSecrets("u-1", { apiKey: "secret-val" })).rejects.toThrow(
+        /Cannot encrypt or decrypt secrets/
+      );
+    } finally {
+      if (prevMasterKey !== undefined) {
+        process.env.MASTER_ENCRYPTION_KEY = prevMasterKey;
+      }
+    }
   });
 });

@@ -65,13 +65,7 @@ export interface AdminAuthAdapter {
   setCustomUserClaims(uid: string, customUserClaims: Record<string, any> | null): Promise<void>;
 }
 
-const SAFE_AUTH_ERROR_PREFIXES = [
-  "Token must contain an email claim",
-  "Token email must be verified",
-  "Missing Authorization header",
-  "Invalid x-mock-user-uid",
-  "SECURITY VIOLATION:"
-];
+const SAFE_AUTH_ERROR_PREFIXES = ["Token must contain an email claim", "Token email must be verified"];
 
 function formatClientAuthError(error: unknown): string {
   const message = error instanceof Error ? error.message : "";
@@ -79,21 +73,6 @@ function formatClientAuthError(error: unknown): string {
     return `Unauthorized: ${message}`;
   }
   return "Unauthorized: Invalid or expired authentication token";
-}
-
-/**
- * Ensures mock/emulator authentication services can never be instantiated or invoked in production.
- */
-export function assertNotProduction(featureName: string): void {
-  const isCloudRunOrFunctions =
-    Boolean(process.env.K_SERVICE) ||
-    Boolean(process.env.FUNCTION_TARGET) ||
-    (Boolean(process.env.FIREBASE_CONFIG) && !process.env.FIREBASE_AUTH_EMULATOR_HOST);
-  const isProdEnv = process.env.NODE_ENV === "production" || isCloudRunOrFunctions;
-
-  if (isProdEnv) {
-    throw new Error(`SECURITY VIOLATION: ${featureName} cannot be used in a production environment.`);
-  }
 }
 
 export class GoogleAuthService implements AuthService {
@@ -128,46 +107,6 @@ export class GoogleAuthService implements AuthService {
       photoUrl: sanitizeAvatarUrl(decodedToken.picture),
       isAdmin: Boolean(decodedToken.admin)
     };
-  }
-}
-
-export class FakeAuthService implements AuthService {
-  private readonly fallbackAuth?: GoogleAuthService;
-
-  constructor(adminAuth?: Pick<AdminAuthAdapter, "verifyIdToken">, requireVerifiedEmail = true) {
-    assertNotProduction("FakeAuthService");
-    if (adminAuth) {
-      this.fallbackAuth = new GoogleAuthService(adminAuth, requireVerifiedEmail);
-    }
-  }
-
-  async verifyToken(
-    authHeader: string | undefined,
-    headers: Record<string, any> = {}
-  ): Promise<AuthenticatedUser | null> {
-    assertNotProduction("FakeAuthService");
-    const mockEmail = headers["x-mock-user-email"];
-    if (mockEmail) {
-      if (!authHeader || !authHeader.startsWith("Bearer ") || !authHeader.slice("Bearer ".length).trim()) {
-        throw new Error("Missing Authorization header (required to prevent production authentication bypass)");
-      }
-      const emailStr = String(mockEmail).trim().toLowerCase();
-      const mockUid = headers["x-mock-user-uid"] ? String(headers["x-mock-user-uid"]).trim() : `mock-uid-${emailStr}`;
-      assertValidResourceId(mockUid, "x-mock-user-uid");
-
-      return {
-        uid: mockUid,
-        email: emailStr,
-        emailVerified: true,
-        name: (headers["x-mock-user-name"] as string) || "Mock User",
-        photoUrl: sanitizeAvatarUrl(headers["x-mock-user-photo-url"] as string),
-        isAdmin: headers["x-mock-user-admin"] === "true"
-      };
-    }
-    if (this.fallbackAuth) {
-      return this.fallbackAuth.verifyToken(authHeader);
-    }
-    return null;
   }
 }
 

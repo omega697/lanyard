@@ -39,13 +39,13 @@ Like a conference or workplace lanyard, `lanyard` answers two questions everywhe
 
 ## Package Entrypoints
 
-| Import Path                | Environment    | Description                                                                                                                                                                                                   |
-| :------------------------- | :------------- | :------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `lanyard/core`             | Universal      | Generic types (`TRole`, `TCapability`), `createPermissionPolicy`, avatar/time formatters (`resolveAvatar`, `formatLastSeen`), observable store, and `InMemoryLanyardStore`. Zero runtime dependencies.        |
-| `lanyard/client`           | Browser        | Multi-provider OAuth, Passwordless Magic Email Link, Anonymous sign-in, Account Linking, reactive stores, deduplicated avatar sync, and presence tracker.                                                     |
-| `lanyard/client/firestore` | Browser        | `FirestoreClientStore` implementation of `LanyardClientStore` (peer dependency: `firebase`).                                                                                                                  |
-| `lanyard/server`           | Node / Express | `GoogleAuthService`, emulator `FakeAuthService` (with production safeguard), Express middleware (`checkAuth`, `requireAdmin`, `requireScopeRole`, `requireScopeCapability`), and UID/capability provisioning. |
-| `lanyard/server/firestore` | Node / Express | `FirestoreServerStore` implementation of `LanyardServerStore` (peer dependency: `firebase-admin`).                                                                                                            |
+| Import Path                | Environment    | Description                                                                                                                                                                                                                                                           |
+| :------------------------- | :------------- | :-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `lanyard/core`             | Universal      | Generic types (`TRole`, `TCapability`), `createPermissionPolicy`, avatar/time formatters (`resolveAvatar`, `formatLastSeen`), observable store, and `InMemoryLanyardStore`. Zero runtime dependencies.                                                                |
+| `lanyard/client`           | Browser        | Multi-provider OAuth, Passwordless Magic Email Link, Anonymous sign-in, Account Linking, reactive stores, deduplicated avatar sync, and presence tracker.                                                                                                             |
+| `lanyard/client/firestore` | Browser        | `FirestoreClientStore` implementation of `LanyardClientStore` (peer dependency: `firebase`).                                                                                                                                                                          |
+| `lanyard/server`           | Node / Express | `GoogleAuthService`, Express middleware (`checkAuth`, `requireAdmin`, `requireUserRole`, `requireUserCapability`, `requireScopeRole`, `requireScopeCapability`), UID/capability provisioning, and capability-gated `attributes`/`hiddenAttributes`/`secrets` helpers. |
+| `lanyard/server/firestore` | Node / Express | `FirestoreServerStore` implementation of `LanyardServerStore` (peer dependency: `firebase-admin`).                                                                                                                                                                    |
 
 ---
 

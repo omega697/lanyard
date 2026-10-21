@@ -1,15 +1,25 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { existsSync } from "node:fs";
+import { type Server as HttpServer } from "node:http";
+import { createRequire } from "node:module";
 import { createServer } from "node:net";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import {
   deleteApp as deleteAdminApp,
   initializeApp as initializeAdminApp,
   type App as AdminApp
 } from "firebase-admin/app";
+import { getAuth as getAdminAuth, type Auth as AdminAuth } from "firebase-admin/auth";
 import { getFirestore as getAdminFirestore, type Firestore as AdminFirestore } from "firebase-admin/firestore";
 import { deleteApp as deleteClientApp, initializeApp as initializeClientApp, type FirebaseApp } from "firebase/app";
+import {
+  connectAuthEmulator,
+  getAuth as getClientAuth,
+  GoogleAuthProvider,
+  signInWithCredential,
+  type Auth as ClientAuth
+} from "firebase/auth";
 import {
   connectFirestoreEmulator,
   doc as clientDoc,
@@ -25,9 +35,20 @@ import { FirestoreClientStore } from "./client/firestore.js";
 import { createLanyardClient } from "./client/index.js";
 import { createPermissionPolicy, type LanyardReadable } from "./core/index.js";
 import { FirestoreServerStore } from "./server/firestore.js";
-import { createLanyardServer, FakeAuthService, isEncryptedSecretData } from "./server/index.js";
+import { createLanyardServer, isEncryptedSecretData } from "./server/index.js";
 
 const EMULATOR_JAR = join(homedir(), ".cache", "firebase", "emulators", "cloud-firestore-emulator-v1.21.0.jar");
+const AUTH_EMULATOR_SERVER_JS = join(
+  dirname(process.execPath),
+  "..",
+  "lib",
+  "node_modules",
+  "firebase-tools",
+  "lib",
+  "emulator",
+  "auth",
+  "server.js"
+);
 
 function getFreePort(): Promise<number> {
   return new Promise((resolve, reject) => {
@@ -106,38 +127,14 @@ function waitForStore<T>(store: LanyardReadable<T>, predicate: (value: T) => boo
   });
 }
 
-function createFakeAdminAuth(): any {
-  const usersByEmail = new Map<string, { uid: string; email: string; customClaims?: Record<string, any> }>();
-  const claimsByUid = new Map<string, Record<string, any>>();
-  let counter = 1;
-
-  return {
-    claimsByUid,
-    async verifyIdToken(token: string) {
-      return { uid: token, email: `${token}@example.com`, email_verified: true };
-    },
-    async getUserByEmail(email: string) {
-      const found = usersByEmail.get(email.toLowerCase());
-      if (!found) {
-        const err: any = new Error("User not found");
-        err.code = "auth/user-not-found";
-        throw err;
-      }
-      return {
-        ...found,
-        customClaims: claimsByUid.get(found.uid)
-      };
-    },
-    async createUser(props: { email: string; displayName?: string; emailVerified?: boolean }) {
-      const uid = `emu-uid-${counter++}`;
-      const record = { uid, email: props.email.toLowerCase() };
-      usersByEmail.set(record.email, record);
-      return record;
-    },
-    async setCustomUserClaims(uid: string, claims: Record<string, any> | null) {
-      claimsByUid.set(uid, claims || {});
-    }
-  };
+async function startAuthEmulator(port: number, projectId: string): Promise<HttpServer> {
+  const require = createRequire(import.meta.url);
+  const { createApp } = require(AUTH_EMULATOR_SERVER_JS);
+  const app = await createApp(projectId);
+  return new Promise((resolve, reject) => {
+    const server: HttpServer = app.listen(port, "127.0.0.1", () => resolve(server));
+    server.on("error", reject);
+  });
 }
 
 function createMockRes() {
@@ -156,32 +153,49 @@ function createMockRes() {
   return res;
 }
 
-describe.skipIf(!existsSync(EMULATOR_JAR))(
-  "Real Cloud Firestore Emulator integration tests (FirestoreServerStore + FirestoreClientStore)",
+describe.skipIf(!existsSync(EMULATOR_JAR) || !existsSync(AUTH_EMULATOR_SERVER_JS))(
+  "Real Cloud Firestore & Firebase Auth Emulator integration tests (FirestoreServerStore + FirestoreClientStore)",
   () => {
     let emulatorProc: ChildProcess | null = null;
+    let authEmulatorServer: HttpServer | null = null;
     let emulatorPort = 0;
+    let authEmulatorPort = 0;
     let projectId = "";
     let origEmulatorHost: string | undefined;
+    let origAuthEmulatorHost: string | undefined;
     let adminApp: AdminApp;
     let clientApp: FirebaseApp;
     let adminDb: AdminFirestore;
+    let adminAuth: AdminAuth;
     let clientDb: ClientFirestore;
+    let clientAuth: ClientAuth;
 
     beforeAll(async () => {
       emulatorPort = await getFreePort();
-      origEmulatorHost = process.env.FIRESTORE_EMULATOR_HOST;
-      process.env.FIRESTORE_EMULATOR_HOST = `127.0.0.1:${emulatorPort}`;
-
-      emulatorProc = await startFirestoreEmulator(emulatorPort);
-
+      authEmulatorPort = await getFreePort();
       projectId = `lanyard-emu-test-${Date.now()}`;
+
+      origEmulatorHost = process.env.FIRESTORE_EMULATOR_HOST;
+      origAuthEmulatorHost = process.env.FIREBASE_AUTH_EMULATOR_HOST;
+      process.env.FIRESTORE_EMULATOR_HOST = `127.0.0.1:${emulatorPort}`;
+      process.env.FIREBASE_AUTH_EMULATOR_HOST = `127.0.0.1:${authEmulatorPort}`;
+
+      const [fsProc, authSrv] = await Promise.all([
+        startFirestoreEmulator(emulatorPort),
+        startAuthEmulator(authEmulatorPort, projectId)
+      ]);
+      emulatorProc = fsProc;
+      authEmulatorServer = authSrv;
+
       adminApp = initializeAdminApp({ projectId }, "lanyard-admin-emu");
       adminDb = getAdminFirestore(adminApp);
+      adminAuth = getAdminAuth(adminApp);
 
       clientApp = initializeClientApp({ projectId, apiKey: "fake-api-key" }, "lanyard-client-emu");
       clientDb = getClientFirestore(clientApp);
       connectFirestoreEmulator(clientDb, "127.0.0.1", emulatorPort);
+      clientAuth = getClientAuth(clientApp);
+      connectAuthEmulator(clientAuth, `http://127.0.0.1:${authEmulatorPort}`, { disableWarnings: true });
     }, 30_000);
 
     afterAll(async () => {
@@ -190,6 +204,11 @@ describe.skipIf(!existsSync(EMULATOR_JAR))(
         if (clientApp) await deleteClientApp(clientApp);
         if (adminApp) await deleteAdminApp(adminApp);
       } catch {}
+
+      if (authEmulatorServer) {
+        await new Promise<void>((resolve) => authEmulatorServer!.close(() => resolve()));
+        authEmulatorServer = null;
+      }
 
       if (emulatorProc) {
         emulatorProc.kill("SIGTERM");
@@ -200,6 +219,12 @@ describe.skipIf(!existsSync(EMULATOR_JAR))(
         process.env.FIRESTORE_EMULATOR_HOST = origEmulatorHost;
       } else {
         delete process.env.FIRESTORE_EMULATOR_HOST;
+      }
+
+      if (origAuthEmulatorHost !== undefined) {
+        process.env.FIREBASE_AUTH_EMULATOR_HOST = origAuthEmulatorHost;
+      } else {
+        delete process.env.FIREBASE_AUTH_EMULATOR_HOST;
       }
     });
 
@@ -295,15 +320,13 @@ describe.skipIf(!existsSync(EMULATOR_JAR))(
         usersCollection: "users_st"
       });
 
-      const adminAuth = createFakeAdminAuth();
       const server = createLanyardServer<Role, Cap, Prefs, Attrs, HiddenAttrs, Secrets>({
         adminAuth,
         store: serverStore,
-        policy,
-        authService: new FakeAuthService()
+        policy
       });
 
-      // 1. Provision single-tenant users in real Firestore (including omitting optional firstName/lastName to verify no undefined field errors!)
+      // 1. Provision single-tenant users in real Firebase Auth Emulator + real Firestore (including omitting optional firstName/lastName to verify no undefined field errors!)
       const attendee = await server.upsertUserByEmail({
         email: "attendee@example.com",
         firstName: "Testy",
@@ -336,22 +359,37 @@ describe.skipIf(!existsSync(EMULATOR_JAR))(
         role: "moderator"
       });
 
-      // 2. Connect real FirestoreClientStore for `attendee` and verify live onSnapshot updates
+      // 2. Connect real Firebase Auth Emulator + FirestoreClientStore for `attendee` and verify live onAuthStateChanged & onSnapshot updates
       const client = createLanyardClient<Role, Cap, Prefs, Attrs>({
+        auth: clientAuth,
         store: clientStore,
         policy,
         defaultPreferences: { leaderboardOptIn: false, theme: "light" }
       });
-      client.setActiveUser({
-        uid: attendee.uid,
-        email: attendee.email,
-        displayName: "Testy McTest",
-        photoUrl: "https://example.com/testy.png",
-        emailVerified: true,
-        isAnonymous: false,
-        isAdmin: false,
-        providerIds: []
+      await signInWithCredential(
+        clientAuth,
+        GoogleAuthProvider.credential(
+          JSON.stringify({
+            sub: attendee.uid,
+            email: attendee.email,
+            email_verified: true,
+            name: "Testy McTest",
+            picture: "https://example.com/testy.png"
+          })
+        )
+      );
+
+      // Verify real GoogleAuthService verifies the Auth Emulator ID token on `server.checkAuth`
+      const realIdToken = await clientAuth.currentUser!.getIdToken();
+      const checkAuthReq: any = { headers: { authorization: `Bearer ${realIdToken}` } };
+      let checkAuthNextCalled = false;
+      await server.checkAuth(checkAuthReq, createMockRes(), () => {
+        checkAuthNextCalled = true;
       });
+      expect(checkAuthNextCalled).toBe(true);
+      expect(checkAuthReq.user?.uid).toBe(attendee.uid);
+      expect(checkAuthReq.user?.email).toBe(attendee.email);
+      expect(checkAuthReq.user?.isAdmin).toBe(false);
 
       // Wait for real Firestore onSnapshot to deliver initial attributes to client
       const initialAttrs = await waitForStore(client.attributesStore, (a) => a.pointsAllTime === 10);
@@ -554,13 +592,18 @@ describe.skipIf(!existsSync(EMULATOR_JAR))(
         })
       ).rejects.toThrow(/Forbidden/);
 
-      // 7. Real-time system admin promotion & demotion on real Firestore + stale JWT rejection:
+      // 7. Real-time system admin promotion & demotion on real Firebase Auth Emulator + real Firestore + stale JWT rejection:
       await server.setSystemAdminStatus({
         email: "attendee@example.com",
         isAdmin: true,
         actorUid: "root-admin"
       });
       await waitForStore(client.authStore, (s) => s.user?.isAdmin === true);
+
+      // Force token refresh on clientAuth and verify the real Auth Emulator minted the custom `admin: true` claim
+      const promotedTokenResult = await clientAuth.currentUser!.getIdTokenResult(true);
+      expect(promotedTokenResult.claims.admin).toBe(true);
+      const staleAdminJwt = promotedTokenResult.token;
 
       await server.setSystemAdminStatus({
         email: "attendee@example.com",
@@ -569,13 +612,13 @@ describe.skipIf(!existsSync(EMULATOR_JAR))(
       });
       await waitForStore(client.authStore, (s) => s.user?.isAdmin === false);
 
-      // Even if a request arrives with a stale `isAdmin: true` JWT, `requireAdmin` and `requireUserRole("scanner")` reject with 403!
+      // Even if a request arrives with a real signed Auth Emulator JWT that still has `admin: true`,
+      // `checkAuth` + `requireAdmin` re-checks live Firestore `isSystemAdmin` and rejects with 403!
+      const staleReq: any = { headers: { authorization: `Bearer ${staleAdminJwt}` } };
+      await server.checkAuth(staleReq, createMockRes(), () => {});
+      expect(staleReq.user?.isAdmin).toBe(true);
       const resStaleAdmin = createMockRes();
-      await server.requireAdmin(
-        { user: { uid: attendee.uid, email: attendee.email, isAdmin: true } } as any,
-        resStaleAdmin,
-        () => {}
-      );
+      await server.requireAdmin(staleReq, resStaleAdmin, () => {});
       expect(resStaleAdmin.statusCode).toBe(403);
 
       // And attendee's attributes & preferences are still intact in real Firestore after admin demotion!
@@ -695,7 +738,6 @@ describe.skipIf(!existsSync(EMULATOR_JAR))(
         membersSubcollection: "members_mt"
       });
 
-      const adminAuth = createFakeAdminAuth();
       const server = createLanyardServer<
         Role,
         Cap,
@@ -706,8 +748,7 @@ describe.skipIf(!existsSync(EMULATOR_JAR))(
       >({
         adminAuth,
         store: serverStore,
-        policy,
-        authService: new FakeAuthService()
+        policy
       });
 
       // 1. Grant additive capabilities via FieldValue.arrayUnion and revoke via FieldValue.arrayRemove on real Firestore
@@ -737,20 +778,22 @@ describe.skipIf(!existsSync(EMULATOR_JAR))(
       });
 
       const client = createLanyardClient<Role, Cap, Record<string, any>, { quotaTier: string }>({
+        auth: clientAuth,
         store: clientStore,
         policy,
         defaultPreferences: {}
       });
-      client.setActiveUser({
-        uid: m1.uid,
-        email: "worker@example.com",
-        displayName: "Worker",
-        photoUrl: null,
-        emailVerified: true,
-        isAnonymous: false,
-        isAdmin: false,
-        providerIds: []
-      });
+      await signInWithCredential(
+        clientAuth,
+        GoogleAuthProvider.credential(
+          JSON.stringify({
+            sub: m1.uid,
+            email: "worker@example.com",
+            email_verified: true,
+            name: "Worky McWorker"
+          })
+        )
+      );
 
       const membershipsState = await waitForStore(
         client.membershipsStore,
@@ -773,11 +816,31 @@ describe.skipIf(!existsSync(EMULATOR_JAR))(
         targetUid: m1.uid,
         patch: { geminiKey: "AIzaSyMemberKeyOrg2" }
       });
+      expect(
+        await server.getScopeMemberSecretsStatusAs({
+          scopeId: "org-2",
+          actorUid: m1.uid,
+          targetUid: m1.uid
+        })
+      ).toEqual({ geminiKey: true });
+      expect(await server.getDecryptedScopeMemberSecrets("org-2", m1.uid)).toEqual({
+        geminiKey: "AIzaSyMemberKeyOrg2"
+      });
+      const rawScopedMemberSecretSnap = await adminDb.doc(`orgs_mt/org-2/members_mt/${m1.uid}/private/secrets`).get();
+      expect(isEncryptedSecretData(rawScopedMemberSecretSnap.data()?.geminiKey)).toBe(true);
+      expect(JSON.stringify(rawScopedMemberSecretSnap.data())).not.toContain("AIzaSyMemberKeyOrg2");
+
       await server.updateScopeSecretsAs({
         scopeId: "org-2",
         actorUid: m1.uid,
         patch: { geminiKey: "AIzaSySharedOrg2" }
       });
+      expect(
+        await server.getScopeSecretsStatusAs({
+          scopeId: "org-2",
+          actorUid: m1.uid
+        })
+      ).toEqual({ geminiKey: true });
       expect(await server.getDecryptedScopeSecrets("org-2")).toEqual({ geminiKey: "AIzaSySharedOrg2" });
 
       await expect(
@@ -900,27 +963,35 @@ service cloud.firestore {
       });
       expect(rulesRes.status).toBe(200);
 
-      function createAuthedClient(uid: string, email: string, isAdmin = false) {
+      async function createAuthedClient(uid: string, email: string, isAdmin = false) {
+        await adminAuth.createUser({ uid, email, emailVerified: true });
+        if (isAdmin) {
+          await adminAuth.setCustomUserClaims(uid, { admin: true });
+        }
         const app = initializeClientApp(
           { projectId, apiKey: "fake-api-key" },
           `client-${uid}-${Math.random().toString(36).slice(2, 7)}`
         );
+        const auth = getClientAuth(app);
+        connectAuthEmulator(auth, `http://127.0.0.1:${authEmulatorPort}`, { disableWarnings: true });
+        await signInWithCredential(
+          auth,
+          GoogleAuthProvider.credential(
+            JSON.stringify({
+              sub: uid,
+              email,
+              email_verified: true
+            })
+          )
+        );
         const db = getClientFirestore(app);
-        connectFirestoreEmulator(db, "127.0.0.1", emulatorPort, {
-          mockUserToken: {
-            sub: uid,
-            user_id: uid,
-            email,
-            email_verified: true,
-            admin: isAdmin
-          }
-        });
-        return { app, db };
+        connectFirestoreEmulator(db, "127.0.0.1", emulatorPort);
+        return { app, auth, db };
       }
 
-      const memberClient = createAuthedClient("u-member", "member@example.com", false);
-      const mgrClient = createAuthedClient("u-mgr", "mgr@example.com", false);
-      const sysAdminClient = createAuthedClient("u-sysadmin", "sysadmin@example.com", true);
+      const memberClient = await createAuthedClient("u-member", "member@example.com", false);
+      const mgrClient = await createAuthedClient("u-mgr", "mgr@example.com", false);
+      const sysAdminClient = await createAuthedClient("u-sysadmin", "sysadmin@example.com", true);
 
       try {
         type Role = "member" | "manager" | "owner";

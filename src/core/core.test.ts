@@ -843,6 +843,31 @@ describe("lanyard/core unit tests", () => {
       expect(policy.canWriteSecret(moderator, "hybridAnthropicKey", { isSelf: false })).toBe(true);
       expect(policy.canWriteSecret(scanner, "hybridAnthropicKey", { isSelf: false })).toBe(false);
 
+      // - canWriteSecretsPatch validates every key in a multi-key secret patch
+      expect(
+        policy.canWriteSecretsPatch(
+          attendee,
+          { personalGeminiKey: "AIza1", hybridAnthropicKey: "sk-ant-1" },
+          { isSelf: true }
+        )
+      ).toBe(true);
+      expect(
+        policy.canWriteSecretsPatch(
+          attendee,
+          { personalGeminiKey: "AIza1", sharedOpenaiKey: "sk-proj-1" },
+          { isSelf: true }
+        )
+      ).toBe(false);
+      expect(
+        policy.canWriteSecretsPatch(
+          moderator,
+          { sharedOpenaiKey: "sk-proj-1", hybridAnthropicKey: null },
+          { isSelf: false }
+        )
+      ).toBe(true);
+      expect(policy.canWriteSecretsPatch(moderator, { personalGeminiKey: "AIza1" }, { isSelf: false })).toBe(false);
+      expect(policy.canWriteSecretsPatch(moderator, {}, { isSelf: true })).toBe(false);
+
       // 4. Patch validation & prototype-pollution defenses (even for systemAdmin!)
       expect(policy.canWriteAttributesPatch(scanner, { pointsAllTime: 50 })).toBe(true);
       expect(policy.canWriteAttributesPatch(scanner, { pointsAllTime: 50, internalTier: "vip" })).toBe(false);
@@ -948,6 +973,14 @@ describe("lanyard/core unit tests", () => {
       await store.deleteScopeMember("ws-1", "u-hybrid");
       expect(await store.getScopeMemberHiddenAttributes("ws-1", "u-hybrid")).toEqual({});
       expect(await store.getScopeMemberSecrets("ws-1", "u-hybrid")).toEqual({});
+
+      // Scope-wide secrets lifecycle (e.g. BYOK workspace keys)
+      await store.updateScopeSecrets("ws-1", { geminiKey: "AIzaSyWorkspaceByok" });
+      expect(await store.getScopeSecretsStatus("ws-1")).toEqual({ geminiKey: true });
+      expect(await store.getScopeSecrets("ws-1")).toEqual({ geminiKey: "AIzaSyWorkspaceByok" });
+      await store.updateScopeSecrets("ws-1", { geminiKey: null });
+      expect(await store.getScopeSecretsStatus("ws-1")).toEqual({});
+      expect(await store.getScopeSecrets("ws-1")).toEqual({});
 
       unsubUser();
       expect(observedUsers.length).toBeGreaterThanOrEqual(5);

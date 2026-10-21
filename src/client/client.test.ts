@@ -280,29 +280,7 @@ describe("lanyard/client unit tests", () => {
     expect(magicUser?.uid).toBe("u-magic");
     expect(localStorage.getItem("testapp_emailForSignIn")).toBeNull();
 
-    // 4. Dev Mode Login (?loginAs=dev@test.com)
-    vi.stubGlobal(
-      "fetch",
-      vi.fn().mockResolvedValueOnce({
-        ok: true,
-        json: async () => ({ token: "custom-dev-token" })
-      })
-    );
-    vi.mocked(firebaseAuth.signInWithCustomToken).mockResolvedValueOnce({
-      user: {
-        uid: "u-dev",
-        email: "dev@test.com",
-        emailVerified: true,
-        providerData: [],
-        getIdTokenResult: vi.fn().mockResolvedValue({ claims: { admin: true } })
-      }
-    } as any);
-    const params = new URLSearchParams("loginAs=dev@test.com&tab=events");
-    await client.handleDevModeLogin(params);
-    expect(client.authStore.get().user?.uid).toBe("u-dev");
-    expect(client.authStore.get().user?.isAdmin).toBe(true);
-
-    // 5. Link / Unlink Social Provider, getSignInMethodsForEmail, sendEmailUpdateVerification
+    // 4. Link / Unlink Social Provider, getSignInMethodsForEmail, sendEmailUpdateVerification
     vi.mocked(firebaseAuth.linkWithPopup).mockResolvedValueOnce({
       user: {
         ...fakeAuth.currentUser,
@@ -912,24 +890,7 @@ describe("lanyard/client unit tests", () => {
       /protocol must be http: or https:/
     );
 
-    // 3. Reject external or protocol-relative endpoints and invalid emails in handleDevModeLogin
-    await expect(
-      client.handleDevModeLogin(new URLSearchParams("loginAs=dev@test.com"), "https://evil.example.com/steal")
-    ).rejects.toThrow(/relative path/);
-    await expect(
-      client.handleDevModeLogin(new URLSearchParams("loginAs=dev@test.com"), "//evil.example.com/steal")
-    ).rejects.toThrow(/relative path/);
-    await expect(
-      client.handleDevModeLogin(new URLSearchParams("loginAs=not-an-email"), "/api/dev/auth/token")
-    ).rejects.toThrow(/Invalid loginAs email/);
-
-    vi.stubGlobal("fetch", vi.fn().mockResolvedValueOnce({ ok: true, json: async () => ({ token: "" }) }));
-    await expect(
-      client.handleDevModeLogin(new URLSearchParams("loginAs=dev@test.com"), "/api/dev/auth/token")
-    ).rejects.toThrow(/missing valid token/);
-    vi.unstubAllGlobals();
-
-    // 4. FirestoreClientStore rejects path traversal and reserved __.*__ document IDs
+    // 3. FirestoreClientStore rejects path traversal and reserved __.*__ document IDs
     const fsStore = new FirestoreClientStore<TestRole, TestCap, TestPrefs>({
       db: {} as any,
       defaultRole: "member"
@@ -1070,9 +1031,6 @@ describe("lanyard/client unit tests", () => {
     await expect(clientNoPolicy.loginAnonymously()).rejects.toThrow(/not initialized/);
     await expect(clientNoPolicy.sendPasswordlessEmailLink("a@b.com")).rejects.toThrow(/not initialized/);
     await expect(clientNoPolicy.completePasswordlessSignIn("a@b.com")).rejects.toThrow(/not initialized/);
-    await expect(clientNoPolicy.handleDevModeLogin(new URLSearchParams("loginAs=a@b.com"))).rejects.toThrow(
-      /not initialized/
-    );
     await expect(clientNoPolicy.linkSocialProvider("google")).rejects.toThrow(/No authenticated user/);
     await expect(clientNoPolicy.unlinkSocialProvider("google.com")).rejects.toThrow(/No authenticated user/);
     await expect(clientNoPolicy.sendEmailUpdateVerification("a@b.com")).rejects.toThrow(/No authenticated user/);
@@ -1119,14 +1077,6 @@ describe("lanyard/client unit tests", () => {
     // getSignInMethodsForEmail catches errors and returns []
     vi.mocked(firebaseAuth.fetchSignInMethodsForEmail).mockRejectedValueOnce(new Error("Network error"));
     expect(await clientWithAuth.getSignInMethodsForEmail("stored@example.com")).toEqual([]);
-
-    // handleDevModeLogin no-ops when loginAs param is absent, and throws when response.ok is false
-    await clientWithAuth.handleDevModeLogin(new URLSearchParams(""));
-    vi.stubGlobal("fetch", vi.fn().mockResolvedValueOnce({ ok: false, status: 403 }));
-    await expect(
-      clientWithAuth.handleDevModeLogin(new URLSearchParams("loginAs=dev@example.com"), "/api/dev/auth/token")
-    ).rejects.toThrow(/Dev token generation failed/);
-    vi.unstubAllGlobals();
 
     // 4. FirestoreClientStore error callbacks, custom collection names, custom resolveRole, and unsafe photoUrl ignore
     vi.mocked(firebaseFirestore.onSnapshot).mockImplementation((_ref: any, _onNext: any, onError?: any) => {
@@ -1557,6 +1507,61 @@ describe("lanyard/client unit tests", () => {
     expect(clientFourTier.canWriteSecret("personalGeminiKey", "ws-unknown")).toBe(false);
     expect(clientFourTier.canWriteSecret("personalGeminiKey", "../bad")).toBe(false);
 
+    // Policy-less client fallback behavior (when policy is omitted from createLanyardClient):
+    const clientNoPolicy = createLanyardClient<TestRole, TestCap, TestPrefs, CustomAttrs>({
+      store,
+      defaultPreferences: DEFAULT_PREFS
+    });
+
+    // While signed out, all permission checks return false
+    expect(clientNoPolicy.canReadAttribute("points")).toBe(false);
+    expect(clientNoPolicy.canWriteAttribute("points")).toBe(false);
+    expect(clientNoPolicy.canReadHiddenAttribute("staffNotes")).toBe(false);
+    expect(clientNoPolicy.canWriteHiddenAttribute("staffNotes")).toBe(false);
+    expect(clientNoPolicy.canWriteSecret("personalGeminiKey")).toBe(false);
+
+    // Non-admin user without a policy: can read own attributes and write own secrets (isSelf: true),
+    // but cannot read others' attributes, write attributes/hiddenAttributes, or write non-self secrets
+    clientNoPolicy.setActiveUser({
+      uid: "u-dual",
+      email: "dual@example.com",
+      emailVerified: true,
+      displayName: "Dual User",
+      photoUrl: null,
+      isAnonymous: false,
+      isAdmin: false,
+      providerIds: ["google.com"]
+    });
+    expect(clientNoPolicy.canReadAttribute("points")).toBe(true);
+    expect(clientNoPolicy.canReadAttribute("points", { isSelf: false })).toBe(false);
+    expect(clientNoPolicy.canReadAttribute("points", "ws-alpha")).toBe(true);
+    expect(clientNoPolicy.canReadAttribute("points", "ws-unknown")).toBe(false);
+    expect(clientNoPolicy.canWriteAttribute("points")).toBe(false);
+    expect(clientNoPolicy.canReadHiddenAttribute("staffNotes")).toBe(false);
+    expect(clientNoPolicy.canWriteHiddenAttribute("staffNotes")).toBe(false);
+    expect(clientNoPolicy.canWriteSecret("personalGeminiKey")).toBe(true);
+    expect(clientNoPolicy.canWriteSecret("personalGeminiKey", { isSelf: false })).toBe(false);
+    expect(clientNoPolicy.canWriteSecret("personalGeminiKey", "ws-alpha")).toBe(true);
+    expect(clientNoPolicy.canWriteSecret("personalGeminiKey", "ws-unknown")).toBe(false);
+
+    // System admin without a policy: allowed for all attribute/hiddenAttribute/secret operations
+    clientNoPolicy.setActiveUser({
+      uid: "u-admin",
+      email: "admin@example.com",
+      emailVerified: true,
+      displayName: "Admin User",
+      photoUrl: null,
+      isAnonymous: false,
+      isAdmin: true,
+      providerIds: ["google.com"]
+    });
+    expect(clientNoPolicy.canReadAttribute("points", { isSelf: false })).toBe(true);
+    expect(clientNoPolicy.canWriteAttribute("points")).toBe(true);
+    expect(clientNoPolicy.canReadHiddenAttribute("staffNotes")).toBe(true);
+    expect(clientNoPolicy.canWriteHiddenAttribute("staffNotes")).toBe(true);
+    expect(clientNoPolicy.canWriteSecret("workspaceOpenaiKey", { scopeId: "ws-unknown", isSelf: false })).toBe(true);
+
+    clientNoPolicy.destroy();
     clientFourTier.destroy();
     client.destroy();
   });

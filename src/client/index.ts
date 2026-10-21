@@ -6,7 +6,6 @@ import {
   linkWithPopup,
   unlink,
   signInAnonymously,
-  signInWithCustomToken,
   signOut as firebaseSignOut,
   onAuthStateChanged,
   sendSignInLinkToEmail,
@@ -487,43 +486,6 @@ export function createLanyardClient<
       return normalized;
     }
     return null;
-  }
-
-  async function handleDevModeLogin(urlParams: URLSearchParams, endpoint = "/api/dev/auth/token"): Promise<void> {
-    if (!auth) throw new Error("Firebase Auth is not initialized");
-    const loginAs = urlParams.get("loginAs")?.trim();
-    if (!loginAs) return;
-    if (!isValidEmail(loginAs)) {
-      throw new Error("Invalid loginAs email address");
-    }
-    if (!endpoint || !endpoint.startsWith("/") || endpoint.startsWith("//") || endpoint.includes("\\")) {
-      throw new Error("Dev auth endpoint must be a relative path starting with '/'");
-    }
-
-    const response = await fetch(endpoint, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ email: loginAs })
-    });
-
-    if (!response.ok) {
-      throw new Error("Dev token generation failed");
-    }
-
-    const data = await response.json();
-    if (!data || typeof data.token !== "string" || !data.token.trim()) {
-      throw new Error("Dev token response missing valid token string");
-    }
-    const userCredential = await signInWithCustomToken(auth, data.token.trim());
-    const tokenResult = await userCredential.user.getIdTokenResult();
-    setActiveUser(normalizeFirebaseUser(userCredential.user, tokenResult.claims || {}));
-
-    if (typeof window !== "undefined") {
-      urlParams.delete("loginAs");
-      const cleanSearch = urlParams.toString();
-      const cleanUrl = window.location.pathname + (cleanSearch ? `?${cleanSearch}` : "") + window.location.hash;
-      window.history.replaceState({}, "", cleanUrl);
-    }
   }
 
   async function signOut(): Promise<void> {
@@ -1024,7 +986,6 @@ export function createLanyardClient<
     loginAnonymously,
     sendPasswordlessEmailLink,
     completePasswordlessSignIn,
-    handleDevModeLogin,
     signOut,
     linkSocialProvider,
     unlinkSocialProvider,
