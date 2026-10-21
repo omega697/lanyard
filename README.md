@@ -21,7 +21,7 @@ Like a conference or workplace lanyard, `lanyard` answers two questions everywhe
     - **`preferences`** (`TPreferences`): Self-readable and self-writable custom properties (stored inline on `users/{uid}.preferences` and `{scope}/{scopeId}/members/{uid}.preferences`).
     - **`attributes`** (`TAttributes`): Self-readable custom properties that only system admins or roles holding the configured capability in `attributeCapabilities` can write (e.g., points, badges, quotas).
     - **`hiddenAttributes`** (`THiddenAttributes`): Properties _about_ a user that **not even the user themselves can read or write**—accessible only to system admins or roles holding the configured `read` / `write` capability in `hiddenAttributeCapabilities` (stored in isolated `users/{uid}/private/hiddenAttributes` and `{scope}/{scopeId}/members/{uid}/private/hiddenAttributes` subdocuments).
-    - **`secrets`** (`TSecrets`): **Write-only AES-256-GCM encrypted secrets** owned by the user or workspace (e.g., BYOK AI API keys or OAuth tokens). Stored encrypted at rest (`{ ciphertext, iv, tag }`) in `private/secrets`, never readable back out to any client, with boolean status checks (`getUserSecretsStatusAs`, `getScopeSecretsStatusAs`) for the UI and server-only decryption (`getDecryptedUserSecrets`, `getDecryptedScopeSecrets`) for backend API calls.
+    - **`secrets`** (`TSecrets`): **Write-only AES-256-GCM encrypted secrets** owned by the user or workspace (e.g., BYOK AI API keys or OAuth tokens). Stored encrypted at rest (`{ ciphertext, iv, tag }`) in `private/secrets`, never readable back out to any client, with boolean status checks (`getUserSecretsStatusAs`, `getScopeMemberSecretsStatusAs`, `getScopeSecretsStatusAs`) for the UI and server-only decryption (`getDecryptedUserSecrets`, `getDecryptedScopeMemberSecrets`, `getDecryptedScopeSecrets`) for backend API calls.
   - **Single-Listener Multiplexing**: `FirestoreClientStore` multiplexes `onSnapshot` listeners on `users/{uid}` so subscribing to user profile, `attributes`, `preferences`, and admin status only ever opens **1 Firestore document listener**.
 - **Smart Avatar Tracking & Fallback Resolution**:
   - **Provider Fallback**: When a user signs up via Magic Email Link (`user.photoURL === null`) and later links Google or GitHub, `normalizeFirebaseUser` automatically extracts their avatar from `user.providerData[].photoURL` and sanitizes the URL.
@@ -165,9 +165,38 @@ export const lanyard = createLanyardClient<WorkspaceRole, WorkspaceCapability, U
 });
 
 // In a Svelte component, use native $store syntax directly:
-// const { authStore, membershipsStore, preferencesStore } = lanyard;
+// const { authStore, userRecordStore, attributesStore, membershipsStore, preferencesStore } = lanyard;
 // $: currentUser = $authStore.user;
 // $: workspaces = $membershipsStore.memberships;
+```
+
+#### Unified Client Accessors & Field-Level Permission Helpers
+
+All role, capability, preference, attribute, and field-level permission methods on `createLanyardClient` accept an optional `scopeId` so single-tenant (unscoped) and multi-tenant (scoped) applications share the exact same API:
+
+```ts
+// Role & capability checks (omit scopeId for single-tenant; pass scopeId for multi-tenant):
+const globalRole = lanyard.getRole();
+const workspaceRole = lanyard.getRole(activeWorkspaceId);
+
+const isManagerOrAbove = lanyard.hasMinimumRole("manager", activeWorkspaceId);
+const canInvite = lanyard.hasCapability("invite_members", activeWorkspaceId);
+const canEditOrBill = lanyard.hasAnyCapability(["edit_content", "billing"], activeWorkspaceId);
+
+// Preferences & Attributes (unscoped or scoped):
+const globalPrefs = lanyard.getPreferences();
+const workspacePrefs = lanyard.getPreferences(activeWorkspaceId);
+await lanyard.updatePreferences({ themePreference: "dark" });
+await lanyard.updatePreferences({ use12h: false }, { scopeId: activeWorkspaceId });
+
+const globalAttrs = lanyard.getAttributes();
+const workspaceAttrs = lanyard.getAttributes(activeWorkspaceId);
+
+// Field-level UI permission checks across all 4 custom property tiers:
+const canEditPoints = lanyard.canWriteAttribute("pointsAllTime", activeWorkspaceId);
+const canViewNotes = lanyard.canReadHiddenAttribute("internalNotes", activeWorkspaceId);
+const canEditNotes = lanyard.canWriteHiddenAttribute("internalNotes", activeWorkspaceId);
+const canConfigureGeminiKey = lanyard.canWriteSecret("geminiKey", activeWorkspaceId);
 ```
 
 #### Authentication & Magic Links
@@ -213,7 +242,8 @@ const store = new FirestoreServerStore<WorkspaceRole, WorkspaceCapability>({
   db,
   defaultRole: workspacePolicy.defaultRole,
   scopeCollection: "workspaces",
-  membersSubcollection: "members"
+  membersSubcollection: "members",
+  encryptionKey: process.env.LANYARD_ENCRYPTION_KEY // Master key for AES-256-GCM encrypted secrets
 });
 
 export const lanyardServer = createLanyardServer<WorkspaceRole, WorkspaceCapability>({
@@ -225,7 +255,17 @@ export const lanyardServer = createLanyardServer<WorkspaceRole, WorkspaceCapabil
 
 const router = express.Router();
 
-// Protect routes by hierarchical role tier ('owner' | 'manager' | 'member')
+// Single-tenant route protection (checks users/{uid}):
+router.post(
+  "/events/scan",
+  lanyardServer.checkAuth,
+  lanyardServer.requireUserCapability("edit_content"),
+  async (req, res) => {
+    res.json({ ok: true });
+  }
+);
+
+// Multi-tenant route protection by hierarchical role tier ('owner' | 'manager' | 'member'):
 router.put(
   "/workspaces/:workspaceId/settings",
   lanyardServer.checkAuth,
@@ -235,8 +275,8 @@ router.put(
   }
 );
 
-// Protect routes by capability (roles whose capabilities include 'invite_members' or '*',
-// members with 'invite_members' in member.capabilities, and system admins automatically pass)
+// Multi-tenant route protection by capability (roles whose capabilities include 'invite_members' or '*',
+// members with 'invite_members' in member.capabilities, and system admins automatically pass):
 router.post(
   "/workspaces/:workspaceId/invitations",
   lanyardServer.checkAuth,
@@ -252,7 +292,15 @@ router.post(
 When adding a user by email (e.g., via CSV import or an invite form) before they have ever signed in:
 
 ```ts
-// Additively grants 'edit_content' capability (and creates/resolves their Firebase Auth UID)
+// Single-tenant user provisioning / additive capability grants on users/{uid}:
+const user = await lanyardServer.grantUserCapabilitiesByEmail({
+  email: "collaborator@example.com",
+  firstName: "Accenty",
+  lastName: "McÉccent",
+  capabilities: ["edit_content"]
+});
+
+// Multi-tenant member provisioning / additive capability grants on workspaces/{workspaceId}/members/{uid}
 // without overwriting any other capabilities (such as 'invite_members') they already hold:
 const member = await lanyardServer.grantScopeCapabilitiesByEmail({
   scopeId: workspaceId,
@@ -264,19 +312,72 @@ const member = await lanyardServer.grantScopeCapabilitiesByEmail({
 });
 ```
 
+#### Managing `attributes`, `hiddenAttributes`, and Encrypted `secrets` on the Server
+
+```ts
+// 1. attributes (self-readable on users/{uid} or members/{uid}; capability-gated writes):
+await lanyardServer.updateUserAttributesAs({
+  actorUid: req.user!.uid,
+  isSystemAdmin: req.user!.isAdmin,
+  targetUid: attendeeUid,
+  patch: { pointsAllTime: 150 }
+});
+const visibleAttrs = await lanyardServer.readUserAttributesAs({
+  actorUid: req.user!.uid,
+  isSystemAdmin: req.user!.isAdmin,
+  targetUid: attendeeUid
+});
+
+// 2. hiddenAttributes (stored in private/hiddenAttributes; hidden from target user, redacted per field):
+await lanyardServer.updateUserHiddenAttributesAs({
+  actorUid: req.user!.uid,
+  isSystemAdmin: req.user!.isAdmin,
+  targetUid: attendeeUid,
+  patch: { internalNotes: "Verified badge at registration desk" }
+});
+const visibleHidden = await lanyardServer.readUserHiddenAttributesAs({
+  actorUid: req.user!.uid,
+  isSystemAdmin: req.user!.isAdmin,
+  targetUid: attendeeUid
+});
+
+// 3. secrets (write-only AES-256-GCM encrypted in private/secrets; pass "" or null to delete a key):
+const secretStatus = await lanyardServer.updateUserSecretsAs({
+  actorUid: req.user!.uid,
+  isSystemAdmin: req.user!.isAdmin,
+  targetUid: req.user!.uid,
+  patch: { geminiKey: "AIzaSy..." }
+}); // Returns { geminiKey: true } — never the plaintext or ciphertext!
+
+// Decrypt on the server only when making an outbound API call:
+const decrypted = await lanyardServer.getDecryptedUserSecrets(req.user!.uid);
+// (Scoped equivalents: updateScopeMemberSecretsAs / getScopeMemberSecretsStatusAs / getDecryptedScopeMemberSecrets
+//  and updateScopeSecretsAs / getScopeSecretsStatusAs / getDecryptedScopeSecrets)
+```
+
 ---
 
 ### 4. Supplying a Custom Storage Implementation
 
-To use `lanyard` with a non-Firestore database (PostgreSQL, SQLite, REST, etc.), implement `LanyardClientStore<TRole, TCapability, TPreferences>` and/or `LanyardServerStore<TRole, TCapability>` from `lanyard/core`:
+To use `lanyard` with a non-Firestore database (PostgreSQL, SQLite, REST, etc.), implement `LanyardClientStore` and/or `LanyardServerStore` from `lanyard/core`:
 
 ```ts
-import type { LanyardServerStore, ScopedMember, SystemAdminProfile } from "lanyard/core";
+import type {
+  EncryptedSecretMap,
+  LanyardServerStore,
+  LanyardUserRecord,
+  ScopedMember,
+  SystemAdminProfile
+} from "lanyard/core";
 
 class PostgresServerStore<
   TRole extends string = string,
-  TCapability extends string = string
-> implements LanyardServerStore<TRole, TCapability> {
+  TCapability extends string = string,
+  TPreferences extends Record<string, any> = Record<string, any>,
+  TAttributes extends Record<string, any> = Record<string, any>,
+  THiddenAttributes extends Record<string, any> = Record<string, any>
+> implements LanyardServerStore<TRole, TCapability, TPreferences, TAttributes, THiddenAttributes> {
+  // System Admin methods
   async getSystemAdmin(uid: string): Promise<SystemAdminProfile | null> {
     /* ... */
   }
@@ -289,27 +390,98 @@ class PostgresServerStore<
   async deleteSystemAdmin(uid: string): Promise<void> {
     /* ... */
   }
-  async getScopeMember(scopeId: string, uid: string): Promise<ScopedMember<TRole, TCapability> | null> {
+
+  // Unscoped (Single-Tenant) User methods
+  async getUser(uid: string): Promise<LanyardUserRecord<TRole, TCapability, TPreferences, TAttributes> | null> {
     /* ... */
   }
-  async listScopeMembers(scopeId: string): Promise<ScopedMember<TRole, TCapability>[]> {
+  async listUsers(): Promise<LanyardUserRecord<TRole, TCapability, TPreferences, TAttributes>[]> {
     /* ... */
   }
-  async upsertScopeMember(scopeId: string, member: ScopedMember<TRole, TCapability>): Promise<void> {
+  async upsertUser(user: LanyardUserRecord<TRole, TCapability, TPreferences, TAttributes>): Promise<void> {
+    /* ... */
+  }
+  async grantUserCapabilities(
+    uid: string,
+    caps: readonly TCapability[],
+    fallback?: Omit<LanyardUserRecord<TRole, TCapability, TPreferences, TAttributes>, "capabilities">
+  ): Promise<LanyardUserRecord<TRole, TCapability, TPreferences, TAttributes>> {
+    /* ... */
+  }
+  async revokeUserCapabilities(uid: string, caps: readonly TCapability[]): Promise<void> {
+    /* ... */
+  }
+  async deleteUser(uid: string): Promise<void> {
+    /* ... */
+  }
+
+  // Scoped (Multi-Tenant) Member methods
+  async getScopeMember(
+    scopeId: string,
+    uid: string
+  ): Promise<ScopedMember<TRole, TCapability, TPreferences, TAttributes> | null> {
+    /* ... */
+  }
+  async listScopeMembers(scopeId: string): Promise<ScopedMember<TRole, TCapability, TPreferences, TAttributes>[]> {
+    /* ... */
+  }
+  async upsertScopeMember(
+    scopeId: string,
+    member: ScopedMember<TRole, TCapability, TPreferences, TAttributes>
+  ): Promise<void> {
     /* ... */
   }
   async grantScopeCapabilities(
     scopeId: string,
     uid: string,
     caps: readonly TCapability[],
-    fallback?: Omit<ScopedMember<TRole, TCapability>, "capabilities">
-  ): Promise<ScopedMember<TRole, TCapability>> {
+    fallback?: Omit<ScopedMember<TRole, TCapability, TPreferences, TAttributes>, "capabilities">
+  ): Promise<ScopedMember<TRole, TCapability, TPreferences, TAttributes>> {
     /* ... */
   }
   async revokeScopeCapabilities(scopeId: string, uid: string, caps: readonly TCapability[]): Promise<void> {
     /* ... */
   }
   async deleteScopeMember(scopeId: string, uid: string): Promise<void> {
+    /* ... */
+  }
+
+  // Hidden Attributes & Encrypted Secrets methods
+  async getUserHiddenAttributes(uid: string): Promise<Partial<THiddenAttributes>> {
+    /* ... */
+  }
+  async updateUserHiddenAttributes(
+    uid: string,
+    patch: Partial<THiddenAttributes>
+  ): Promise<Partial<THiddenAttributes>> {
+    /* ... */
+  }
+  async getScopeMemberHiddenAttributes(scopeId: string, uid: string): Promise<Partial<THiddenAttributes>> {
+    /* ... */
+  }
+  async updateScopeMemberHiddenAttributes(
+    scopeId: string,
+    uid: string,
+    patch: Partial<THiddenAttributes>
+  ): Promise<Partial<THiddenAttributes>> {
+    /* ... */
+  }
+  async getUserSecrets(uid: string): Promise<EncryptedSecretMap> {
+    /* ... */
+  }
+  async updateUserSecrets(uid: string, patch: EncryptedSecretMap): Promise<EncryptedSecretMap> {
+    /* ... */
+  }
+  async getScopeMemberSecrets(scopeId: string, uid: string): Promise<EncryptedSecretMap> {
+    /* ... */
+  }
+  async updateScopeMemberSecrets(scopeId: string, uid: string, patch: EncryptedSecretMap): Promise<EncryptedSecretMap> {
+    /* ... */
+  }
+  async getScopeSecrets(scopeId: string): Promise<EncryptedSecretMap> {
+    /* ... */
+  }
+  async updateScopeSecrets(scopeId: string, patch: EncryptedSecretMap): Promise<EncryptedSecretMap> {
     /* ... */
   }
 }
@@ -417,7 +589,7 @@ match /workspaces/{scopeId}/members/{memberUid} {
 ## Development & Testing
 
 ```bash
-# Run unit tests
+# Run unit tests + real Firebase Auth & Cloud Firestore Emulator integration tests
 npm test
 
 # Typecheck
