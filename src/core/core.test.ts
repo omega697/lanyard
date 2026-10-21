@@ -324,9 +324,9 @@ describe("lanyard/core unit tests", () => {
       expect(getAvatarInitials("   ", "U")).toBe("U");
 
       // Display name fallback order: firstName + lastName -> displayName -> name -> email -> fallback
-      expect(formatMemberDisplayName({ firstName: "Accenty", lastName: "McÉccent", email: "accenty@example.com" })).toBe(
-        "Accenty McÉccent"
-      );
+      expect(
+        formatMemberDisplayName({ firstName: "Accenty", lastName: "McÉccent", email: "accenty@example.com" })
+      ).toBe("Accenty McÉccent");
       expect(formatMemberDisplayName({ displayName: "Accenty M." })).toBe("Accenty M.");
       expect(formatMemberDisplayName({ name: "Accenty Name" })).toBe("Accenty Name");
       expect(formatMemberDisplayName({ email: "accenty@example.com" })).toBe("accenty@example.com");
@@ -598,6 +598,317 @@ describe("lanyard/core unit tests", () => {
       });
       await store.revokeScopeCapabilities("ws-ghost", "ghost-user", ["edit_content"]);
       expect(await store.getScopeMember("ws-ghost", "ghost-user")).toBeNull();
+    });
+
+    it("resolves explicit role inheritance (DAGs, sibling roles, wildcard propagation, trackPresence override) and rejects cycles or unknown roles", () => {
+      type EventRole = "attendee" | "scanner" | "merch_seller" | "moderator" | "director" | "quiet_director";
+      type EventCap =
+        | "view:events"
+        | "manage:points"
+        | "manage:merch"
+        | "manage:badges"
+        | "view:notes"
+        | "manage:notes";
+
+      const dagPolicy = createPermissionPolicy<EventRole, EventCap>({
+        roles: {
+          attendee: {
+            weight: 10,
+            capabilities: ["view:events"],
+            trackPresence: false
+          },
+          scanner: {
+            weight: 20,
+            inherits: ["attendee"],
+            capabilities: ["manage:points"],
+            trackPresence: true
+          },
+          merch_seller: {
+            weight: 20,
+            inherits: ["attendee"],
+            capabilities: ["manage:merch"],
+            trackPresence: false
+          },
+          // Diamond inheritance: moderator inherits from both sibling roles (scanner & merch_seller)
+          moderator: {
+            weight: 30,
+            inherits: ["scanner", "merch_seller"],
+            capabilities: ["manage:badges"]
+            // trackPresence omitted -> inherits true from scanner!
+          },
+          director: {
+            weight: 40,
+            inherits: ["moderator"],
+            capabilities: "*"
+          },
+          quiet_director: {
+            weight: 5, // Intentionally lower weight than director, but explicitly inherits director!
+            inherits: ["director"],
+            trackPresence: false // Explicitly overrides inherited trackPresence: true -> false
+          }
+        }
+      });
+
+      const scannerSubj = { role: "scanner" as const, capabilities: [] };
+      const merchSubj = { role: "merch_seller" as const, capabilities: [] };
+      const modSubj = { role: "moderator" as const, capabilities: [] };
+      const quietDirSubj = { role: "quiet_director" as const, capabilities: [] };
+
+      // Sibling isolation: scanner cannot manage:merch; merch_seller cannot manage:points
+      expect(dagPolicy.hasCapability(scannerSubj, "view:events")).toBe(true);
+      expect(dagPolicy.hasCapability(scannerSubj, "manage:points")).toBe(true);
+      expect(dagPolicy.hasCapability(scannerSubj, "manage:merch")).toBe(false);
+      expect(dagPolicy.inheritsRole(scannerSubj, "merch_seller")).toBe(false);
+      expect(dagPolicy.hasMinimumRole(scannerSubj, "merch_seller")).toBe(false);
+      expect(dagPolicy.hasMinimumRole(merchSubj, "scanner")).toBe(false);
+
+      expect(dagPolicy.hasCapability(merchSubj, "view:events")).toBe(true);
+      expect(dagPolicy.hasCapability(merchSubj, "manage:merch")).toBe(true);
+      expect(dagPolicy.hasCapability(merchSubj, "manage:points")).toBe(false);
+
+      // Diamond convergence: moderator has attendee + scanner + merch_seller + moderator capabilities
+      expect(
+        dagPolicy.hasAllCapabilities(modSubj, ["view:events", "manage:points", "manage:merch", "manage:badges"])
+      ).toBe(true);
+      expect(dagPolicy.hasCapability(modSubj, "manage:notes")).toBe(false);
+      expect(dagPolicy.inheritsRole(modSubj, "attendee")).toBe(true);
+      expect(dagPolicy.inheritsRole(modSubj, "scanner")).toBe(true);
+      expect(dagPolicy.inheritsRole(modSubj, "merch_seller")).toBe(true);
+      expect(dagPolicy.inheritsRole(modSubj, "director")).toBe(false);
+      expect(dagPolicy.shouldTrackPresence(modSubj)).toBe(true); // inherited from scanner
+
+      // quiet_director inherits wildcard "*" from director and passes hasMinimumRole("director") despite weight 5 < 40
+      expect(dagPolicy.hasCapability(quietDirSubj, "manage:notes")).toBe(true);
+      expect(dagPolicy.inheritsRole(quietDirSubj, "director")).toBe(true);
+      expect(dagPolicy.hasMinimumRole(quietDirSubj, "director")).toBe(true);
+      expect(dagPolicy.shouldTrackPresence(quietDirSubj)).toBe(false); // explicit override
+
+      // Cycle detection & validation errors
+      expect(() =>
+        createPermissionPolicy({
+          roles: {
+            selfLoop: { weight: 10, inherits: ["selfLoop"] }
+          }
+        })
+      ).toThrow(/Circular role inheritance detected: selfLoop -> selfLoop/);
+
+      expect(() =>
+        createPermissionPolicy({
+          roles: {
+            a: { weight: 10, inherits: ["b"] },
+            b: { weight: 20, inherits: ["c"] },
+            c: { weight: 30, inherits: ["a"] }
+          }
+        })
+      ).toThrow(/Circular role inheritance detected: a -> b -> c -> a/);
+
+      expect(() =>
+        createPermissionPolicy({
+          roles: {
+            a: { weight: 10, inherits: ["nonexistent" as any] }
+          }
+        })
+      ).toThrow(/inherits from unknown role 'nonexistent'/);
+
+      expect(() =>
+        createPermissionPolicy({
+          roles: {
+            a: { weight: 10, inherits: ["__proto__" as any] }
+          }
+        })
+      ).toThrow(/inherits from unknown role '__proto__'/);
+
+      expect(() =>
+        createPermissionPolicy({
+          roles: {
+            badWeight: { weight: Number.NaN }
+          }
+        })
+      ).toThrow(/Invalid weight for role 'badWeight'/);
+    });
+
+    it("enforces independent read/write capabilities on attributes and secrets with strict self/admin/prototype invariants", () => {
+      type Role = "attendee" | "scanner" | "auditor" | "moderator";
+      type Cap =
+        | "write:points"
+        | "read:internal_tier"
+        | "write:internal_tier"
+        | "read:notes"
+        | "write:notes"
+        | "full:risk";
+
+      const policy = createPermissionPolicy<Role, Cap>({
+        roles: {
+          attendee: { weight: 10, capabilities: [] },
+          scanner: { weight: 20, inherits: ["attendee"], capabilities: ["write:points"] },
+          auditor: { weight: 25, inherits: ["attendee"], capabilities: ["read:internal_tier", "read:notes"] },
+          moderator: {
+            weight: 30,
+            inherits: ["scanner", "auditor"],
+            capabilities: ["write:internal_tier", "write:notes", "full:risk"]
+          }
+        },
+        attributeCapabilities: {
+          // String shorthand: anyone (including self) can read, only 'write:points' can write
+          pointsAllTime: "write:points",
+          // Object syntax: self or 'read:internal_tier' can read; 'write:internal_tier' can write
+          internalTier: { read: "read:internal_tier", write: "write:internal_tier" },
+          // Read-only attribute with no non-admin writer
+          systemFlag: { read: "read:internal_tier" }
+        },
+        secretCapabilities: {
+          // Object syntax: independent read and write capabilities; self NEVER gets access
+          moderatorNotes: { read: "read:notes", write: "write:notes" },
+          // String shorthand on secrets: gates BOTH read and write
+          riskScore: "full:risk",
+          // Write-only secret for non-admins (no read capability configured)
+          auditTrailHash: { write: "write:notes" }
+        }
+      });
+
+      const attendee = { role: "attendee" as const, capabilities: [] };
+      const scanner = { role: "scanner" as const, capabilities: [] };
+      const auditor = { role: "auditor" as const, capabilities: [] };
+      const moderator = { role: "moderator" as const, capabilities: [] };
+
+      // 1. Attributes: self can ALWAYS read their own attributes, but can NEVER write attributes without capability
+      expect(policy.canReadAttribute(attendee, "pointsAllTime", { isSelf: true })).toBe(true);
+      expect(policy.canReadAttribute(attendee, "internalTier", { isSelf: true })).toBe(true);
+      expect(policy.canReadAttribute(attendee, "internalTier", { isSelf: false })).toBe(false);
+      expect(policy.canReadAttribute(auditor, "internalTier", { isSelf: false })).toBe(true);
+
+      expect(policy.canWriteAttribute(attendee, "pointsAllTime")).toBe(false);
+      expect(policy.canWriteAttribute(scanner, "pointsAllTime")).toBe(true);
+      expect(policy.canWriteAttribute(scanner, "internalTier")).toBe(false);
+      expect(policy.canWriteAttribute(moderator, "internalTier")).toBe(true);
+      // Unconfigured or write-omitted attribute key is default-deny for non-admins, allowed for system admins
+      expect(policy.canWriteAttribute(moderator, "systemFlag")).toBe(false);
+      expect(policy.canWriteAttribute(moderator, "unconfiguredAttr")).toBe(false);
+      expect(policy.canWriteAttribute(null, "unconfiguredAttr", true)).toBe(true);
+
+      // filterReadableAttributes redacts restricted attributes for non-self callers lacking read capability
+      const sampleAttrs = { pointsAllTime: 100, internalTier: "gold", systemFlag: true };
+      expect(policy.filterReadableAttributes(attendee, sampleAttrs, { isSelf: false })).toEqual({
+        pointsAllTime: 100
+      });
+      expect(policy.filterReadableAttributes(attendee, sampleAttrs, { isSelf: true })).toEqual(sampleAttrs);
+      expect(policy.filterReadableAttributes(auditor, sampleAttrs, { isSelf: false })).toEqual(sampleAttrs);
+
+      // 2. Secrets: self NEVER gets read or write access; only explicit capability holders or systemAdmin
+      expect(policy.canReadSecret(attendee, "moderatorNotes")).toBe(false);
+      expect(policy.canReadSecret(scanner, "moderatorNotes")).toBe(false);
+      expect(policy.canReadSecret(auditor, "moderatorNotes")).toBe(true);
+      expect(policy.canWriteSecret(auditor, "moderatorNotes")).toBe(false); // auditor has read:notes, NOT write:notes!
+      expect(policy.canWriteSecret(moderator, "moderatorNotes")).toBe(true);
+
+      expect(policy.canReadSecret(auditor, "riskScore")).toBe(false);
+      expect(policy.canReadSecret(moderator, "riskScore")).toBe(true);
+      expect(policy.canWriteSecret(moderator, "riskScore")).toBe(true);
+
+      // Secret with write capability but no read capability cannot be read by non-admins
+      expect(policy.canWriteSecret(moderator, "auditTrailHash")).toBe(true);
+      expect(policy.canReadSecret(moderator, "auditTrailHash")).toBe(false);
+      expect(policy.canReadSecret(null, "auditTrailHash", true)).toBe(true);
+
+      const sampleSecrets = { moderatorNotes: "Trusted", riskScore: 0, superAdminOnly: "top-secret" };
+      expect(policy.filterReadableSecrets(attendee, sampleSecrets)).toEqual({});
+      expect(policy.filterReadableSecrets(auditor, sampleSecrets)).toEqual({ moderatorNotes: "Trusted" });
+      expect(policy.filterReadableSecrets(moderator, sampleSecrets)).toEqual({
+        moderatorNotes: "Trusted",
+        riskScore: 0
+      });
+      expect(policy.filterReadableSecrets(null, sampleSecrets, true)).toEqual(sampleSecrets);
+
+      // 3. Patch validation & prototype-pollution defenses (even for systemAdmin!)
+      expect(policy.canWriteAttributesPatch(scanner, { pointsAllTime: 50 })).toBe(true);
+      expect(policy.canWriteAttributesPatch(scanner, { pointsAllTime: 50, internalTier: "vip" })).toBe(false);
+      expect(policy.canWriteAttributesPatch(scanner, {})).toBe(false);
+      expect(policy.canWriteAttributesPatch(scanner, null as any)).toBe(false);
+      expect(policy.canWriteAttributesPatch(scanner, [] as any)).toBe(false);
+
+      const protoPatch = Object.defineProperty({}, "__proto__", {
+        value: { polluted: true },
+        enumerable: true
+      });
+      expect(policy.canWriteAttributesPatch(null, protoPatch, true)).toBe(false);
+      expect(policy.canWriteSecretsPatch(null, protoPatch, true)).toBe(false);
+      expect(policy.canWriteAttribute(null, "__proto__", true)).toBe(false);
+      expect(policy.canReadSecret(null, "constructor", true)).toBe(false);
+    });
+
+    it("preserves user preferences, attributes, and profile when demoting a system admin in InMemoryLanyardStore", async () => {
+      interface Prefs {
+        leaderboardOptIn: boolean;
+      }
+      interface Attrs {
+        pointsAllTime: number;
+      }
+      interface Secrets {
+        internalNotes: string;
+      }
+
+      const store = new InMemoryLanyardStore<TestRole, TestCapability, Prefs, Attrs, Secrets>();
+      const observedUsers: any[] = [];
+      const unsubUser = store.subscribeToUser("u-hybrid", (u) => observedUsers.push(u));
+
+      // User is both a system admin and an attendee with preferences, attributes, and secrets
+      await store.upsertSystemAdmin({
+        uid: "u-hybrid",
+        email: "hybrid@example.com",
+        firstName: "Testy",
+        lastName: "McTest",
+        displayName: "Testy McTest"
+      });
+      await store.savePreferences("u-hybrid", { leaderboardOptIn: true });
+      await store.updateUserAttributes("u-hybrid", { pointsAllTime: 250 });
+      await store.updateUserSecrets("u-hybrid", { internalNotes: "Great volunteer" });
+      await store.updateUserProfile("u-hybrid", {
+        firstName: "UpdatedTesty",
+        photoUrl: "https://example.com/testy.png"
+      });
+
+      expect(await store.getSystemAdmin("u-hybrid")).not.toBeNull();
+      expect(await store.listSystemAdmins()).toHaveLength(1);
+
+      // Demote from system admin -> getSystemAdmin returns null, but UserRecord preserves points, prefs, and profile!
+      await store.deleteSystemAdmin("u-hybrid");
+      expect(await store.getSystemAdmin("u-hybrid")).toBeNull();
+      expect(await store.listSystemAdmins()).toHaveLength(0);
+
+      const userAfterDemotion = await store.getUser("u-hybrid");
+      expect(userAfterDemotion).toMatchObject({
+        uid: "u-hybrid",
+        email: "hybrid@example.com",
+        firstName: "UpdatedTesty",
+        lastName: "McTest",
+        photoUrl: "https://example.com/testy.png",
+        isSystemAdmin: false,
+        preferences: { leaderboardOptIn: true },
+        attributes: { pointsAllTime: 250 }
+      });
+      expect(await store.getUserSecrets("u-hybrid")).toEqual({ internalNotes: "Great volunteer" });
+
+      // Scoped member attributes and secrets lifecycle
+      await expect(store.updateScopeMemberAttributes("ws-1", "missing-uid", { pointsAllTime: 10 })).rejects.toThrow(
+        /does not exist/
+      );
+      await store.upsertScopeMember("ws-1", {
+        uid: "u-hybrid",
+        email: "hybrid@example.com",
+        role: "member",
+        capabilities: []
+      });
+      await store.updateScopeMemberAttributes("ws-1", "u-hybrid", { pointsAllTime: 99 });
+      await store.updateScopeMemberSecrets("ws-1", "u-hybrid", { internalNotes: "Scoped note" });
+      expect((await store.getScopeMember("ws-1", "u-hybrid"))?.attributes).toEqual({ pointsAllTime: 99 });
+      expect(await store.getScopeMemberSecrets("ws-1", "u-hybrid")).toEqual({ internalNotes: "Scoped note" });
+
+      // Deleting scope member also cleans up scope secrets
+      await store.deleteScopeMember("ws-1", "u-hybrid");
+      expect(await store.getScopeMemberSecrets("ws-1", "u-hybrid")).toEqual({});
+
+      unsubUser();
+      expect(observedUsers.length).toBeGreaterThanOrEqual(5);
     });
   });
 });

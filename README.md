@@ -15,9 +15,13 @@ Like a conference or workplace lanyard, `lanyard` answers two questions everywhe
   - Uses Firebase Auth `uid` as the primary key across all collections, allowing users to link multiple OAuth providers (Google, Microsoft, GitHub, Magic Email Links) or update their email address without breaking foreign keys.
   - Includes `getOrProvisionUidByEmail()` on the server so applications that import or invite users by email _before_ they have ever signed in can deterministically resolve (or pre-create) a verified `uid` up front.
 - **Unified Generic Role & Capability Policy (`createPermissionPolicy<TRole, TCapability>`)**:
-  - **Global System Admin (`admin: true`)**: Checked via Firebase Auth custom claims for zero-read security rules and fast JWT checks, mirrored in `system_admins/{uid}` for directory listing, avatars, and presence.
-  - **Per-Role Definition (`roles`)**: Zero hardcoded role or capability names. Each role in `TRole` defines its hierarchy `weight`, its implied `capabilities` (`"*"` or `readonly TCapability[]`), and `trackPresence` (`boolean`) in one place.
-  - **Per-Member Explicit Capabilities**: Alongside capabilities implied by a user's `role`, each `ScopedMember<TRole, TCapability>` can be granted additional capabilities in `capabilities: TCapability[]` (e.g., a `"member"` granted both `["edit_content", "invite_members"]`).
+  - **Global System Admin (`admin: true`)**: Checked via Firebase Auth custom claims for zero-read security rules and fast JWT checks, mirrored on `users/{uid}` (`isSystemAdmin: true`) for single-query directory listing, instant revocation checks, avatars, and presence.
+  - **Explicit Role Inheritance (`inherits`)**: Each role in `TRole` defines its hierarchy `weight`, optional `inherits: readonly TRole[]` (supporting DAGs and sibling roles with cycle detection), implied `capabilities` (`"*"` or `readonly TCapability[]`), and `trackPresence` (`boolean`) in one place.
+  - **Three-Tier User & Member Properties (`preferences`, `attributes`, `secrets`)**:
+    - **`preferences`** (`TPreferences`): Self-readable and self-writable custom properties (stored inline on `users/{uid}.preferences` and `{scope}/{scopeId}/members/{uid}.preferences`).
+    - **`attributes`** (`TAttributes`): Self-readable custom properties that only system admins or roles holding the configured capability in `attributeCapabilities` can write (e.g., points, badges, quotas).
+    - **`secrets`** (`TSecrets`): Restricted properties that **not even the user themselves can read or write**—accessible only to system admins or roles holding the configured `read` / `write` capability in `secretCapabilities` (stored in isolated `users/{uid}/private/secrets` and `{scope}/{scopeId}/members/{uid}/private/secrets` subdocuments in Firestore).
+  - **Single-Listener Multiplexing**: `FirestoreClientStore` multiplexes `onSnapshot` listeners on `users/{uid}` so subscribing to user profile, `attributes`, `preferences`, and admin status only ever opens **1 Firestore document listener**.
 - **Smart Avatar Tracking & Fallback Resolution**:
   - **Provider Fallback**: When a user signs up via Magic Email Link (`user.photoURL === null`) and later links Google or GitHub, `normalizeFirebaseUser` automatically extracts their avatar from `user.providerData[].photoURL` and sanitizes the URL.
   - **Pre-Provisioned Member & Admin Sync**: When a user who was pre-provisioned by email (`photoUrl: null`) later signs in with OAuth, both the client (`createLanyardClient`) and server middleware (`requireAdmin`, `requireScopeRole`, `requireScopeCapability`) automatically sync their `photoUrl` to their existing member/admin record (deduplicated per session).
@@ -80,21 +84,28 @@ export const workspacePolicy = createPermissionPolicy<WorkspaceRole, WorkspaceCa
   roles: {
     owner: {
       weight: 30,
+      inherits: ["manager"],
       capabilities: "*", // Owners automatically hold all capabilities
       trackPresence: true
     },
     manager: {
       weight: 20,
+      inherits: ["member"],
       capabilities: ["edit_content", "invite_members"], // Managers automatically get 'edit_content' + 'invite_members'
       trackPresence: true
     },
     member: {
       weight: 10,
-      capabilities: [], // Members only hold capabilities explicitly listed in member.capabilities
-      trackPresence: false
+      capabilities: [] // Members only hold capabilities explicitly listed in member.capabilities
     }
   },
-  defaultRole: "member"
+  defaultRole: "member",
+  attributeCapabilities: {
+    pointsAllTime: "edit_content" // Self-readable; writable by roles with 'edit_content' (or system admins)
+  },
+  secretCapabilities: {
+    internalNotes: { read: "invite_members", write: "edit_content" } // Never self-readable; gated by capabilities
+  }
 });
 
 const manager: ScopedMember<WorkspaceRole, WorkspaceCapability> = {
@@ -349,14 +360,46 @@ function hasScopeCapability(scopeId, capability, rolesImplyingCapability) {
   );
 }
 
-// Example member rules preventing self-role/capability escalation on presence & avatar sync:
+// Example unified users/{uid} & private/secrets rules:
+match /users/{uid} {
+  allow read: if isOwner(uid) || isAdmin();
+  allow create: if isAdmin() || (
+    isOwner(uid) &&
+    request.resource.data.keys().hasOnly([
+      'uid', 'email', 'firstName', 'lastName', 'displayName', 'photoUrl', 'lastSeen', 'preferences', 'createdAt', 'updatedAt'
+    ]) &&
+    (!('uid' in request.resource.data) || request.resource.data.uid == uid)
+  );
+  allow update: if isAdmin() || (
+    isOwner(uid) &&
+    request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+      'uid', 'email', 'firstName', 'lastName', 'displayName', 'photoUrl', 'lastSeen', 'preferences', 'updatedAt'
+    ]) &&
+    (!('uid' in request.resource.data) || request.resource.data.uid == uid)
+  );
+
+  match /private/secrets {
+    allow read, write: if isAdmin();
+  }
+}
+
+// Allow authenticated users to query their own memberships across scopes via collectionGroup('members'):
+match /{path=**}/members/{memberUid} {
+  allow read: if isSignedIn() && (resource.data.uid == request.auth.uid || isAdmin());
+}
+
+// Example tenant-scoped member rules preventing cross-tenant access and self-role/attribute escalation:
 match /workspaces/{scopeId}/members/{memberUid} {
   allow read: if isScopeMember(scopeId);
   allow create, delete: if hasScopeCapability(scopeId, 'invite_members', ['owner', 'manager']);
   allow update: if hasScopeCapability(scopeId, 'invite_members', ['owner', 'manager']) || (
     isOwner(memberUid) &&
-    request.resource.data.diff(resource.data).affectedKeys().hasOnly(['lastSeen', 'photoUrl'])
+    request.resource.data.diff(resource.data).affectedKeys().hasOnly(['lastSeen', 'photoUrl', 'preferences'])
   );
+
+  match /private/secrets {
+    allow read, write: if hasScopeCapability(scopeId, 'invite_members', ['owner', 'manager']);
+  }
 }
 ```
 

@@ -423,19 +423,24 @@ describe("lanyard/client unit tests", () => {
       resolveRole: (data) => (data.role as TestRole) || (data.isCreator ? "owner" : "manager")
     });
 
-    // 1. subscribeToPreferences + savePreferences
+    // 1. subscribeToPreferences + savePreferences on unified users/{uid}
     vi.mocked(firebaseFirestore.onSnapshot).mockImplementationOnce((_ref: any, onNext: any) => {
-      onNext({ exists: () => true, data: () => ({ theme: "dark" }) });
+      onNext({ exists: () => true, data: () => ({ preferences: { theme: "dark" } }) });
       return () => {};
     });
     const prefObserved: Partial<TestPrefs>[] = [];
-    store.subscribeToPreferences("u-1", (p) => prefObserved.push(p));
+    const unsubPref1 = store.subscribeToPreferences("u-1", (p) => prefObserved.push(p));
     expect(prefObserved).toEqual([{ theme: "dark" }]);
+    unsubPref1();
 
     await store.savePreferences("u-1", { use12h: false });
     expect(firebaseFirestore.setDoc).toHaveBeenCalledWith(
-      expect.objectContaining({ path: "user_preferences/u-1" }),
-      { use12h: false },
+      expect.objectContaining({ path: "users/u-1" }),
+      expect.objectContaining({
+        uid: "u-1",
+        preferences: { use12h: false },
+        updatedAt: expect.any(String)
+      }),
       { merge: true }
     );
 
@@ -486,7 +491,7 @@ describe("lanyard/client unit tests", () => {
     expect(scopeMembers).toHaveLength(1);
     expect(scopeMembers[0].capabilities).toEqual(["invite_members"]);
 
-    // 4. syncAvatar uses updateDoc for scoped members and setDoc for system_admins
+    // 4. syncAvatar uses updateDoc for scoped members and setDoc for users/{uid}
     await store.syncAvatar({ uid: "u-1", scopeId: "ws-1", photoUrl: "https://example.com/u1.png" });
     expect(firebaseFirestore.updateDoc).toHaveBeenCalledWith(
       expect.objectContaining({ path: "workspaces/ws-1/members/u-1" }),
@@ -500,7 +505,7 @@ describe("lanyard/client unit tests", () => {
       photoUrl: "https://example.com/admin.png"
     });
     expect(firebaseFirestore.setDoc).toHaveBeenCalledWith(
-      expect.objectContaining({ path: "system_admins/u-admin" }),
+      expect.objectContaining({ path: "users/u-admin" }),
       {
         uid: "u-admin",
         email: "admin@example.com",
@@ -527,7 +532,7 @@ describe("lanyard/client unit tests", () => {
       lastSeenIso: "2026-10-19T12:00:00.000Z"
     });
     expect(firebaseFirestore.setDoc).toHaveBeenCalledWith(
-      expect.objectContaining({ path: "system_admins/u-admin" }),
+      expect.objectContaining({ path: "users/u-admin" }),
       { lastSeen: "2026-10-19T12:00:00.000Z" },
       { merge: true }
     );
@@ -538,10 +543,11 @@ describe("lanyard/client unit tests", () => {
       return () => {};
     });
     let prefErrorTriggered = false;
-    store.subscribeToPreferences("u-err", () => {
+    const unsubErr = store.subscribeToPreferences("u-err", () => {
       prefErrorTriggered = true;
     });
     expect(prefErrorTriggered).toBe(false);
+    unsubErr();
 
     vi.mocked(firebaseFirestore.onSnapshot).mockImplementationOnce((_q: any, _onNext: any, onError: any) => {
       onError(new Error("permission-denied"));
@@ -1132,8 +1138,7 @@ describe("lanyard/client unit tests", () => {
       db: { type: "custom-fs" } as any,
       defaultRole: "member",
       resolveRole: (d) => (d.isOwner ? "owner" : "member"),
-      preferencesCollection: "custom_prefs",
-      systemAdminsCollection: "custom_admins",
+      usersCollection: "custom_users",
       scopeCollection: "custom_scopes",
       membersSubcollection: "custom_members"
     });
@@ -1141,13 +1146,14 @@ describe("lanyard/client unit tests", () => {
     const prefErrCb = vi.fn();
     const userMemErrCb = vi.fn();
     const scopeMemErrCb = vi.fn();
-    fsStore.subscribeToPreferences("u-1", prefErrCb);
+    const unsubPrefErr = fsStore.subscribeToPreferences("u-1", prefErrCb);
     fsStore.subscribeToUserMemberships("u-1", userMemErrCb);
     fsStore.subscribeToScopeMembers("ws-1", scopeMemErrCb);
 
     expect(prefErrCb).not.toHaveBeenCalled();
     expect(userMemErrCb).toHaveBeenCalledWith([]);
     expect(scopeMemErrCb).toHaveBeenCalledWith([]);
+    unsubPrefErr();
 
     // syncAvatar with unsafe URL is ignored without calling updateDoc or setDoc
     vi.mocked(firebaseFirestore.updateDoc).mockClear();
@@ -1158,6 +1164,203 @@ describe("lanyard/client unit tests", () => {
 
     clientNoPolicy.destroy();
     clientWithAuth.destroy();
+    vi.restoreAllMocks();
+  });
+
+  it("multiplexes FirestoreClientStore users/{uid} listeners (1 onSnapshot per UID), strips unauthorized fields on updateUserProfile, and supports legacy top-level preferences", async () => {
+    const fakeDb: any = {};
+    const fsStore = new FirestoreClientStore<TestRole, TestCap, TestPrefs, { pointsAllTime: number }>({
+      db: fakeDb,
+      defaultRole: "member"
+    });
+
+    let emitSnapshot!: (snap: any) => void;
+    const underlyingUnsub = vi.fn();
+    vi.mocked(firebaseFirestore.onSnapshot).mockImplementationOnce((_ref: any, onNext: any) => {
+      emitSnapshot = onNext;
+      return underlyingUnsub;
+    });
+
+    const userEvents: any[] = [];
+    const prefEvents: any[] = [];
+    const latePrefEvents: any[] = [];
+
+    // 1. Subscribing to BOTH subscribeToUser and subscribeToPreferences on 'u-mux' opens ONLY 1 Firestore listener!
+    const unsubUser = fsStore.subscribeToUser("u-mux", (u) => userEvents.push(u));
+    const unsubPref = fsStore.subscribeToPreferences("u-mux", (p) => prefEvents.push(p));
+    expect(firebaseFirestore.onSnapshot).toHaveBeenCalledTimes(1);
+
+    emitSnapshot({
+      exists: () => true,
+      data: () => ({
+        uid: "u-mux",
+        email: "mux@example.com",
+        firstName: "Testy",
+        lastName: "McTest",
+        isSystemAdmin: false,
+        role: "manager",
+        preferences: { theme: "dark", use12h: false },
+        attributes: { pointsAllTime: 420 }
+      })
+    });
+
+    expect(userEvents).toHaveLength(1);
+    expect(userEvents[0]).toMatchObject({
+      uid: "u-mux",
+      role: "manager",
+      preferences: { theme: "dark", use12h: false },
+      attributes: { pointsAllTime: 420 }
+    });
+    expect(prefEvents).toEqual([{ theme: "dark", use12h: false }]);
+
+    // 2. Late subscriber immediately receives the latest cached snapshot without triggering a 2nd Firestore read!
+    const unsubLatePref = fsStore.subscribeToPreferences("u-mux", (p) => latePrefEvents.push(p));
+    expect(firebaseFirestore.onSnapshot).toHaveBeenCalledTimes(1);
+    expect(latePrefEvents).toEqual([{ theme: "dark", use12h: false }]);
+
+    // Non-existent doc snapshot emits null to userCallbacks
+    emitSnapshot({ exists: () => false, data: () => undefined });
+    expect(userEvents[userEvents.length - 1]).toBeNull();
+
+    // 3. Ref-counted cleanup: underlying Firestore listener stays active until ALL 3 subscribers detach
+    unsubUser();
+    unsubPref();
+    expect(underlyingUnsub).not.toHaveBeenCalled();
+    unsubLatePref();
+    expect(underlyingUnsub).toHaveBeenCalledTimes(1);
+
+    // 4. Legacy top-level preferences fallback on users/{uid}
+    vi.mocked(firebaseFirestore.onSnapshot).mockImplementationOnce((_ref: any, onNext: any) => {
+      onNext({
+        exists: () => true,
+        data: () => ({
+          uid: "u-legacy",
+          email: "legacy@example.com",
+          theme: "light",
+          use12h: false
+        })
+      });
+      return () => {};
+    });
+    const legacyPrefs: any[] = [];
+    const unsubLegacy = fsStore.subscribeToPreferences("u-legacy", (p) => legacyPrefs.push(p));
+    expect(legacyPrefs).toEqual([{ theme: "light", use12h: false }]);
+    unsubLegacy();
+
+    // 5. updateUserProfile strictly whitelists Tier-1 fields and strips malicious privilege escalation fields
+    vi.mocked(firebaseFirestore.setDoc).mockClear();
+    await fsStore.updateUserProfile("u-mux", {
+      firstName: "  Testy  ",
+      lastName: " McTest ",
+      displayName: " Testy McTest ",
+      photoUrl: "https://example.com/safe.png",
+      // Malicious extra properties injected at runtime via `as any`
+      isSystemAdmin: true,
+      role: "owner",
+      attributes: { pointsAllTime: 999999 }
+    } as any);
+
+    expect(firebaseFirestore.setDoc).toHaveBeenCalledTimes(1);
+    const writtenPayload = vi.mocked(firebaseFirestore.setDoc).mock.calls[0][1] as Record<string, any>;
+    expect(writtenPayload).toEqual({
+      uid: "u-mux",
+      firstName: "Testy",
+      lastName: "McTest",
+      displayName: "Testy McTest",
+      photoUrl: "https://example.com/safe.png",
+      updatedAt: expect.any(String)
+    });
+    expect(writtenPayload.isSystemAdmin).toBeUndefined();
+    expect(writtenPayload.role).toBeUndefined();
+    expect(writtenPayload.attributes).toBeUndefined();
+  });
+
+  it("wires userRecordStore, attributesStore, updateProfile, real-time isSystemAdmin sync, and single-tenant role presence tracking", async () => {
+    interface CheckinAttrs {
+      pointsAllTime: number;
+      awardedBadges: string[];
+    }
+    const store = new InMemoryLanyardStore<TestRole, TestCap, TestPrefs, CheckinAttrs>();
+    await store.upsertUser({
+      uid: "u-single",
+      email: "single@example.com",
+      firstName: "Testy",
+      lastName: "McTest",
+      role: "manager", // 'manager' has trackPresence: true in TEST_POLICY
+      isSystemAdmin: false,
+      preferences: { theme: "dark", use12h: false },
+      attributes: { pointsAllTime: 120, awardedBadges: ["first-checkin"] }
+    });
+
+    const getIdTokenResultSpy = vi.fn().mockResolvedValue({ claims: { admin: true } });
+    const fakeAuth: any = {
+      currentUser: {
+        uid: "u-single",
+        email: "single@example.com",
+        getIdTokenResult: getIdTokenResultSpy
+      }
+    };
+    vi.mocked(firebaseAuth.onAuthStateChanged).mockImplementation(() => () => {});
+
+    const client = createLanyardClient<TestRole, TestCap, TestPrefs, CheckinAttrs>({
+      auth: fakeAuth,
+      store,
+      policy: TEST_POLICY,
+      defaultPreferences: DEFAULT_PREFS,
+      storageKeyPrefix: "singleapp"
+    });
+
+    // Calling updateProfile before sign-in throws
+    await expect(client.updateProfile({ firstName: "Anon" })).rejects.toThrow(/No authenticated user/);
+
+    client.setActiveUser({
+      uid: "u-single",
+      email: "single@example.com",
+      emailVerified: true,
+      displayName: "Testy McTest",
+      photoUrl: "https://example.com/oauth-single.png",
+      isAnonymous: false,
+      isAdmin: false,
+      providerIds: ["google.com"]
+    });
+    await new Promise((r) => setTimeout(r, 0));
+
+    // 1. Single subscription populates preferencesStore, attributesStore, and userRecordStore, and syncs OAuth avatar to users/{uid}
+    expect(client.preferencesStore.get()).toEqual({ theme: "dark", use12h: false });
+    expect(client.attributesStore.get()).toEqual({ pointsAllTime: 120, awardedBadges: ["first-checkin"] });
+    expect(client.userRecordStore.get()?.photoUrl).toBe("https://example.com/oauth-single.png");
+
+    // 2. Self-service updateProfile updates firstName/lastName on users/{uid}
+    await client.updateProfile({ firstName: "Formy", lastName: "McFormerson" });
+    expect(client.userRecordStore.get()?.firstName).toBe("Formy");
+    expect(client.userRecordStore.get()?.lastName).toBe("McFormerson");
+
+    // 3. Server updates attributes -> client attributesStore updates reactively
+    await store.updateUserAttributes("u-single", { pointsAllTime: 170 });
+    expect(client.attributesStore.get().pointsAllTime).toBe(170);
+
+    // 4. Real-time system admin promotion & demotion in users/{uid} updates authStore.user.isAdmin and refreshes ID token
+    await store.upsertSystemAdmin({
+      uid: "u-single",
+      email: "single@example.com",
+      isSystemAdmin: true
+    });
+    expect(client.authStore.get().user?.isAdmin).toBe(true);
+    expect(getIdTokenResultSpy).toHaveBeenCalledWith(true);
+
+    await store.deleteSystemAdmin("u-single");
+    expect(client.authStore.get().user?.isAdmin).toBe(false);
+    // Attributes and preferences remain intact after admin demotion!
+    expect(client.attributesStore.get().pointsAllTime).toBe(170);
+
+    // 5. Single-tenant presence tracking without scopeId: 'manager' role on users/{uid} has trackPresence: true
+    const t0 = 1_700_000_000_000;
+    vi.spyOn(Date, "now").mockReturnValue(t0);
+    client.recordActivity();
+    await client.syncPresence();
+    expect((await store.getUser("u-single"))?.lastSeen).toBe(new Date(t0).toISOString());
+
+    client.destroy();
     vi.restoreAllMocks();
   });
 });

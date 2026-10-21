@@ -1033,9 +1033,9 @@ describe("lanyard/server unit tests", () => {
     const fsStore = new FirestoreServerStore<TestRole, TestCap>({
       db: fakeDb,
       defaultRole: "member",
-      systemAdminsCollection: "custom_admins",
+      usersCollection: "custom_users",
       scopeCollection: "custom_orgs",
-      membersSubcollection: "custom_users"
+      membersSubcollection: "custom_members"
     });
 
     await fsStore.upsertSystemAdmin({
@@ -1053,5 +1053,848 @@ describe("lanyard/server unit tests", () => {
       photoUrl: "javascript:alert(1)"
     });
     expect((await fsStore.getScopeMember("org-1", "u-1"))?.photoUrl).toBeNull();
+  });
+
+  it("blocks stale 1-hour admin JWTs immediately after demotion without re-seeding or wiping user attributes/preferences", async () => {
+    interface Prefs {
+      leaderboardOptIn: boolean;
+    }
+    interface Attrs {
+      pointsAllTime: number;
+    }
+    const adminAuth = createFakeAdminAuth();
+    const store = new InMemoryLanyardStore<TestRole, TestCap, Prefs, Attrs>();
+    const server = createLanyardServer<TestRole, TestCap, Prefs, Attrs>({
+      adminAuth,
+      store,
+      policy: TEST_POLICY,
+      authService: new FakeAuthService()
+    });
+
+    // 1. Provision user who is both an attendee (with points & preferences) and promoted to system admin
+    const user = await server.upsertUserByEmail({
+      email: "hybrid.admin@example.com",
+      firstName: "Testy",
+      lastName: "McTest",
+      role: "member",
+      preferences: { leaderboardOptIn: true },
+      attributes: { pointsAllTime: 350 }
+    });
+    await server.setSystemAdminStatus({
+      email: "hybrid.admin@example.com",
+      isAdmin: true,
+      actorUid: "root-admin"
+    });
+    expect((await store.getSystemAdmin(user.uid))?.isSystemAdmin).toBe(true);
+
+    // 2. Root admin demotes hybrid.admin@example.com
+    await server.setSystemAdminStatus({
+      email: "hybrid.admin@example.com",
+      isAdmin: false,
+      actorUid: "root-admin"
+    });
+
+    // User's attendee attributes and preferences on users/{uid} are 100% preserved!
+    const preservedRecord = await store.getUser(user.uid);
+    expect(preservedRecord?.isSystemAdmin).toBe(false);
+    expect(preservedRecord?.attributes).toEqual({ pointsAllTime: 350 });
+    expect(preservedRecord?.preferences).toEqual({ leaderboardOptIn: true });
+
+    // 3. Stale JWT attack: demoted admin still holds a Firebase ID token with `isAdmin: true` (valid for up to 1 hour)
+    const staleAdminReq: any = {
+      user: {
+        uid: user.uid,
+        email: "hybrid.admin@example.com",
+        isAdmin: true // Stale claim from unexpired JWT!
+      },
+      params: { scopeId: "ws-1" }
+    };
+
+    // requireAdmin blocks with 403 and does NOT auto-seed them back into system_admins!
+    const resAdmin = createMockRes();
+    await server.requireAdmin(staleAdminReq, resAdmin, () => {});
+    expect(resAdmin.statusCode).toBe(403);
+    expect(await store.getSystemAdmin(user.uid)).toBeNull();
+
+    // requireScopeRole("owner") also strips the stale admin bypass and blocks with 403!
+    const resScope = createMockRes();
+    await server.requireScopeRole("owner")(
+      { ...staleAdminReq, user: { ...staleAdminReq.user, isAdmin: true } },
+      resScope,
+      () => {}
+    );
+    expect(resScope.statusCode).toBe(403);
+
+    // requireUserRole("owner") also strips the stale admin bypass and blocks with 403!
+    const resUserRole = createMockRes();
+    await server.requireUserRole("owner")(
+      { ...staleAdminReq, user: { ...staleAdminReq.user, isAdmin: true } },
+      resUserRole,
+      () => {}
+    );
+    expect(resUserRole.statusCode).toBe(403);
+  });
+
+  it("enforces single-tenant roles/capabilities, field-level attributes/secrets permissions, and strict cross-tenant isolation", async () => {
+    type AppRole = "attendee" | "scanner" | "auditor" | "moderator" | "tenant_owner";
+    type AppCap = "write:points" | "write:badges" | "read:tier" | "write:tier" | "read:notes" | "write:notes";
+
+    interface AppPrefs {
+      optIn: boolean;
+    }
+    interface AppAttrs {
+      pointsAllTime: number;
+      awardedBadges: string[];
+      vipTier: string;
+    }
+    interface AppSecrets {
+      moderatorNotes: string;
+      superAdminSecret: string;
+    }
+
+    const policy = createPermissionPolicy<AppRole, AppCap>({
+      roles: {
+        attendee: { weight: 10, capabilities: [] },
+        scanner: { weight: 20, inherits: ["attendee"], capabilities: ["write:points"] },
+        auditor: { weight: 20, inherits: ["attendee"], capabilities: ["read:tier", "read:notes"] },
+        moderator: {
+          weight: 30,
+          inherits: ["scanner", "auditor"],
+          capabilities: ["write:badges", "write:tier", "write:notes"]
+        },
+        tenant_owner: {
+          weight: 40,
+          inherits: ["moderator"],
+          capabilities: "*"
+        }
+      },
+      attributeCapabilities: {
+        pointsAllTime: "write:points",
+        awardedBadges: "write:badges",
+        vipTier: { read: "read:tier", write: "write:tier" }
+      },
+      secretCapabilities: {
+        moderatorNotes: { read: "read:notes", write: "write:notes" }
+      }
+    });
+
+    const adminAuth = createFakeAdminAuth();
+    const store = new InMemoryLanyardStore<AppRole, AppCap, AppPrefs, AppAttrs, AppSecrets>();
+    const server = createLanyardServer<AppRole, AppCap, AppPrefs, AppAttrs, AppSecrets>({
+      adminAuth,
+      store,
+      policy,
+      authService: new FakeAuthService()
+    });
+
+    // Provision single-tenant users
+    const attendee = await server.upsertUserByEmail({
+      email: "attendee@example.com",
+      firstName: "Testy",
+      lastName: "McTest",
+      role: "attendee",
+      attributes: { pointsAllTime: 10, awardedBadges: [], vipTier: "silver" }
+    });
+    const scanner = await server.upsertUserByEmail({
+      email: "scanner@example.com",
+      firstName: "Scanny",
+      lastName: "McScanner",
+      role: "scanner"
+    });
+    const auditor = await server.upsertUserByEmail({
+      email: "auditor@example.com",
+      firstName: "Audity",
+      lastName: "McAuditor",
+      role: "auditor"
+    });
+    const moderator = await server.upsertUserByEmail({
+      email: "moderator@example.com",
+      firstName: "Moddy",
+      lastName: "McModerator",
+      role: "moderator"
+    });
+
+    // 1. Single-tenant middleware: requireUserRole & requireUserCapability (including inherited capabilities!)
+    const reqMod: any = {
+      user: {
+        uid: moderator.uid,
+        email: moderator.email,
+        photoUrl: "https://example.com/mod.png",
+        isAdmin: false
+      }
+    };
+    let modPassedRole = false;
+    await server.requireUserRole("scanner")(reqMod, createMockRes(), () => {
+      modPassedRole = true;
+    });
+    expect(modPassedRole).toBe(true);
+    expect((await store.getUser(moderator.uid))?.photoUrl).toBe("https://example.com/mod.png");
+
+    let modPassedInheritedCap = false;
+    await server.requireUserCapability("write:points")(reqMod, createMockRes(), () => {
+      modPassedInheritedCap = true;
+    });
+    expect(modPassedInheritedCap).toBe(true);
+
+    // Attendee fails requireUserRole("scanner") and requireUserCapability("write:points")
+    const resAttRole = createMockRes();
+    await server.requireUserRole("scanner")(
+      { user: { uid: attendee.uid, email: attendee.email, isAdmin: false } } as any,
+      resAttRole,
+      () => {}
+    );
+    expect(resAttRole.statusCode).toBe(403);
+
+    // 2. Global User Attributes:
+    // - Self can read ALL own attributes (including vipTier), but CANNOT write own attributes!
+    expect(
+      await server.readUserAttributesAs({
+        actorUid: attendee.uid,
+        targetUid: attendee.uid
+      })
+    ).toEqual({ pointsAllTime: 10, awardedBadges: [], vipTier: "silver" });
+
+    await expect(
+      server.updateUserAttributesAs({
+        actorUid: attendee.uid,
+        targetUid: attendee.uid,
+        patch: { pointsAllTime: 9999 }
+      })
+    ).rejects.toThrow(/Forbidden/);
+
+    // - Scanner can read public attributes (pointsAllTime, awardedBadges) but NOT vipTier, and can ONLY write pointsAllTime
+    expect(
+      await server.readUserAttributesAs({
+        actorUid: scanner.uid,
+        targetUid: attendee.uid
+      })
+    ).toEqual({ pointsAllTime: 10, awardedBadges: [] });
+
+    await server.updateUserAttributesAs({
+      actorUid: scanner.uid,
+      targetUid: attendee.uid,
+      patch: { pointsAllTime: 50 }
+    });
+    expect((await store.getUser(attendee.uid))?.attributes?.pointsAllTime).toBe(50);
+
+    await expect(
+      server.updateUserAttributesAs({
+        actorUid: scanner.uid,
+        targetUid: attendee.uid,
+        patch: { awardedBadges: ["cheater-badge"] }
+      })
+    ).rejects.toThrow(/Forbidden/);
+
+    // - Moderator inherits scanner's write:points AND has write:badges + write:tier
+    await server.updateUserAttributesAs({
+      actorUid: moderator.uid,
+      targetUid: attendee.uid,
+      patch: { pointsAllTime: 100, awardedBadges: ["centurion"], vipTier: "gold" }
+    });
+    expect((await store.getUser(attendee.uid))?.attributes).toEqual({
+      pointsAllTime: 100,
+      awardedBadges: ["centurion"],
+      vipTier: "gold"
+    });
+
+    // 3. Global User Secrets:
+    // - Moderator writes moderatorNotes; SystemAdmin writes superAdminSecret
+    await server.updateUserSecretsAs({
+      actorUid: moderator.uid,
+      targetUid: attendee.uid,
+      patch: { moderatorNotes: "Verified ID at booth" }
+    });
+    await server.updateUserSecretsAs({
+      actorUid: "root-admin",
+      isSystemAdmin: true,
+      targetUid: attendee.uid,
+      patch: { superAdminSecret: "classified-flag" }
+    });
+
+    // - Self (`attendee`) CANNOT read or write their own secrets!
+    await expect(
+      server.readUserSecretsAs({
+        actorUid: attendee.uid,
+        targetUid: attendee.uid
+      })
+    ).rejects.toThrow(/Forbidden/);
+    await expect(
+      server.updateUserSecretsAs({
+        actorUid: attendee.uid,
+        targetUid: attendee.uid,
+        patch: { moderatorNotes: "I am totally trustworthy" }
+      })
+    ).rejects.toThrow(/Forbidden/);
+
+    // - Auditor can read `moderatorNotes` (redacting `superAdminSecret`), and CANNOT write `moderatorNotes`
+    expect(
+      await server.readUserSecretsAs({
+        actorUid: auditor.uid,
+        targetUid: attendee.uid
+      })
+    ).toEqual({ moderatorNotes: "Verified ID at booth" });
+
+    await expect(
+      server.updateUserSecretsAs({
+        actorUid: auditor.uid,
+        targetUid: attendee.uid,
+        patch: { moderatorNotes: "Tampered by auditor" }
+      })
+    ).rejects.toThrow(/Forbidden/);
+
+    // - System Admin reads all secrets unredacted
+    expect(
+      await server.readUserSecretsAs({
+        actorUid: "root-admin",
+        isSystemAdmin: true,
+        targetUid: attendee.uid
+      })
+    ).toEqual({
+      moderatorNotes: "Verified ID at booth",
+      superAdminSecret: "classified-flag"
+    });
+
+    // 4. STRICT CROSS-TENANT ISOLATION:
+    // Make `tenantOwnerA` a `tenant_owner` (with wildcard capabilities: "*") in `tenant-A` ONLY.
+    const tenantOwnerA = await server.upsertScopeMemberByEmail({
+      scopeId: "tenant-A",
+      email: "owner.a@example.com",
+      firstName: "Owner",
+      lastName: "Alpha",
+      role: "tenant_owner"
+    });
+    await server.upsertScopeMemberByEmail({
+      scopeId: "tenant-A",
+      email: "attendee@example.com",
+      role: "attendee"
+    });
+    await server.upsertScopeMemberByEmail({
+      scopeId: "tenant-B",
+      email: "attendee@example.com",
+      role: "attendee",
+      attributes: { pointsAllTime: 10, awardedBadges: [], vipTier: "bronze" }
+    });
+    await store.updateScopeMemberSecrets("tenant-B", attendee.uid, {
+      moderatorNotes: "Tenant B confidential note"
+    });
+
+    // (a) `tenantOwnerA` can update attributes & secrets inside `tenant-A`:
+    await server.updateScopeMemberAttributesAs({
+      scopeId: "tenant-A",
+      actorUid: tenantOwnerA.uid,
+      targetUid: attendee.uid,
+      patch: { pointsAllTime: 500 }
+    });
+    await server.updateScopeMemberSecretsAs({
+      scopeId: "tenant-A",
+      actorUid: tenantOwnerA.uid,
+      targetUid: attendee.uid,
+      patch: { moderatorNotes: "Tenant A note" }
+    });
+    expect(
+      await server.readScopeMemberSecretsAs({
+        scopeId: "tenant-A",
+        actorUid: tenantOwnerA.uid,
+        targetUid: attendee.uid
+      })
+    ).toEqual({ moderatorNotes: "Tenant A note" });
+
+    // (b) `tenantOwnerA` CANNOT monkey with `tenant-B` attributes or secrets!
+    await expect(
+      server.updateScopeMemberAttributesAs({
+        scopeId: "tenant-B",
+        actorUid: tenantOwnerA.uid,
+        targetUid: attendee.uid,
+        patch: { pointsAllTime: 0 }
+      })
+    ).rejects.toThrow(/Forbidden/);
+
+    await expect(
+      server.readScopeMemberSecretsAs({
+        scopeId: "tenant-B",
+        actorUid: tenantOwnerA.uid,
+        targetUid: attendee.uid
+      })
+    ).rejects.toThrow(/Forbidden/);
+
+    await expect(
+      server.updateScopeMemberSecretsAs({
+        scopeId: "tenant-B",
+        actorUid: tenantOwnerA.uid,
+        targetUid: attendee.uid,
+        patch: { moderatorNotes: "Cross-tenant sabotage" }
+      })
+    ).rejects.toThrow(/Forbidden/);
+
+    // (c) `tenantOwnerA` CANNOT monkey with global `users/{attendee.uid}` attributes or secrets!
+    await expect(
+      server.updateUserAttributesAs({
+        actorUid: tenantOwnerA.uid,
+        targetUid: attendee.uid,
+        patch: { pointsAllTime: 0 }
+      })
+    ).rejects.toThrow(/Forbidden/);
+
+    await expect(
+      server.readUserSecretsAs({
+        actorUid: tenantOwnerA.uid,
+        targetUid: attendee.uid
+      })
+    ).rejects.toThrow(/Forbidden/);
+
+    await expect(
+      server.updateUserSecretsAs({
+        actorUid: tenantOwnerA.uid,
+        targetUid: attendee.uid,
+        patch: { moderatorNotes: "Global sabotage" }
+      })
+    ).rejects.toThrow(/Forbidden/);
+  });
+
+  it("tests FirestoreServerStore unified users/{uid}, private/secrets subdocuments, and admin demotion preservation", async () => {
+    const docs = new Map<string, Record<string, any>>();
+    const fakeDb: any = {
+      doc(path: string) {
+        return {
+          path,
+          async get() {
+            const data = docs.get(path);
+            return {
+              id: path.split("/").pop()!,
+              exists: Boolean(data),
+              data: () => (data ? { ...data } : undefined)
+            };
+          },
+          async set(payload: Record<string, any>, options?: { merge?: boolean }) {
+            const current = options?.merge ? docs.get(path) || {} : {};
+            docs.set(path, { ...current, ...payload });
+          },
+          async delete() {
+            docs.delete(path);
+          }
+        };
+      },
+      collection(path: string) {
+        return {
+          where(field: string, _op: string, val: any) {
+            return {
+              async get() {
+                const prefix = `${path}/`;
+                const matching: any[] = [];
+                for (const [k, v] of docs.entries()) {
+                  if (k.startsWith(prefix) && !k.slice(prefix.length).includes("/") && v[field] === val) {
+                    matching.push({
+                      id: k.slice(prefix.length),
+                      data: () => ({ ...v })
+                    });
+                  }
+                }
+                return { docs: matching };
+              }
+            };
+          },
+          async get() {
+            const prefix = `${path}/`;
+            const matching: any[] = [];
+            for (const [k, v] of docs.entries()) {
+              if (k.startsWith(prefix) && !k.slice(prefix.length).includes("/")) {
+                matching.push({
+                  id: k.slice(prefix.length),
+                  data: () => ({ ...v })
+                });
+              }
+            }
+            return { docs: matching };
+          }
+        };
+      }
+    };
+
+    const fsStore = new FirestoreServerStore<
+      TestRole,
+      TestCap,
+      { theme: string },
+      { pointsAllTime: number },
+      { note: string }
+    >({
+      db: fakeDb,
+      defaultRole: "member"
+    });
+
+    // 1. UserRecord + attributes + secrets + admin status on users/{uid} and users/{uid}/private/secrets
+    await fsStore.upsertUser({
+      uid: "u-1",
+      email: "u1@example.com",
+      firstName: "Testy",
+      lastName: "McTest",
+      isSystemAdmin: true,
+      preferences: { theme: "dark" },
+      attributes: { pointsAllTime: 100 }
+    });
+    await fsStore.updateUserAttributes("u-1", { pointsAllTime: 250 });
+    await fsStore.updateUserSecrets("u-1", { note: "Top secret" });
+
+    expect(docs.get("users/u-1")?.attributes).toEqual({ pointsAllTime: 250 });
+    expect(docs.get("users/u-1")?.note).toBeUndefined(); // Secrets are NEVER stored on users/{uid}!
+    expect(docs.get("users/u-1/private/secrets")).toEqual({ note: "Top secret" });
+    expect(await fsStore.getUserSecrets("u-1")).toEqual({ note: "Top secret" });
+    expect(await fsStore.listSystemAdmins()).toHaveLength(1);
+
+    // 2. Demoting admin via deleteSystemAdmin sets isSystemAdmin: false on users/u-1 while keeping attributes & preferences
+    await fsStore.deleteSystemAdmin("u-1");
+    expect(await fsStore.getSystemAdmin("u-1")).toBeNull();
+    expect(await fsStore.listSystemAdmins()).toHaveLength(0);
+    const afterDemote = await fsStore.getUser("u-1");
+    expect(afterDemote?.isSystemAdmin).toBe(false);
+    expect(afterDemote?.attributes).toEqual({ pointsAllTime: 250 });
+    expect(afterDemote?.preferences).toEqual({ theme: "dark" });
+
+    // 3. Scoped member attributes & private/secrets subdocument lifecycle
+    await fsStore.upsertScopeMember("ws-1", {
+      uid: "u-1",
+      email: "u1@example.com",
+      role: "manager",
+      capabilities: []
+    });
+    await fsStore.updateScopeMemberAttributes("ws-1", "u-1", { pointsAllTime: 77 });
+    await fsStore.updateScopeMemberSecrets("ws-1", "u-1", { note: "Workspace secret" });
+
+    expect(docs.get("workspaces/ws-1/members/u-1")?.attributes).toEqual({ pointsAllTime: 77 });
+    expect(docs.get("workspaces/ws-1/members/u-1/private/secrets")).toEqual({ note: "Workspace secret" });
+    expect(await fsStore.getScopeMemberSecrets("ws-1", "u-1")).toEqual({ note: "Workspace secret" });
+
+    // Deleting scoped member also deletes its private/secrets subdocument
+    await fsStore.deleteScopeMember("ws-1", "u-1");
+    expect(docs.has("workspaces/ws-1/members/u-1")).toBe(false);
+    expect(docs.has("workspaces/ws-1/members/u-1/private/secrets")).toBe(false);
+  });
+
+  it("enforces single-tenant sibling role isolation, per-user capability overrides, atomic multi-key patch rejection, and role demotion on users/{uid}", async () => {
+    type SingleTenantRole = "attendee" | "scanner" | "merch_seller" | "moderator";
+    type SingleTenantCap =
+      | "write:points"
+      | "read:merch"
+      | "write:merch"
+      | "write:badges"
+      | "read:scanner_log"
+      | "write:scanner_log"
+      | "read:merch_Pin"
+      | "write:merch_Pin"
+      | "write:audit_hash";
+
+    interface SingleTenantAttrs {
+      pointsAllTime: number;
+      merchCreditBalance: number;
+      awardedBadges: string[];
+      readonlySystemBadge: string;
+    }
+
+    interface SingleTenantSecrets {
+      scannerAuditLog: string;
+      merchPosPin: string;
+      blindAuditHash: string;
+    }
+
+    const policy = createPermissionPolicy<SingleTenantRole, SingleTenantCap>({
+      roles: {
+        attendee: { weight: 10, capabilities: [] },
+        // Sibling role A: scanner (handles points + scannerAuditLog)
+        scanner: {
+          weight: 20,
+          inherits: ["attendee"],
+          capabilities: ["write:points", "read:scanner_log", "write:scanner_log"]
+        },
+        // Sibling role B: merch_seller (handles merchCreditBalance + merchPosPin; does NOT inherit scanner!)
+        merch_seller: {
+          weight: 20,
+          inherits: ["attendee"],
+          capabilities: ["read:merch", "write:merch", "read:merch_Pin", "write:merch_Pin"]
+        },
+        // Moderator inherits BOTH scanner and merch_seller, plus badges and write-only blindAuditHash
+        moderator: {
+          weight: 30,
+          inherits: ["scanner", "merch_seller"],
+          capabilities: ["write:badges", "write:audit_hash"]
+        }
+      },
+      attributeCapabilities: {
+        pointsAllTime: "write:points",
+        merchCreditBalance: { read: "read:merch", write: "write:merch" },
+        awardedBadges: "write:badges",
+        // Read-only for merch/moderator, writable ONLY by system admin (no write capability configured)
+        readonlySystemBadge: { read: "read:merch" }
+      },
+      secretCapabilities: {
+        scannerAuditLog: { read: "read:scanner_log", write: "write:scanner_log" },
+        merchPosPin: { read: "read:merch_Pin", write: "write:merch_Pin" },
+        // Write-only secret for moderator; readable ONLY by system admin
+        blindAuditHash: { write: "write:audit_hash" }
+      }
+    });
+
+    const adminAuth = createFakeAdminAuth();
+    const store = new InMemoryLanyardStore<
+      SingleTenantRole,
+      SingleTenantCap,
+      Record<string, unknown>,
+      SingleTenantAttrs,
+      SingleTenantSecrets
+    >();
+    const server = createLanyardServer<
+      SingleTenantRole,
+      SingleTenantCap,
+      Record<string, unknown>,
+      SingleTenantAttrs,
+      SingleTenantSecrets
+    >({
+      adminAuth,
+      store,
+      policy,
+      authService: new FakeAuthService()
+    });
+
+    const attendee = await server.upsertUserByEmail({
+      email: "attendee@example.com",
+      firstName: "Testy",
+      lastName: "McTest",
+      role: "attendee",
+      attributes: {
+        pointsAllTime: 25,
+        merchCreditBalance: 150,
+        awardedBadges: ["welcome"],
+        readonlySystemBadge: "founding-member"
+      }
+    });
+    const scanner = await server.upsertUserByEmail({
+      email: "scanner@example.com",
+      firstName: "Scanny",
+      lastName: "McScanner",
+      role: "scanner"
+    });
+    const merchSeller = await server.upsertUserByEmail({
+      email: "merch@example.com",
+      firstName: "Merchy",
+      lastName: "McMerch",
+      role: "merch_seller"
+    });
+    const moderator = await server.upsertUserByEmail({
+      email: "mod@example.com",
+      firstName: "Moddy",
+      lastName: "McModerator",
+      role: "moderator"
+    });
+
+    // 1. Mutual sibling role isolation on users/{uid}:
+    // - Scanner can update pointsAllTime & scannerAuditLog, but CANNOT read/write merchCreditBalance or merchPosPin
+    await server.updateUserAttributesAs({
+      actorUid: scanner.uid,
+      targetUid: attendee.uid,
+      patch: { pointsAllTime: 40 }
+    });
+    await server.updateUserSecretsAs({
+      actorUid: scanner.uid,
+      targetUid: attendee.uid,
+      patch: { scannerAuditLog: "Scanned booth #4" }
+    });
+    await expect(
+      server.updateUserAttributesAs({
+        actorUid: scanner.uid,
+        targetUid: attendee.uid,
+        patch: { merchCreditBalance: 999 }
+      })
+    ).rejects.toThrow(/Forbidden/);
+    await expect(
+      server.updateUserSecretsAs({
+        actorUid: scanner.uid,
+        targetUid: attendee.uid,
+        patch: { merchPosPin: "0000" }
+      })
+    ).rejects.toThrow(/Forbidden/);
+
+    // - Merch seller can read/write merchCreditBalance & merchPosPin, but CANNOT write pointsAllTime or read scannerAuditLog
+    await server.updateUserAttributesAs({
+      actorUid: merchSeller.uid,
+      targetUid: attendee.uid,
+      patch: { merchCreditBalance: 120 }
+    });
+    await server.updateUserSecretsAs({
+      actorUid: merchSeller.uid,
+      targetUid: attendee.uid,
+      patch: { merchPosPin: "4821" }
+    });
+    await expect(
+      server.updateUserAttributesAs({
+        actorUid: merchSeller.uid,
+        targetUid: attendee.uid,
+        patch: { pointsAllTime: 999 }
+      })
+    ).rejects.toThrow(/Forbidden/);
+
+    // Reading attributes & secrets redacts each sibling's restricted fields:
+    expect(
+      await server.readUserAttributesAs({
+        actorUid: scanner.uid,
+        targetUid: attendee.uid
+      })
+    ).toEqual({
+      pointsAllTime: 40,
+      awardedBadges: ["welcome"]
+      // merchCreditBalance and readonlySystemBadge are redacted for scanner!
+    });
+    expect(
+      await server.readUserAttributesAs({
+        actorUid: merchSeller.uid,
+        targetUid: attendee.uid
+      })
+    ).toEqual({
+      pointsAllTime: 40,
+      merchCreditBalance: 120,
+      awardedBadges: ["welcome"],
+      readonlySystemBadge: "founding-member"
+    });
+    expect(
+      await server.readUserSecretsAs({
+        actorUid: scanner.uid,
+        targetUid: attendee.uid
+      })
+    ).toEqual({ scannerAuditLog: "Scanned booth #4" });
+    expect(
+      await server.readUserSecretsAs({
+        actorUid: merchSeller.uid,
+        targetUid: attendee.uid
+      })
+    ).toEqual({ merchPosPin: "4821" });
+
+    // Sibling middleware check: scanner fails requireUserRole("merch_seller") and vice versa
+    const resScannerAsMerch = createMockRes();
+    await server.requireUserRole("merch_seller")(
+      { user: { uid: scanner.uid, email: scanner.email, isAdmin: false } } as any,
+      resScannerAsMerch,
+      () => {}
+    );
+    expect(resScannerAsMerch.statusCode).toBe(403);
+
+    // 2. Write-only secret & Read-only attribute enforcement:
+    // Moderator can write `blindAuditHash`, but CANNOT read `blindAuditHash` back (only systemAdmin can read it)
+    await server.updateUserSecretsAs({
+      actorUid: moderator.uid,
+      targetUid: attendee.uid,
+      patch: { blindAuditHash: "sha256:abcdef" }
+    });
+    expect(
+      await server.readUserSecretsAs({
+        actorUid: moderator.uid,
+        targetUid: attendee.uid
+      })
+    ).toEqual({
+      scannerAuditLog: "Scanned booth #4",
+      merchPosPin: "4821"
+      // blindAuditHash is redacted for non-system-admins!
+    });
+    expect(
+      await server.readUserSecretsAs({
+        actorUid: "sys-admin",
+        isSystemAdmin: true,
+        targetUid: attendee.uid
+      })
+    ).toEqual({
+      scannerAuditLog: "Scanned booth #4",
+      merchPosPin: "4821",
+      blindAuditHash: "sha256:abcdef"
+    });
+
+    // Moderator CANNOT write `readonlySystemBadge` (only systemAdmin can)
+    await expect(
+      server.updateUserAttributesAs({
+        actorUid: moderator.uid,
+        targetUid: attendee.uid,
+        patch: { readonlySystemBadge: "forged-founder" }
+      })
+    ).rejects.toThrow(/Forbidden/);
+
+    // 3. All-or-nothing atomic multi-key patch rejection on users/{uid}:
+    // Scanner attempts to patch BOTH `pointsAllTime` (allowed) and `awardedBadges` (forbidden) in one call.
+    // Must reject with 403 and leave `pointsAllTime` untouched at 40!
+    await expect(
+      server.updateUserAttributesAs({
+        actorUid: scanner.uid,
+        targetUid: attendee.uid,
+        patch: { pointsAllTime: 9999, awardedBadges: ["injected-badge"] }
+      })
+    ).rejects.toThrow(/Forbidden/);
+    expect((await store.getUser(attendee.uid))?.attributes?.pointsAllTime).toBe(40);
+    expect((await store.getUser(attendee.uid))?.attributes?.awardedBadges).toEqual(["welcome"]);
+
+    // Same atomic guarantee for secrets on users/{uid}/private/secrets:
+    await expect(
+      server.updateUserSecretsAs({
+        actorUid: scanner.uid,
+        targetUid: attendee.uid,
+        patch: { scannerAuditLog: "Valid", merchPosPin: "9999" }
+      })
+    ).rejects.toThrow(/Forbidden/);
+    expect(await store.getUserSecrets(attendee.uid)).toEqual({
+      scannerAuditLog: "Scanned booth #4",
+      merchPosPin: "4821",
+      blindAuditHash: "sha256:abcdef"
+    });
+
+    // 4. Per-user ad-hoc capability overrides on users/{uid}:
+    // Grant `attendee` an individual `write:points` capability without promoting their role from `attendee`
+    await server.upsertUserByEmail({
+      email: "attendee@example.com",
+      role: "attendee",
+      capabilities: ["write:points"]
+    });
+    await server.updateUserAttributesAs({
+      actorUid: attendee.uid,
+      targetUid: attendee.uid,
+      patch: { pointsAllTime: 55 }
+    });
+    expect((await store.getUser(attendee.uid))?.attributes?.pointsAllTime).toBe(55);
+
+    // Revoke the ad-hoc capability on `attendee` -> immediately blocked again
+    await server.upsertUserByEmail({
+      email: "attendee@example.com",
+      role: "attendee",
+      capabilities: []
+    });
+    await expect(
+      server.updateUserAttributesAs({
+        actorUid: attendee.uid,
+        targetUid: attendee.uid,
+        patch: { pointsAllTime: 70 }
+      })
+    ).rejects.toThrow(/Forbidden/);
+
+    // 5. Role demotion on users/{uid}:
+    // Demote `moderator` down to `scanner` -> immediately loses access to `merchPosPin` and `awardedBadges`,
+    // while retaining `scanner` access to `pointsAllTime` and `scannerAuditLog`
+    await server.upsertUserByEmail({
+      email: "mod@example.com",
+      role: "scanner"
+    });
+    await expect(
+      server.updateUserAttributesAs({
+        actorUid: moderator.uid,
+        targetUid: attendee.uid,
+        patch: { awardedBadges: ["demoted-mod-badge"] }
+      })
+    ).rejects.toThrow(/Forbidden/);
+    expect(
+      await server.readUserSecretsAs({
+        actorUid: moderator.uid,
+        targetUid: attendee.uid
+      })
+    ).toEqual({
+      scannerAuditLog: "Scanned booth #4"
+      // merchPosPin is no longer visible after demotion from moderator to scanner!
+    });
+    await server.updateUserAttributesAs({
+      actorUid: moderator.uid,
+      targetUid: attendee.uid,
+      patch: { pointsAllTime: 65 }
+    });
+    expect((await store.getUser(attendee.uid))?.attributes?.pointsAllTime).toBe(65);
   });
 });

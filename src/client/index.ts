@@ -29,7 +29,9 @@ import {
   type LanyardUser,
   type PermissionPolicy,
   type ScopedMember,
-  type SocialProviderType
+  type SocialProviderType,
+  type UserProfilePatch,
+  type UserRecord
 } from "../core/index.js";
 
 export const HEARTBEAT_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
@@ -109,20 +111,26 @@ export interface AuthState {
   isReady: boolean;
 }
 
-export interface MembershipsState<TRole extends string = string, TCapability extends string = string> {
-  memberships: ScopedMember<TRole, TCapability>[];
+export interface MembershipsState<
+  TRole extends string = string,
+  TCapability extends string = string,
+  TPreferences extends Record<string, any> = Record<string, any>,
+  TAttributes extends Record<string, any> = Record<string, any>
+> {
+  memberships: ScopedMember<TRole, TCapability, TPreferences, TAttributes>[];
   isLoading: boolean;
 }
 
 export interface LanyardClientConfig<
   TRole extends string = string,
   TCapability extends string = string,
-  TPreferences extends Record<string, any> = Record<string, any>
+  TPreferences extends Record<string, any> = Record<string, any>,
+  TAttributes extends Record<string, any> = Record<string, any>
 > {
   /** Optional Firebase Auth instance. May be omitted in tests or custom auth environments. */
   auth?: Auth | null;
   /** Backing storage adapter implementing `LanyardClientStore` (e.g. `FirestoreClientStore` or `InMemoryLanyardStore`). */
-  store: LanyardClientStore<TRole, TCapability, TPreferences>;
+  store: LanyardClientStore<TRole, TCapability, TPreferences, TAttributes>;
   /** Default preferences applied before remote preferences load or after sign-out. */
   defaultPreferences: TPreferences;
   /** Optional permission policy defining role hierarchy, capabilities, and per-role `trackPresence`. */
@@ -133,14 +141,16 @@ export interface LanyardClientConfig<
 
 /**
  * Creates a storage-agnostic Lanyard client instance managing authentication flows,
- * reactive Svelte-compatible stores (`authStore`, `membershipsStore`, `preferencesStore`),
- * smart deduplicated avatar syncing, and 5-minute `localStorage`-throttled presence heartbeats.
+ * reactive Svelte-compatible stores (`authStore`, `userRecordStore`, `attributesStore`,
+ * `membershipsStore`, `preferencesStore`), smart deduplicated avatar syncing, and
+ * 5-minute `localStorage`-throttled presence heartbeats.
  */
 export function createLanyardClient<
   TRole extends string = string,
   TCapability extends string = string,
-  TPreferences extends Record<string, any> = Record<string, any>
->(config: LanyardClientConfig<TRole, TCapability, TPreferences>) {
+  TPreferences extends Record<string, any> = Record<string, any>,
+  TAttributes extends Record<string, any> = Record<string, any>
+>(config: LanyardClientConfig<TRole, TCapability, TPreferences, TAttributes>) {
   const { auth = null, store, defaultPreferences, policy, storageKeyPrefix = "lanyard" } = config;
 
   const prefStorageKey = `${storageKeyPrefix}_user_preferences`;
@@ -170,22 +180,30 @@ export function createLanyardClient<
     isReady: false
   });
 
-  const membershipsStoreInternal = createWritableStore<MembershipsState<TRole, TCapability>>({
-    memberships: [],
-    isLoading: false
-  });
+  const userRecordStoreInternal = createWritableStore<UserRecord<TRole, TCapability, TPreferences, TAttributes> | null>(
+    null
+  );
+
+  const attributesStoreInternal = createWritableStore<Partial<TAttributes>>({});
+
+  const membershipsStoreInternal = createWritableStore<MembershipsState<TRole, TCapability, TPreferences, TAttributes>>(
+    {
+      memberships: [],
+      isLoading: false
+    }
+  );
 
   const preferencesStoreInternal = createWritableStore<TPreferences>(loadCachedPreferences());
 
-  let unsubPrefs: (() => void) | null = null;
+  let unsubUserOrPrefs: (() => void) | null = null;
   let unsubMemberships: (() => void) | null = null;
   let unsubAuth: (() => void) | null = null;
   let authGeneration = 0;
 
   function cleanupUserSubscriptions(): void {
-    if (unsubPrefs) {
-      unsubPrefs();
-      unsubPrefs = null;
+    if (unsubUserOrPrefs) {
+      unsubUserOrPrefs();
+      unsubUserOrPrefs = null;
     }
     if (unsubMemberships) {
       unsubMemberships();
@@ -193,9 +211,22 @@ export function createLanyardClient<
     }
   }
 
+  function applyRemotePreferences(remotePrefs: Partial<TPreferences> | undefined): void {
+    if (!remotePrefs) return;
+    preferencesStoreInternal.update((current) => {
+      const merged = { ...current, ...sanitizePreferencesObject<TPreferences>(remotePrefs) };
+      if (typeof localStorage !== "undefined") {
+        try {
+          localStorage.setItem(prefStorageKey, JSON.stringify(merged));
+        } catch {}
+      }
+      return merged;
+    });
+  }
+
   /**
    * Programmatically sets the authenticated user (useful in tests or custom auth flows)
-   * and wires up reactive store subscriptions for preferences, memberships, and avatar syncing.
+   * and wires up reactive store subscriptions for `users/{uid}`, preferences, memberships, and avatar syncing.
    */
   function setActiveUser(user: LanyardUser | null): void {
     authGeneration += 1;
@@ -204,6 +235,8 @@ export function createLanyardClient<
     if (!user) {
       syncedAvatars.clear();
       authStoreInternal.set({ user: null, isReady: true });
+      userRecordStoreInternal.set(null);
+      attributesStoreInternal.set({});
       membershipsStoreInternal.set({ memberships: [], isLoading: false });
       preferencesStoreInternal.set({ ...defaultPreferences });
       return;
@@ -212,11 +245,12 @@ export function createLanyardClient<
     authStoreInternal.set({ user, isReady: true });
     membershipsStoreInternal.set({ memberships: [], isLoading: true });
 
-    // If user is a system admin with an avatar, sync their avatar to system_admins once per session/photo change
+    const globalUserSyncKey = `user:${user.uid}`;
+
+    // If user is a system admin with an avatar, sync their avatar to users/{uid} once per session/photo change
     if (user.isAdmin && user.photoUrl && typeof store.syncAvatar === "function") {
-      const adminTargetKey = `admin:${user.uid}`;
-      if (syncedAvatars.get(adminTargetKey) !== user.photoUrl) {
-        syncedAvatars.set(adminTargetKey, user.photoUrl);
+      if (syncedAvatars.get(globalUserSyncKey) !== user.photoUrl) {
+        syncedAvatars.set(globalUserSyncKey, user.photoUrl);
         store
           .syncAvatar({
             uid: user.uid,
@@ -225,22 +259,74 @@ export function createLanyardClient<
             displayName: user.displayName
           })
           .catch(() => {
-            syncedAvatars.delete(adminTargetKey);
+            syncedAvatars.delete(globalUserSyncKey);
           });
       }
     }
 
-    unsubPrefs = store.subscribeToPreferences(user.uid, (remotePrefs) => {
-      preferencesStoreInternal.update((current) => {
-        const merged = { ...current, ...sanitizePreferencesObject<TPreferences>(remotePrefs) };
-        if (typeof localStorage !== "undefined") {
-          try {
-            localStorage.setItem(prefStorageKey, JSON.stringify(merged));
-          } catch {}
+    if (typeof store.subscribeToUser === "function") {
+      unsubUserOrPrefs = store.subscribeToUser(user.uid, (record) => {
+        userRecordStoreInternal.set(record);
+        if (record) {
+          applyRemotePreferences(record.preferences);
+          attributesStoreInternal.set(sanitizePreferencesObject<TAttributes>(record.attributes || {}));
+
+          // If a provisioned global user record exists with a stale/missing photoUrl, sync it once
+          const isProvisionedProfile = Boolean(
+            record.email || record.isSystemAdmin || record.firstName || record.lastName
+          );
+          if (
+            isProvisionedProfile &&
+            user.photoUrl &&
+            record.photoUrl !== user.photoUrl &&
+            typeof store.syncAvatar === "function"
+          ) {
+            if (syncedAvatars.get(globalUserSyncKey) !== user.photoUrl) {
+              syncedAvatars.set(globalUserSyncKey, user.photoUrl);
+              store
+                .syncAvatar({
+                  uid: user.uid,
+                  photoUrl: user.photoUrl,
+                  email: user.email,
+                  displayName: user.displayName
+                })
+                .catch(() => {
+                  syncedAvatars.delete(globalUserSyncKey);
+                });
+            }
+          }
+
+          // Real-time system admin promotion/demotion sync from users/{uid}
+          if (typeof record.isSystemAdmin === "boolean") {
+            const currentAuth = authStoreInternal.get();
+            if (
+              currentAuth.user &&
+              currentAuth.user.uid === user.uid &&
+              currentAuth.user.isAdmin !== record.isSystemAdmin
+            ) {
+              authStoreInternal.set({
+                ...currentAuth,
+                user: { ...currentAuth.user, isAdmin: record.isSystemAdmin }
+              });
+              // Force-refresh the Firebase Auth ID token in the background so custom claims update immediately
+              if (
+                auth?.currentUser &&
+                auth.currentUser.uid === user.uid &&
+                typeof auth.currentUser.getIdTokenResult === "function"
+              ) {
+                auth.currentUser.getIdTokenResult(true).catch(() => {});
+              }
+            }
+          }
+        } else {
+          attributesStoreInternal.set({});
         }
-        return merged;
       });
-    });
+    } else {
+      unsubUserOrPrefs = store.subscribeToPreferences(user.uid, (remotePrefs) => {
+        applyRemotePreferences(remotePrefs);
+      });
+    }
 
     unsubMemberships = store.subscribeToUserMemberships(user.uid, (members) => {
       // Smart Avatar Sync: when a pre-provisioned member doc loads with a stale/missing photoUrl,
@@ -502,7 +588,7 @@ export function createLanyardClient<
     });
   }
 
-  // --- Preferences ---
+  // --- Self-Service Profile & Preferences ---
 
   async function updatePreferences(patch: Partial<TPreferences>, syncToStore = true): Promise<void> {
     const cleanPatch = sanitizePreferencesObject<TPreferences>(patch);
@@ -522,6 +608,17 @@ export function createLanyardClient<
     }
   }
 
+  async function updateProfile(patch: UserProfilePatch): Promise<void> {
+    const currentUser = authStoreInternal.get().user;
+    if (!currentUser?.uid) {
+      throw new Error("No authenticated user.");
+    }
+    if (typeof store.updateUserProfile !== "function") {
+      throw new Error("Backing store does not implement updateUserProfile");
+    }
+    await store.updateUserProfile(currentUser.uid, patch);
+  }
+
   // --- Presence Tracking (5-minute localStorage-throttled) ---
 
   function getPresenceKeys(uid: string, scopeId?: string) {
@@ -537,7 +634,14 @@ export function createLanyardClient<
     if (!currentUser) return false;
     if (scopeId !== undefined && !isValidResourceId(scopeId)) return false;
     if (currentUser.isAdmin) return true;
-    if (!scopeId) return false;
+    if (!scopeId) {
+      // In single-tenant mode, check if the user's global UserRecord role has trackPresence enabled
+      const userRecord = userRecordStoreInternal.get();
+      if (userRecord?.role && policy) {
+        return policy.shouldTrackPresence(userRecord, currentUser.isAdmin);
+      }
+      return false;
+    }
 
     const membership = membershipsStoreInternal.get().memberships.find((m) => m.scopeId === scopeId);
     if (!membership) return false;
@@ -650,7 +754,16 @@ export function createLanyardClient<
 
   return {
     authStore: authStoreInternal as LanyardReadable<AuthState>,
-    membershipsStore: membershipsStoreInternal as LanyardReadable<MembershipsState<TRole, TCapability>>,
+    userRecordStore: userRecordStoreInternal as LanyardReadable<UserRecord<
+      TRole,
+      TCapability,
+      TPreferences,
+      TAttributes
+    > | null>,
+    attributesStore: attributesStoreInternal as LanyardReadable<Partial<TAttributes>>,
+    membershipsStore: membershipsStoreInternal as LanyardReadable<
+      MembershipsState<TRole, TCapability, TPreferences, TAttributes>
+    >,
     preferencesStore: preferencesStoreInternal as LanyardReadable<TPreferences>,
     setActiveUser,
     subscribeToAuthUser,
@@ -665,6 +778,7 @@ export function createLanyardClient<
     getSignInMethodsForEmail,
     sendEmailUpdateVerification,
     updatePreferences,
+    updateProfile,
     recordActivity,
     getPresenceStatus,
     syncPresence,
