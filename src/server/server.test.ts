@@ -17,17 +17,16 @@ type TestCap = "edit_content" | "invite_members" | "billing";
 const TEST_POLICY = createPermissionPolicy<TestRole, TestCap>({
   roles: {
     owner: {
-      weight: 30,
+      inherits: ["manager"],
       capabilities: "*",
       trackPresence: true
     },
     manager: {
-      weight: 20,
+      inherits: ["member"],
       capabilities: ["edit_content", "invite_members"],
       trackPresence: true
     },
     member: {
-      weight: 10,
       capabilities: [],
       trackPresence: false
     }
@@ -36,13 +35,19 @@ const TEST_POLICY = createPermissionPolicy<TestRole, TestCap>({
 
 function createFakeAdminAuth(): AdminAuthAdapter & {
   claimsByUid: Map<string, Record<string, any> | null>;
+  deletedUids: Set<string>;
+  updatedUsersByUid: Map<string, { displayName?: string | null; photoURL?: string | null }>;
 } {
   const usersByEmail = new Map<string, { uid: string; email: string; displayName?: string }>();
   const claimsByUid = new Map<string, Record<string, any> | null>();
+  const deletedUids = new Set<string>();
+  const updatedUsersByUid = new Map<string, { displayName?: string | null; photoURL?: string | null }>();
   let counter = 1;
 
   return {
     claimsByUid,
+    deletedUids,
+    updatedUsersByUid,
     async verifyIdToken(idToken: string) {
       if (idToken === "valid-token") {
         return {
@@ -112,6 +117,17 @@ function createFakeAdminAuth(): AdminAuthAdapter & {
     },
     async setCustomUserClaims(uid, claims) {
       claimsByUid.set(uid, claims);
+    },
+    async updateUser(uid, properties) {
+      updatedUsersByUid.set(uid, properties);
+    },
+    async deleteUser(uid) {
+      deletedUids.add(uid);
+      for (const [email, rec] of usersByEmail.entries()) {
+        if (rec.uid === uid) {
+          usersByEmail.delete(email);
+        }
+      }
     }
   };
 }
@@ -195,26 +211,25 @@ describe("lanyard/server unit tests", () => {
     expect(secondProvision.created).toBe(false);
     expect(secondProvision.uid).toBe("provisioned-uid-1");
 
-    // 2. Grant multiple capabilities incrementally by email (defaults to policy.defaultRole = 'member')
-    await server.grantScopeCapabilitiesByEmail({
+    // 2. Grant multiple roles incrementally by email
+    await server.grantScopeRolesByEmail({
       scopeId: "ws-1",
       email: "newmember@example.com",
-      capabilities: ["edit_content"],
+      roles: ["member"],
       firstName: "New",
       lastName: "Member"
     });
-    const afterSecondGrant = await server.grantScopeCapabilitiesByEmail({
+    const afterSecondGrant = await server.grantScopeRolesByEmail({
       scopeId: "ws-1",
       email: "newmember@example.com",
-      capabilities: ["invite_members"]
+      roles: ["manager"]
     });
     expect(afterSecondGrant.uid).toBe("provisioned-uid-1");
-    expect(afterSecondGrant.role).toBe("member");
-    expect(afterSecondGrant.capabilities).toEqual(["edit_content", "invite_members"]);
+    expect(afterSecondGrant.roles).toEqual(["member", "manager"]);
 
-    // Revoke capability
-    await server.revokeScopeCapabilities("ws-1", "provisioned-uid-1", ["edit_content"]);
-    expect((await store.getScopeMember("ws-1", "provisioned-uid-1"))?.capabilities).toEqual(["invite_members"]);
+    // Revoke role
+    await server.revokeScopeRoles("ws-1", "provisioned-uid-1", ["member"]);
+    expect((await store.getScopeMember("ws-1", "provisioned-uid-1"))?.roles).toEqual(["manager"]);
 
     // Upsert full member by email
     const upsertedManager = await server.upsertScopeMemberByEmail({
@@ -222,10 +237,9 @@ describe("lanyard/server unit tests", () => {
       email: "lead@example.com",
       firstName: "Lead",
       lastName: "Manager",
-      role: "manager",
-      capabilities: ["edit_content"]
+      roles: ["manager"]
     });
-    expect(upsertedManager.role).toBe("manager");
+    expect(upsertedManager.roles).toEqual(["manager"]);
 
     // 3. Promote and demote system admin
     const adminProfile = await server.setSystemAdminStatus({
@@ -329,16 +343,14 @@ describe("lanyard/server unit tests", () => {
     await store.upsertScopeMember("ws-1", {
       uid: "u-inviter",
       email: "inviter@example.com",
-      role: "member",
-      capabilities: ["invite_members"],
+      roles: ["manager"],
       photoUrl: null
     });
 
     await store.upsertScopeMember("ws-1", {
       uid: "u-mgr",
       email: "mgr@example.com",
-      role: "manager",
-      capabilities: [],
+      roles: ["manager"],
       photoUrl: null
     });
 
@@ -401,7 +413,7 @@ describe("lanyard/server unit tests", () => {
     expect(res500.statusCode).toBe(500);
   });
 
-  it("tests FirestoreServerStore CRUD, custom resolveRole, and additive/subtractive capabilities", async () => {
+  it("tests FirestoreServerStore CRUD and additive/subtractive roles", async () => {
     const docs = new Map<string, Record<string, any>>();
 
     const fakeDb: any = {
@@ -465,8 +477,7 @@ describe("lanyard/server unit tests", () => {
 
     const store = new FirestoreServerStore<TestRole, TestCap>({
       db: fakeDb,
-      defaultRole: "member",
-      resolveRole: (data) => (data.role as TestRole) || (data.isCreator ? "owner" : "member")
+      defaultRole: "member"
     });
 
     // 1. System Admin CRUD
@@ -482,36 +493,34 @@ describe("lanyard/server unit tests", () => {
     await store.deleteSystemAdmin("admin-1");
     expect(await store.getSystemAdmin("admin-1")).toBeNull();
 
-    // 2. Scoped Member CRUD + custom resolveRole + grant/revoke/delete
-    await expect(store.grantScopeCapabilities("ws-1", "missing", ["edit_content"])).rejects.toThrow(/does not exist/);
+    // 2. Scoped Member CRUD + grant/revoke/delete
+    await expect(store.grantScopeRoles("ws-1", "missing", ["member"])).rejects.toThrow(/does not exist/);
 
-    const created = await store.grantScopeCapabilities("ws-1", "u-1", ["edit_content"], {
+    const created = await store.grantScopeRoles("ws-1", "u-1", ["member"], {
       uid: "u-1",
-      email: "u1@example.com",
-      role: "member"
+      email: "u1@example.com"
     });
-    expect(created.capabilities).toEqual(["edit_content"]);
-    expect((await store.getScopeMember("ws-1", "u-1"))?.capabilities).toEqual(["edit_content"]);
+    expect(created.roles).toEqual(["member"]);
+    expect((await store.getScopeMember("ws-1", "u-1"))?.roles).toEqual(["member"]);
 
     // Additive grant on existing member uses FieldValue.arrayUnion
-    const updatedGrant = await store.grantScopeCapabilities("ws-1", "u-1", ["invite_members"]);
-    expect(updatedGrant.capabilities).toEqual(["edit_content", "invite_members"]);
+    const updatedGrant = await store.grantScopeRoles("ws-1", "u-1", ["manager"]);
+    expect(updatedGrant.roles).toEqual(["member", "manager"]);
 
     // Subtractive revoke on existing member uses FieldValue.arrayRemove
-    await store.revokeScopeCapabilities("ws-1", "u-1", ["edit_content"]);
-    expect((await store.getScopeMember("ws-1", "u-1"))?.capabilities).toEqual(["invite_members"]);
+    await store.revokeScopeRoles("ws-1", "u-1", ["member"]);
+    expect((await store.getScopeMember("ws-1", "u-1"))?.roles).toEqual(["manager"]);
 
     // No-op revokes (empty array or non-existent member)
-    await store.revokeScopeCapabilities("ws-1", "u-1", []);
-    await store.revokeScopeCapabilities("ws-1", "non-existent", ["invite_members"]);
+    await store.revokeScopeRoles("ws-1", "u-1", []);
+    await store.revokeScopeRoles("ws-1", "non-existent", ["manager"]);
 
-    // Legacy doc with isCreator: true resolves to 'owner' via resolveRole
-    docs.set("workspaces/ws-1/members/u-legacy", {
-      uid: "u-legacy",
-      email: "legacy@example.com",
-      isCreator: true
+    // Doc without roles field resolves to [defaultRole]
+    docs.set("workspaces/ws-1/members/u-default", {
+      uid: "u-default",
+      email: "default@example.com"
     });
-    expect((await store.getScopeMember("ws-1", "u-legacy"))?.role).toBe("owner");
+    expect((await store.getScopeMember("ws-1", "u-default"))?.roles).toEqual(["member"]);
     expect(await store.listScopeMembers("ws-1")).toHaveLength(2);
 
     await store.deleteScopeMember("ws-1", "u-1");
@@ -536,8 +545,7 @@ describe("lanyard/server unit tests", () => {
     await store.upsertScopeMember("ws-1", {
       uid: "u-mgr",
       email: "mgr@example.com",
-      role: "manager",
-      capabilities: ["edit_content"],
+      roles: ["manager"],
       photoUrl: "https://example.com/same-mgr.png"
     });
 
@@ -624,17 +632,17 @@ describe("lanyard/server unit tests", () => {
     });
 
     // 2. Multi-scope pre-provisioning for the same email across ws-1 and ws-2 resolves the exact same UID
-    const m1 = await server.grantScopeCapabilitiesByEmail({
+    const m1 = await server.grantScopeRolesByEmail({
       scopeId: "ws-1",
       email: "  Multi.Scope@Example.com ",
-      capabilities: ["edit_content"],
+      roles: ["member"],
       firstName: "Multi",
       lastName: "Scope"
     });
     const m2 = await server.upsertScopeMemberByEmail({
       scopeId: "ws-2",
       email: "multi.scope@example.com",
-      role: "owner"
+      roles: ["owner"]
     });
     expect(m1.uid).toBe(m2.uid);
 
@@ -653,12 +661,11 @@ describe("lanyard/server unit tests", () => {
     const promoted = await server.upsertScopeMemberByEmail({
       scopeId: "ws-1",
       email: "multi.scope@example.com",
-      role: "manager"
+      roles: ["manager"]
     });
-    expect(promoted.role).toBe("manager");
+    expect(promoted.roles).toEqual(["manager"]);
     expect(promoted.photoUrl).toBe("https://example.com/multi-avatar.png");
     expect(promoted.lastSeen).toBe("2026-10-19T15:00:00.000Z");
-    expect(promoted.capabilities).toEqual(["edit_content"]);
   });
 
   it("enforces cross-scope authorization isolation, capability revocation, and custom scopeParamName", async () => {
@@ -670,23 +677,20 @@ describe("lanyard/server unit tests", () => {
       policy: TEST_POLICY
     });
 
-    // User is 'owner' in ws-A, but only 'member' with ['invite_members'] in ws-B, and not a member of ws-C
+    // User is 'owner' in ws-A, but only 'manager' in ws-B, and not a member of ws-C
     await store.upsertScopeMember("ws-A", {
       uid: "u-scoped",
       email: "scoped@example.com",
-      role: "owner",
-      capabilities: []
+      roles: ["owner"]
     });
     await store.upsertScopeMember("ws-B", {
       uid: "u-scoped",
       email: "scoped@example.com",
-      role: "member",
-      capabilities: ["invite_members"]
+      roles: ["manager"]
     });
 
     const requireOwnerOnProject = server.requireScopeRole("owner", "projectId");
     const requireInviteOnProject = server.requireScopeCapability("invite_members", "projectId");
-    const requireEditOnProject = server.requireScopeCapability("edit_content", "projectId");
 
     // 1. Allowed as owner in ws-A
     let allowedInA = false;
@@ -725,7 +729,7 @@ describe("lanyard/server unit tests", () => {
     );
     expect(resC.statusCode).toBe(403);
 
-    // 3. In ws-B, user has 'invite_members' but not 'edit_content'
+    // 3. In ws-B, user has 'manager' (which implies 'invite_members')
     let inviteInB = false;
     await requireInviteOnProject(
       {
@@ -739,19 +743,8 @@ describe("lanyard/server unit tests", () => {
     );
     expect(inviteInB).toBe(true);
 
-    const resNoEditB = createMockRes();
-    await requireEditOnProject(
-      {
-        user: { uid: "u-scoped", email: "scoped@example.com", isAdmin: false },
-        params: { projectId: "ws-B" }
-      } as any,
-      resNoEditB,
-      () => {}
-    );
-    expect(resNoEditB.statusCode).toBe(403);
-
-    // 4. Revoke 'invite_members' in ws-B -> immediately blocked (403), while global system admin still passes
-    await server.revokeScopeCapabilities("ws-B", "u-scoped", ["invite_members"]);
+    // 4. Revoke 'manager' role in ws-B -> immediately blocked (403), while global system admin still passes
+    await server.revokeScopeRoles("ws-B", "u-scoped", ["manager"]);
     const resAfterRevoke = createMockRes();
     await requireInviteOnProject(
       {
@@ -889,20 +882,19 @@ describe("lanyard/server unit tests", () => {
     expect(JSON.stringify(res401.body)).not.toContain("169.254.169.254");
     expect(res401.body.error).toBe("Unauthorized: Invalid or expired authentication token");
 
-    // 8. upsertScopeMemberByEmail and grantScopeCapabilitiesByEmail reject unknown/prototype roles
+    // 8. upsertScopeMemberByEmail and grantScopeRolesByEmail reject unknown/prototype roles
     await expect(
       server.upsertScopeMemberByEmail({
         scopeId: "ws-1",
         email: "alice@example.com",
-        role: "__proto__" as any
+        roles: ["__proto__" as any]
       })
     ).rejects.toThrow(/role is not defined in policy\.roles/);
     await expect(
-      server.grantScopeCapabilitiesByEmail({
+      server.grantScopeRolesByEmail({
         scopeId: "ws-1",
         email: "alice@example.com",
-        capabilities: ["edit_content"],
-        role: "superadmin" as any
+        roles: ["superadmin" as any]
       })
     ).rejects.toThrow(/role is not defined in policy\.roles/);
   });
@@ -979,8 +971,7 @@ describe("lanyard/server unit tests", () => {
     await fsStore.upsertScopeMember("org-1", {
       uid: "u-1",
       email: "u1@example.com",
-      role: "member",
-      capabilities: [],
+      roles: ["member"],
       photoUrl: "javascript:alert(1)"
     });
     expect((await fsStore.getScopeMember("org-1", "u-1"))?.photoUrl).toBeNull();
@@ -1006,7 +997,7 @@ describe("lanyard/server unit tests", () => {
       email: "hybrid.admin@example.com",
       firstName: "Testy",
       lastName: "McTest",
-      role: "member",
+      roles: ["member"],
       preferences: { leaderboardOptIn: true },
       attributes: { pointsAllTime: 350 }
     });
@@ -1095,16 +1086,14 @@ describe("lanyard/server unit tests", () => {
 
     const policy = createPermissionPolicy<AppRole, AppCap>({
       roles: {
-        attendee: { weight: 10, capabilities: [] },
-        scanner: { weight: 20, inherits: ["attendee"], capabilities: ["write:points"] },
-        auditor: { weight: 20, inherits: ["attendee"], capabilities: ["read:tier", "read:notes"] },
+        attendee: { capabilities: [] },
+        scanner: { inherits: ["attendee"], capabilities: ["write:points"] },
+        auditor: { inherits: ["attendee"], capabilities: ["read:tier", "read:notes"] },
         moderator: {
-          weight: 30,
           inherits: ["scanner", "auditor"],
           capabilities: ["write:badges", "write:tier", "write:notes", "write:ai_keys"]
         },
         tenant_owner: {
-          weight: 40,
           inherits: ["moderator"],
           capabilities: "*"
         }
@@ -1136,26 +1125,26 @@ describe("lanyard/server unit tests", () => {
       email: "attendee@example.com",
       firstName: "Testy",
       lastName: "McTest",
-      role: "attendee",
+      roles: ["attendee"],
       attributes: { pointsAllTime: 10, awardedBadges: [], vipTier: "silver" }
     });
     const scanner = await server.upsertUserByEmail({
       email: "scanner@example.com",
       firstName: "Scanny",
       lastName: "McScanner",
-      role: "scanner"
+      roles: ["scanner"]
     });
     const auditor = await server.upsertUserByEmail({
       email: "auditor@example.com",
       firstName: "Audity",
       lastName: "McAuditor",
-      role: "auditor"
+      roles: ["auditor"]
     });
     const moderator = await server.upsertUserByEmail({
       email: "moderator@example.com",
       firstName: "Moddy",
       lastName: "McModerator",
-      role: "moderator"
+      roles: ["moderator"]
     });
 
     // 1. Single-tenant middleware: requireUserRole & requireUserCapability (including inherited capabilities!)
@@ -1192,14 +1181,14 @@ describe("lanyard/server unit tests", () => {
     // 2. Global User Attributes:
     // - Self can read ALL own attributes (including vipTier), but CANNOT write own attributes!
     expect(
-      await server.readUserAttributesAs({
+      await server.readUserAttributes({
         actorUid: attendee.uid,
         targetUid: attendee.uid
       })
     ).toEqual({ pointsAllTime: 10, awardedBadges: [], vipTier: "silver" });
 
     await expect(
-      server.updateUserAttributesAs({
+      server.updateUserAttributes({
         actorUid: attendee.uid,
         targetUid: attendee.uid,
         patch: { pointsAllTime: 9999 }
@@ -1208,13 +1197,13 @@ describe("lanyard/server unit tests", () => {
 
     // - Scanner can read public attributes (pointsAllTime, awardedBadges) but NOT vipTier, and can ONLY write pointsAllTime
     expect(
-      await server.readUserAttributesAs({
+      await server.readUserAttributes({
         actorUid: scanner.uid,
         targetUid: attendee.uid
       })
     ).toEqual({ pointsAllTime: 10, awardedBadges: [] });
 
-    await server.updateUserAttributesAs({
+    await server.updateUserAttributes({
       actorUid: scanner.uid,
       targetUid: attendee.uid,
       patch: { pointsAllTime: 50 }
@@ -1222,7 +1211,7 @@ describe("lanyard/server unit tests", () => {
     expect((await store.getUser(attendee.uid))?.attributes?.pointsAllTime).toBe(50);
 
     await expect(
-      server.updateUserAttributesAs({
+      server.updateUserAttributes({
         actorUid: scanner.uid,
         targetUid: attendee.uid,
         patch: { awardedBadges: ["cheater-badge"] }
@@ -1230,7 +1219,7 @@ describe("lanyard/server unit tests", () => {
     ).rejects.toThrow(/Forbidden/);
 
     // - Moderator inherits scanner's write:points AND has write:badges + write:tier
-    await server.updateUserAttributesAs({
+    await server.updateUserAttributes({
       actorUid: moderator.uid,
       targetUid: attendee.uid,
       patch: { pointsAllTime: 100, awardedBadges: ["centurion"], vipTier: "gold" }
@@ -1243,12 +1232,12 @@ describe("lanyard/server unit tests", () => {
 
     // 3. Global User HiddenAttributes:
     // - Moderator writes moderatorNotes; SystemAdmin writes superAdminSecret
-    await server.updateUserHiddenAttributesAs({
+    await server.updateUserHiddenAttributes({
       actorUid: moderator.uid,
       targetUid: attendee.uid,
       patch: { moderatorNotes: "Verified ID at booth" }
     });
-    await server.updateUserHiddenAttributesAs({
+    await server.updateUserHiddenAttributes({
       actorUid: "root-admin",
       isSystemAdmin: true,
       targetUid: attendee.uid,
@@ -1257,13 +1246,13 @@ describe("lanyard/server unit tests", () => {
 
     // - Self (`attendee`) CANNOT read or write their own hiddenAttributes!
     await expect(
-      server.readUserHiddenAttributesAs({
+      server.readUserHiddenAttributes({
         actorUid: attendee.uid,
         targetUid: attendee.uid
       })
     ).rejects.toThrow(/Forbidden/);
     await expect(
-      server.updateUserHiddenAttributesAs({
+      server.updateUserHiddenAttributes({
         actorUid: attendee.uid,
         targetUid: attendee.uid,
         patch: { moderatorNotes: "I am totally trustworthy" }
@@ -1272,14 +1261,14 @@ describe("lanyard/server unit tests", () => {
 
     // - Auditor can read `moderatorNotes` (redacting `superAdminSecret`), and CANNOT write `moderatorNotes`
     expect(
-      await server.readUserHiddenAttributesAs({
+      await server.readUserHiddenAttributes({
         actorUid: auditor.uid,
         targetUid: attendee.uid
       })
     ).toEqual({ moderatorNotes: "Verified ID at booth" });
 
     await expect(
-      server.updateUserHiddenAttributesAs({
+      server.updateUserHiddenAttributes({
         actorUid: auditor.uid,
         targetUid: attendee.uid,
         patch: { moderatorNotes: "Tampered by auditor" }
@@ -1288,7 +1277,7 @@ describe("lanyard/server unit tests", () => {
 
     // - System Admin reads all hiddenAttributes unredacted
     expect(
-      await server.readUserHiddenAttributesAs({
+      await server.readUserHiddenAttributes({
         actorUid: "root-admin",
         isSystemAdmin: true,
         targetUid: attendee.uid
@@ -1300,14 +1289,14 @@ describe("lanyard/server unit tests", () => {
 
     // 4. Write-Only Encrypted User & Scope Secrets:
     // - Self (`attendee`) CAN write `geminiKey` (`allowSelfWrite: true`), receives boolean status, and server decrypts it
-    const userSecretStatus = await server.updateUserSecretsAs({
+    const userSecretStatus = await server.updateUserSecrets({
       actorUid: attendee.uid,
       targetUid: attendee.uid,
       patch: { geminiKey: "AIzaSyPersonal123" }
     });
     expect(userSecretStatus).toEqual({ geminiKey: true });
     expect(
-      await server.getUserSecretsStatusAs({
+      await server.getUserSecretsStatus({
         actorUid: attendee.uid,
         targetUid: attendee.uid
       })
@@ -1316,7 +1305,7 @@ describe("lanyard/server unit tests", () => {
 
     // - Self (`attendee`) CANNOT write `openaiKey` because `allowSelfWrite: false` and they lack `write:ai_keys`
     await expect(
-      server.updateUserSecretsAs({
+      server.updateUserSecrets({
         actorUid: attendee.uid,
         targetUid: attendee.uid,
         patch: { openaiKey: "sk-proj-unauthorized" }
@@ -1325,14 +1314,14 @@ describe("lanyard/server unit tests", () => {
 
     // - Moderator (holding `write:ai_keys`) CAN write `openaiKey` and clear `geminiKey` with ""
     expect(
-      await server.updateUserSecretsAs({
+      await server.updateUserSecrets({
         actorUid: moderator.uid,
         targetUid: attendee.uid,
         patch: { openaiKey: "sk-proj-mod123" }
       })
     ).toEqual({ geminiKey: true, openaiKey: true });
     expect(
-      await server.updateUserSecretsAs({
+      await server.updateUserSecrets({
         actorUid: attendee.uid,
         targetUid: attendee.uid,
         patch: { geminiKey: "" }
@@ -1347,17 +1336,17 @@ describe("lanyard/server unit tests", () => {
       email: "owner.a@example.com",
       firstName: "Owner",
       lastName: "Alpha",
-      role: "tenant_owner"
+      roles: ["tenant_owner"]
     });
     await server.upsertScopeMemberByEmail({
       scopeId: "tenant-A",
       email: "attendee@example.com",
-      role: "attendee"
+      roles: ["attendee"]
     });
     await server.upsertScopeMemberByEmail({
       scopeId: "tenant-B",
       email: "attendee@example.com",
-      role: "attendee",
+      roles: ["attendee"],
       attributes: { pointsAllTime: 10, awardedBadges: [], vipTier: "bronze" }
     });
     await store.updateScopeMemberHiddenAttributes("tenant-B", attendee.uid, {
@@ -1368,20 +1357,20 @@ describe("lanyard/server unit tests", () => {
     });
 
     // (a) `tenantOwnerA` can update attributes, hiddenAttributes, and scope secrets inside `tenant-A`:
-    await server.updateScopeMemberAttributesAs({
+    await server.updateScopeMemberAttributes({
       scopeId: "tenant-A",
       actorUid: tenantOwnerA.uid,
       targetUid: attendee.uid,
       patch: { pointsAllTime: 500 }
     });
-    await server.updateScopeMemberHiddenAttributesAs({
+    await server.updateScopeMemberHiddenAttributes({
       scopeId: "tenant-A",
       actorUid: tenantOwnerA.uid,
       targetUid: attendee.uid,
       patch: { moderatorNotes: "Tenant A note" }
     });
     expect(
-      await server.readScopeMemberHiddenAttributesAs({
+      await server.readScopeMemberHiddenAttributes({
         scopeId: "tenant-A",
         actorUid: tenantOwnerA.uid,
         targetUid: attendee.uid
@@ -1389,14 +1378,14 @@ describe("lanyard/server unit tests", () => {
     ).toEqual({ moderatorNotes: "Tenant A note" });
 
     expect(
-      await server.updateScopeSecretsAs({
+      await server.updateScopeSecrets({
         scopeId: "tenant-A",
         actorUid: tenantOwnerA.uid,
         patch: { openaiKey: "sk-tenant-A-key" }
       })
     ).toEqual({ openaiKey: true });
     expect(
-      await server.getScopeSecretsStatusAs({
+      await server.getScopeSecretsStatus({
         scopeId: "tenant-A",
         actorUid: attendee.uid
       })
@@ -1405,7 +1394,7 @@ describe("lanyard/server unit tests", () => {
 
     // (b) `tenantOwnerA` CANNOT monkey with `tenant-B` attributes, hiddenAttributes, or secrets!
     await expect(
-      server.updateScopeMemberAttributesAs({
+      server.updateScopeMemberAttributes({
         scopeId: "tenant-B",
         actorUid: tenantOwnerA.uid,
         targetUid: attendee.uid,
@@ -1414,7 +1403,7 @@ describe("lanyard/server unit tests", () => {
     ).rejects.toThrow(/Forbidden/);
 
     await expect(
-      server.readScopeMemberHiddenAttributesAs({
+      server.readScopeMemberHiddenAttributes({
         scopeId: "tenant-B",
         actorUid: tenantOwnerA.uid,
         targetUid: attendee.uid
@@ -1422,7 +1411,7 @@ describe("lanyard/server unit tests", () => {
     ).rejects.toThrow(/Forbidden/);
 
     await expect(
-      server.updateScopeMemberHiddenAttributesAs({
+      server.updateScopeMemberHiddenAttributes({
         scopeId: "tenant-B",
         actorUid: tenantOwnerA.uid,
         targetUid: attendee.uid,
@@ -1431,14 +1420,14 @@ describe("lanyard/server unit tests", () => {
     ).rejects.toThrow(/Forbidden/);
 
     await expect(
-      server.getScopeSecretsStatusAs({
+      server.getScopeSecretsStatus({
         scopeId: "tenant-B",
         actorUid: tenantOwnerA.uid
       })
     ).rejects.toThrow(/Forbidden/);
 
     await expect(
-      server.updateScopeSecretsAs({
+      server.updateScopeSecrets({
         scopeId: "tenant-B",
         actorUid: tenantOwnerA.uid,
         patch: { openaiKey: "sk-sabotage" }
@@ -1447,7 +1436,7 @@ describe("lanyard/server unit tests", () => {
 
     // (c) `tenantOwnerA` CANNOT monkey with global `users/{attendee.uid}` attributes, hiddenAttributes, or secrets!
     await expect(
-      server.updateUserAttributesAs({
+      server.updateUserAttributes({
         actorUid: tenantOwnerA.uid,
         targetUid: attendee.uid,
         patch: { pointsAllTime: 0 }
@@ -1455,14 +1444,14 @@ describe("lanyard/server unit tests", () => {
     ).rejects.toThrow(/Forbidden/);
 
     await expect(
-      server.readUserHiddenAttributesAs({
+      server.readUserHiddenAttributes({
         actorUid: tenantOwnerA.uid,
         targetUid: attendee.uid
       })
     ).rejects.toThrow(/Forbidden/);
 
     await expect(
-      server.updateUserHiddenAttributesAs({
+      server.updateUserHiddenAttributes({
         actorUid: tenantOwnerA.uid,
         targetUid: attendee.uid,
         patch: { moderatorNotes: "Global sabotage" }
@@ -1470,7 +1459,7 @@ describe("lanyard/server unit tests", () => {
     ).rejects.toThrow(/Forbidden/);
 
     await expect(
-      server.updateUserSecretsAs({
+      server.updateUserSecrets({
         actorUid: tenantOwnerA.uid,
         targetUid: attendee.uid,
         patch: { openaiKey: "sk-global-sabotage" }
@@ -1621,8 +1610,7 @@ describe("lanyard/server unit tests", () => {
     await fsStore.upsertScopeMember("ws-1", {
       uid: "u-1",
       email: "u1@example.com",
-      role: "manager",
-      capabilities: []
+      roles: ["manager"]
     });
     await fsStore.updateScopeMemberAttributes("ws-1", "u-1", { pointsAllTime: 77 });
     await fsStore.updateScopeMemberHiddenAttributes("ws-1", "u-1", { note: "Workspace note" });
@@ -1684,22 +1672,19 @@ describe("lanyard/server unit tests", () => {
 
     const policy = createPermissionPolicy<SingleTenantRole, SingleTenantCap>({
       roles: {
-        attendee: { weight: 10, capabilities: [] },
+        attendee: { capabilities: [] },
         // Sibling role A: scanner (handles points + scannerAuditLog)
         scanner: {
-          weight: 20,
           inherits: ["attendee"],
           capabilities: ["write:points", "read:scanner_log", "write:scanner_log"]
         },
         // Sibling role B: merch_seller (handles merchCreditBalance + merchPosPin; does NOT inherit scanner!)
         merch_seller: {
-          weight: 20,
           inherits: ["attendee"],
           capabilities: ["read:merch", "write:merch", "read:merch_Pin", "write:merch_Pin"]
         },
         // Moderator inherits BOTH scanner and merch_seller, plus badges and write-only blindAuditHash
         moderator: {
-          weight: 30,
           inherits: ["scanner", "merch_seller"],
           capabilities: ["write:badges", "write:audit_hash"]
         }
@@ -1743,7 +1728,7 @@ describe("lanyard/server unit tests", () => {
       email: "attendee@example.com",
       firstName: "Testy",
       lastName: "McTest",
-      role: "attendee",
+      roles: ["attendee"],
       attributes: {
         pointsAllTime: 25,
         merchCreditBalance: 150,
@@ -1755,42 +1740,42 @@ describe("lanyard/server unit tests", () => {
       email: "scanner@example.com",
       firstName: "Scanny",
       lastName: "McScanner",
-      role: "scanner"
+      roles: ["scanner"]
     });
     const merchSeller = await server.upsertUserByEmail({
       email: "merch@example.com",
       firstName: "Merchy",
       lastName: "McMerch",
-      role: "merch_seller"
+      roles: ["merch_seller"]
     });
     const moderator = await server.upsertUserByEmail({
       email: "mod@example.com",
       firstName: "Moddy",
       lastName: "McModerator",
-      role: "moderator"
+      roles: ["moderator"]
     });
 
     // 1. Mutual sibling role isolation on users/{uid}:
     // - Scanner can update pointsAllTime & scannerAuditLog, but CANNOT read/write merchCreditBalance or merchPosPin
-    await server.updateUserAttributesAs({
+    await server.updateUserAttributes({
       actorUid: scanner.uid,
       targetUid: attendee.uid,
       patch: { pointsAllTime: 40 }
     });
-    await server.updateUserHiddenAttributesAs({
+    await server.updateUserHiddenAttributes({
       actorUid: scanner.uid,
       targetUid: attendee.uid,
       patch: { scannerAuditLog: "Scanned booth #4" }
     });
     await expect(
-      server.updateUserAttributesAs({
+      server.updateUserAttributes({
         actorUid: scanner.uid,
         targetUid: attendee.uid,
         patch: { merchCreditBalance: 999 }
       })
     ).rejects.toThrow(/Forbidden/);
     await expect(
-      server.updateUserHiddenAttributesAs({
+      server.updateUserHiddenAttributes({
         actorUid: scanner.uid,
         targetUid: attendee.uid,
         patch: { merchPosPin: "0000" }
@@ -1798,18 +1783,18 @@ describe("lanyard/server unit tests", () => {
     ).rejects.toThrow(/Forbidden/);
 
     // - Merch seller can read/write merchCreditBalance & merchPosPin, but CANNOT write pointsAllTime or read scannerAuditLog
-    await server.updateUserAttributesAs({
+    await server.updateUserAttributes({
       actorUid: merchSeller.uid,
       targetUid: attendee.uid,
       patch: { merchCreditBalance: 120 }
     });
-    await server.updateUserHiddenAttributesAs({
+    await server.updateUserHiddenAttributes({
       actorUid: merchSeller.uid,
       targetUid: attendee.uid,
       patch: { merchPosPin: "4821" }
     });
     await expect(
-      server.updateUserAttributesAs({
+      server.updateUserAttributes({
         actorUid: merchSeller.uid,
         targetUid: attendee.uid,
         patch: { pointsAllTime: 999 }
@@ -1818,7 +1803,7 @@ describe("lanyard/server unit tests", () => {
 
     // Reading attributes & hiddenAttributes redacts each sibling's restricted fields:
     expect(
-      await server.readUserAttributesAs({
+      await server.readUserAttributes({
         actorUid: scanner.uid,
         targetUid: attendee.uid
       })
@@ -1828,7 +1813,7 @@ describe("lanyard/server unit tests", () => {
       // merchCreditBalance and readonlySystemBadge are redacted for scanner!
     });
     expect(
-      await server.readUserAttributesAs({
+      await server.readUserAttributes({
         actorUid: merchSeller.uid,
         targetUid: attendee.uid
       })
@@ -1839,13 +1824,13 @@ describe("lanyard/server unit tests", () => {
       readonlySystemBadge: "founding-member"
     });
     expect(
-      await server.readUserHiddenAttributesAs({
+      await server.readUserHiddenAttributes({
         actorUid: scanner.uid,
         targetUid: attendee.uid
       })
     ).toEqual({ scannerAuditLog: "Scanned booth #4" });
     expect(
-      await server.readUserHiddenAttributesAs({
+      await server.readUserHiddenAttributes({
         actorUid: merchSeller.uid,
         targetUid: attendee.uid
       })
@@ -1862,13 +1847,13 @@ describe("lanyard/server unit tests", () => {
 
     // 2. Write-only hiddenAttribute & Read-only attribute enforcement:
     // Moderator can write `blindAuditHash`, but CANNOT read `blindAuditHash` back (only systemAdmin can read it)
-    await server.updateUserHiddenAttributesAs({
+    await server.updateUserHiddenAttributes({
       actorUid: moderator.uid,
       targetUid: attendee.uid,
       patch: { blindAuditHash: "sha256:abcdef" }
     });
     expect(
-      await server.readUserHiddenAttributesAs({
+      await server.readUserHiddenAttributes({
         actorUid: moderator.uid,
         targetUid: attendee.uid
       })
@@ -1878,7 +1863,7 @@ describe("lanyard/server unit tests", () => {
       // blindAuditHash is redacted for non-system-admins!
     });
     expect(
-      await server.readUserHiddenAttributesAs({
+      await server.readUserHiddenAttributes({
         actorUid: "sys-admin",
         isSystemAdmin: true,
         targetUid: attendee.uid
@@ -1891,7 +1876,7 @@ describe("lanyard/server unit tests", () => {
 
     // Moderator CANNOT write `readonlySystemBadge` (only systemAdmin can)
     await expect(
-      server.updateUserAttributesAs({
+      server.updateUserAttributes({
         actorUid: moderator.uid,
         targetUid: attendee.uid,
         patch: { readonlySystemBadge: "forged-founder" }
@@ -1902,7 +1887,7 @@ describe("lanyard/server unit tests", () => {
     // Scanner attempts to patch BOTH `pointsAllTime` (allowed) and `awardedBadges` (forbidden) in one call.
     // Must reject with 403 and leave `pointsAllTime` untouched at 40!
     await expect(
-      server.updateUserAttributesAs({
+      server.updateUserAttributes({
         actorUid: scanner.uid,
         targetUid: attendee.uid,
         patch: { pointsAllTime: 9999, awardedBadges: ["injected-badge"] }
@@ -1913,7 +1898,7 @@ describe("lanyard/server unit tests", () => {
 
     // Same atomic guarantee for hiddenAttributes on users/{uid}/private/hiddenAttributes:
     await expect(
-      server.updateUserHiddenAttributesAs({
+      server.updateUserHiddenAttributes({
         actorUid: scanner.uid,
         targetUid: attendee.uid,
         patch: { scannerAuditLog: "Valid", merchPosPin: "9999" }
@@ -1925,23 +1910,25 @@ describe("lanyard/server unit tests", () => {
       blindAuditHash: "sha256:abcdef"
     });
 
-    // 4. Per-user ad-hoc capability overrides on users/{uid} using atomic grantUserCapabilitiesByEmail & revokeUserCapabilities:
-    // Grant `attendee` an individual `write:points` capability without promoting their role from `attendee`
-    await server.grantUserCapabilitiesByEmail({
+    // 4. Multi-role grant & revoke on users/{uid} using atomic grantUserRolesByEmail & revokeUserRoles:
+    // Grant `attendee` the `scanner` role (so they now hold `["attendee", "scanner"]`)
+    await server.grantUserRolesByEmail({
       email: "attendee@example.com",
-      capabilities: ["write:points"]
+      roles: ["scanner"]
     });
-    await server.updateUserAttributesAs({
+    expect((await store.getUser(attendee.uid))?.roles).toEqual(["attendee", "scanner"]);
+    await server.updateUserAttributes({
       actorUid: attendee.uid,
       targetUid: attendee.uid,
       patch: { pointsAllTime: 55 }
     });
     expect((await store.getUser(attendee.uid))?.attributes?.pointsAllTime).toBe(55);
 
-    // Revoke the ad-hoc capability on `attendee` -> immediately blocked again
-    await server.revokeUserCapabilities(attendee.uid, ["write:points"]);
+    // Revoke the `scanner` role on `attendee` -> immediately blocked again
+    await server.revokeUserRoles(attendee.uid, ["scanner"]);
+    expect((await store.getUser(attendee.uid))?.roles).toEqual(["attendee"]);
     await expect(
-      server.updateUserAttributesAs({
+      server.updateUserAttributes({
         actorUid: attendee.uid,
         targetUid: attendee.uid,
         patch: { pointsAllTime: 70 }
@@ -1952,7 +1939,7 @@ describe("lanyard/server unit tests", () => {
     await server.upsertScopeMemberByEmail({
       scopeId: "event-2026",
       email: "attendee@example.com",
-      role: "attendee",
+      roles: ["attendee"],
       attributes: {
         pointsAllTime: 88,
         awardedBadges: ["scoped-badge"],
@@ -1963,17 +1950,17 @@ describe("lanyard/server unit tests", () => {
     await server.upsertScopeMemberByEmail({
       scopeId: "event-2026",
       email: "scanner@example.com",
-      role: "scanner"
+      roles: ["scanner"]
     });
     await server.upsertScopeMemberByEmail({
       scopeId: "event-2026",
       email: "mod@example.com",
-      role: "moderator"
+      roles: ["moderator"]
     });
 
     // Self in scope can read all their own attributes (`isSelf: true`)
     expect(
-      await server.readScopeMemberAttributesAs({
+      await server.readScopeMemberAttributes({
         scopeId: "event-2026",
         actorUid: attendee.uid,
         targetUid: attendee.uid
@@ -1988,7 +1975,7 @@ describe("lanyard/server unit tests", () => {
     // Scanner in scope can read attributes without restricted `read` capability (`pointsAllTime`, `awardedBadges`),
     // whereas Moderator in scope also inherits `read:merch` and can read `merchCreditBalance` & `readonlySystemBadge`!
     expect(
-      await server.readScopeMemberAttributesAs({
+      await server.readScopeMemberAttributes({
         scopeId: "event-2026",
         actorUid: scanner.uid,
         targetUid: attendee.uid
@@ -1998,7 +1985,7 @@ describe("lanyard/server unit tests", () => {
       awardedBadges: ["scoped-badge"]
     });
     expect(
-      await server.readScopeMemberAttributesAs({
+      await server.readScopeMemberAttributes({
         scopeId: "event-2026",
         actorUid: moderator.uid,
         targetUid: attendee.uid
@@ -2012,7 +1999,7 @@ describe("lanyard/server unit tests", () => {
 
     // Non-member of `event-2026` (`merchSeller`) is rejected with Forbidden
     await expect(
-      server.readScopeMemberAttributesAs({
+      server.readScopeMemberAttributes({
         scopeId: "event-2026",
         actorUid: merchSeller.uid,
         targetUid: attendee.uid
@@ -2024,17 +2011,17 @@ describe("lanyard/server unit tests", () => {
     // while retaining `scanner` access to `pointsAllTime` and `scannerAuditLog`
     await server.upsertUserByEmail({
       email: "mod@example.com",
-      role: "scanner"
+      roles: ["scanner"]
     });
     await expect(
-      server.updateUserAttributesAs({
+      server.updateUserAttributes({
         actorUid: moderator.uid,
         targetUid: attendee.uid,
         patch: { awardedBadges: ["demoted-mod-badge"] }
       })
     ).rejects.toThrow(/Forbidden/);
     expect(
-      await server.readUserHiddenAttributesAs({
+      await server.readUserHiddenAttributes({
         actorUid: moderator.uid,
         targetUid: attendee.uid
       })
@@ -2042,7 +2029,7 @@ describe("lanyard/server unit tests", () => {
       scannerAuditLog: "Scanned booth #4"
       // merchPosPin is no longer visible after demotion from moderator to scanner!
     });
-    await server.updateUserAttributesAs({
+    await server.updateUserAttributes({
       actorUid: moderator.uid,
       targetUid: attendee.uid,
       patch: { pointsAllTime: 65 }
@@ -2061,8 +2048,8 @@ describe("lanyard/server unit tests", () => {
 
     const policy = createPermissionPolicy<ScopeRole, ScopeCap>({
       roles: {
-        coordinator: { weight: 10, capabilities: [] },
-        lead: { weight: 20, inherits: ["coordinator"], capabilities: ["manage:oauth_secrets"] }
+        coordinator: { capabilities: [] },
+        lead: { inherits: ["coordinator"], capabilities: ["manage:oauth_secrets"] }
       },
       secretCapabilities: {
         // Coordinator can connect/disconnect their own Gmail/Calendar OAuth tokens, and a lead can also manage them
@@ -2098,21 +2085,21 @@ describe("lanyard/server unit tests", () => {
     const coordA = await server.upsertScopeMemberByEmail({
       scopeId: "camp-1",
       email: "coord-a@example.com",
-      role: "coordinator"
+      roles: ["coordinator"]
     });
     const coordB = await server.upsertScopeMemberByEmail({
       scopeId: "camp-1",
       email: "coord-b@example.com",
-      role: "coordinator"
+      roles: ["coordinator"]
     });
     const lead = await server.upsertScopeMemberByEmail({
       scopeId: "camp-1",
       email: "lead@example.com",
-      role: "lead"
+      roles: ["lead"]
     });
 
     // 1. Coordinator A can write and clear their own `gmailRefreshToken` (`allowSelfWrite: true`)
-    const statusAfterSelfWrite = await server.updateScopeMemberSecretsAs({
+    const statusAfterSelfWrite = await server.updateScopeMemberSecrets({
       scopeId: "camp-1",
       actorUid: coordA.uid,
       targetUid: coordA.uid,
@@ -2120,7 +2107,7 @@ describe("lanyard/server unit tests", () => {
     });
     expect(statusAfterSelfWrite).toEqual({ gmailRefreshToken: true });
     expect(
-      await server.getScopeMemberSecretsStatusAs({
+      await server.getScopeMemberSecretsStatus({
         scopeId: "camp-1",
         actorUid: coordA.uid,
         targetUid: coordA.uid
@@ -2132,7 +2119,7 @@ describe("lanyard/server unit tests", () => {
 
     // 2. Coordinator A CANNOT write `managedBotToken` on themselves (`allowSelfWrite: false`)
     await expect(
-      server.updateScopeMemberSecretsAs({
+      server.updateScopeMemberSecrets({
         scopeId: "camp-1",
         actorUid: coordA.uid,
         targetUid: coordA.uid,
@@ -2142,7 +2129,7 @@ describe("lanyard/server unit tests", () => {
 
     // 3. Peer Coordinator B CANNOT write or check status of Coordinator A's secrets (`isSelf: false`, lacks capability)
     await expect(
-      server.updateScopeMemberSecretsAs({
+      server.updateScopeMemberSecrets({
         scopeId: "camp-1",
         actorUid: coordB.uid,
         targetUid: coordA.uid,
@@ -2150,7 +2137,7 @@ describe("lanyard/server unit tests", () => {
       })
     ).rejects.toThrow(/Forbidden/);
     await expect(
-      server.getScopeMemberSecretsStatusAs({
+      server.getScopeMemberSecretsStatus({
         scopeId: "camp-1",
         actorUid: coordB.uid,
         targetUid: coordA.uid
@@ -2158,7 +2145,7 @@ describe("lanyard/server unit tests", () => {
     ).rejects.toThrow(/Forbidden/);
 
     // 4. Lead (`manage:oauth_secrets`) CAN write `managedBotToken` and `calendarRefreshToken` on Coordinator A (`isSelf: false`)
-    await server.updateScopeMemberSecretsAs({
+    await server.updateScopeMemberSecrets({
       scopeId: "camp-1",
       actorUid: lead.uid,
       targetUid: coordA.uid,
@@ -2174,7 +2161,7 @@ describe("lanyard/server unit tests", () => {
     });
 
     // 5. Coordinator A can clear their own `gmailRefreshToken` by passing `""` or `null`
-    await server.updateScopeMemberSecretsAs({
+    await server.updateScopeMemberSecrets({
       scopeId: "camp-1",
       actorUid: coordA.uid,
       targetUid: coordA.uid,
@@ -2247,5 +2234,553 @@ describe("lanyard/server unit tests", () => {
         process.env.MASTER_ENCRYPTION_KEY = prevMasterKey;
       }
     }
+  });
+
+  it("enforces userCapabilities (read, write, assignRoles), abstract roles, multi-role assignment (getUserAs, listUsersAs, updateUserProfileAs, updateUserRolesAs), and anti-footgun deletion safeguards (deleteOwnAccount vs deleteOtherUserAs)", async () => {
+    type UserRole =
+      | "user_reader_base"
+      | "user_writer_base"
+      | "attendee"
+      | "scanner"
+      | "merch_seller"
+      | "write_only_registrar"
+      | "role_manager"
+      | "moderator"
+      | "director";
+    type UserCap =
+      | "read:users"
+      | "write:users"
+      | "assign:roles"
+      | "read:vip_tier"
+      | "write:merch"
+      | "director:nuclear_launch";
+
+    interface UserAttrs {
+      points: number;
+      vipTier: string;
+    }
+
+    const policy = createPermissionPolicy<UserRole, UserCap>({
+      roles: {
+        // Abstract capability-grouping roles (never directly assignable, never defaultRole)
+        user_reader_base: {
+          abstract: true,
+          capabilities: ["read:users"]
+        },
+        user_writer_base: {
+          abstract: true,
+          capabilities: ["write:users"]
+        },
+        attendee: { capabilities: [] },
+        scanner: {
+          inherits: ["attendee", "user_reader_base"],
+          capabilities: []
+        },
+        // Sibling role to scanner/moderator
+        merch_seller: {
+          inherits: ["attendee"],
+          capabilities: ["write:merch"]
+        },
+        // Write-only user role: has `write:users` via `user_writer_base` and inherits `attendee`, but lacks `read:users` and `assign:roles`
+        write_only_registrar: {
+          inherits: ["attendee", "user_writer_base"],
+          capabilities: []
+        },
+        // Role manager: has `read:users` + `assign:roles`, but lacks `write:users`
+        role_manager: {
+          inherits: ["attendee", "user_reader_base"],
+          capabilities: ["assign:roles"]
+        },
+        // Moderator inherits `scanner` and `user_writer_base` (so holds `read:users` + `write:users` + `read:vip_tier`),
+        // but does NOT hold `assign:roles`!
+        moderator: {
+          inherits: ["scanner", "user_writer_base"],
+          capabilities: ["read:vip_tier"]
+        },
+        // Director inherits `moderator`, `merch_seller`, and `role_manager`
+        director: {
+          inherits: ["moderator", "merch_seller", "role_manager"],
+          capabilities: ["director:nuclear_launch"]
+        }
+      },
+      userCapabilities: {
+        read: "read:users",
+        write: "write:users",
+        assignRoles: "assign:roles"
+      },
+      attributeCapabilities: {
+        points: "write:users",
+        vipTier: { read: "read:vip_tier", write: "write:users" }
+      }
+    });
+
+    const adminAuth = createFakeAdminAuth();
+    const store = new InMemoryLanyardStore<
+      UserRole,
+      UserCap,
+      Record<string, any>,
+      UserAttrs,
+      { note: string },
+      { apiKey: string }
+    >();
+    const server = createLanyardServer<
+      UserRole,
+      UserCap,
+      Record<string, any>,
+      UserAttrs,
+      { note: string },
+      { apiKey: string }
+    >({
+      adminAuth,
+      store,
+      policy
+    });
+
+    // 0. Abstract Role Assignment & Middleware Verification:
+    // - Assigning an abstract role directly via upsertUserByEmail, grantUserRolesByEmail, upsertScopeMemberByEmail, or grantScopeRolesByEmail is rejected!
+    await expect(
+      server.upsertUserByEmail({
+        email: "bad-abstract@example.com",
+        roles: ["user_reader_base"]
+      })
+    ).rejects.toThrow(/abstract roles cannot be directly assigned to a user/);
+    await expect(
+      server.grantUserRolesByEmail({
+        email: "bad-abstract@example.com",
+        roles: ["user_writer_base"]
+      })
+    ).rejects.toThrow(/abstract roles cannot be directly assigned to a user/);
+    await expect(
+      server.upsertScopeMemberByEmail({
+        scopeId: "ws-1",
+        email: "bad-abstract@example.com",
+        roles: ["user_reader_base"]
+      })
+    ).rejects.toThrow(/abstract roles cannot be directly assigned to a user/);
+    await expect(
+      server.grantScopeRolesByEmail({
+        scopeId: "ws-1",
+        email: "bad-abstract@example.com",
+        roles: ["user_writer_base"]
+      })
+    ).rejects.toThrow(/abstract roles cannot be directly assigned to a user/);
+
+    const attendee = await server.upsertUserByEmail({
+      email: "attendee@example.com",
+      firstName: "Testy",
+      lastName: "McTest",
+      roles: ["attendee"],
+      preferences: { theme: "dark" },
+      attributes: { points: 50, vipTier: "gold" }
+    });
+    const scanner = await server.upsertUserByEmail({
+      email: "scanner@example.com",
+      firstName: "Scanny",
+      lastName: "McScanner",
+      roles: ["scanner"],
+      attributes: { points: 10, vipTier: "silver" }
+    });
+    const merchSeller = await server.upsertUserByEmail({
+      email: "merch@example.com",
+      firstName: "Merchy",
+      lastName: "McMerch",
+      roles: ["merch_seller"]
+    });
+    const registrar = await server.upsertUserByEmail({
+      email: "registrar@example.com",
+      firstName: "Reggie",
+      lastName: "Registrar",
+      roles: ["write_only_registrar"]
+    });
+    const roleManager = await server.upsertUserByEmail({
+      email: "rolemanager@example.com",
+      firstName: "Roley",
+      lastName: "Manager",
+      roles: ["role_manager"]
+    });
+    const moderator = await server.upsertUserByEmail({
+      email: "moderator@example.com",
+      firstName: "Moddy",
+      lastName: "McModerator",
+      roles: ["moderator"]
+    });
+    const moderator2 = await server.upsertUserByEmail({
+      email: "moderator2@example.com",
+      firstName: "Second",
+      lastName: "Moderator",
+      roles: ["moderator"]
+    });
+    const director = await server.upsertUserByEmail({
+      email: "director@example.com",
+      firstName: "Dirk",
+      lastName: "Director",
+      roles: ["director"]
+    });
+    const sysAdmin = await server.setSystemAdminStatus({
+      email: "sysadmin@example.com",
+      isAdmin: true,
+      firstName: "Root",
+      lastName: "Admin",
+      actorUid: "bootstrap"
+    });
+
+    // - Middleware `requireUserRole("user_reader_base")` passes for `scanner` and `moderator` (who inherit `user_reader_base`),
+    //   and fails for `attendee` and `merch_seller`!
+    let scannerPassedAbstractRole = false;
+    await server.requireUserRole("user_reader_base")(
+      { user: { uid: scanner.uid, email: scanner.email, isAdmin: false } } as any,
+      createMockRes(),
+      () => {
+        scannerPassedAbstractRole = true;
+      }
+    );
+    expect(scannerPassedAbstractRole).toBe(true);
+
+    const resMerchAbstract = createMockRes();
+    await server.requireUserRole("user_reader_base")(
+      { user: { uid: merchSeller.uid, email: merchSeller.email, isAdmin: false } } as any,
+      resMerchAbstract,
+      () => {}
+    );
+    expect(resMerchAbstract.statusCode).toBe(403);
+
+    // 1. Viewing users (`getUserAs` and `listUsersAs`):
+    await store.updateUserHiddenAttributes(attendee.uid, { note: "Confidential staff note" });
+    await store.updateUserSecrets(attendee.uid, { apiKey: "AIzaSySecret123" });
+
+    // - Attendee can read their own profile (including restricted `vipTier`), but CANNOT read another user's profile or list users
+    const selfRead = await server.getUser({
+      actorUid: attendee.uid,
+      targetUid: attendee.uid
+    });
+    expect(selfRead?.attributes).toEqual({ points: 50, vipTier: "gold" });
+    // `hiddenAttributes` and `secrets` never leak onto `getUserAs`!
+    expect((selfRead as any)?.note).toBeUndefined();
+    expect((selfRead as any)?.apiKey).toBeUndefined();
+
+    await expect(
+      server.getUser({
+        actorUid: attendee.uid,
+        targetUid: scanner.uid
+      })
+    ).rejects.toThrow(/Forbidden/);
+    await expect(
+      server.listUsers({
+        actorUid: attendee.uid
+      })
+    ).rejects.toThrow(/Forbidden/);
+
+    // - Write-only registrar (has `write:users`, lacks `read:users`) CANNOT read another user or list users!
+    await expect(
+      server.getUser({
+        actorUid: registrar.uid,
+        targetUid: attendee.uid
+      })
+    ).rejects.toThrow(/Forbidden/);
+    await expect(
+      server.listUsers({
+        actorUid: registrar.uid
+      })
+    ).rejects.toThrow(/Forbidden/);
+
+    // - Scanner (inherits `read:users` from abstract `user_reader_base`, lacks `read:vip_tier`) CAN read another user's profile and list users;
+    //   restricted attributes (`vipTier`) are redacted on OTHER users (`attendee`), while remaining UNREDACTED on `scanner`'s own record in `listUsersAs`!
+    const scannerReadAttendee = await server.getUser({
+      actorUid: scanner.uid,
+      targetUid: attendee.uid
+    });
+    expect(scannerReadAttendee?.email).toBe("attendee@example.com");
+    expect(scannerReadAttendee?.attributes).toEqual({ points: 50 });
+
+    const scannerListed = await server.listUsers({ actorUid: scanner.uid });
+    expect(scannerListed).toHaveLength(9);
+    expect(scannerListed.find((u) => u.uid === attendee.uid)?.attributes).toEqual({ points: 50 });
+    expect(scannerListed.find((u) => u.uid === scanner.uid)?.attributes).toEqual({ points: 10, vipTier: "silver" });
+
+    // - Multi-role grant (`scanner`) to `merchSeller` (`roles: ["merch_seller", "scanner"]`) then revoked:
+    await server.grantUserRolesByEmail({
+      email: merchSeller.email,
+      roles: ["scanner"]
+    });
+    expect((await server.getUser({ actorUid: merchSeller.uid, targetUid: attendee.uid }))?.uid).toBe(attendee.uid);
+    await server.revokeUserRoles(merchSeller.uid, ["scanner"]);
+    await expect(server.getUser({ actorUid: merchSeller.uid, targetUid: attendee.uid })).rejects.toThrow(/Forbidden/);
+
+    // - Moderator (holds `read:users` + `read:vip_tier`) sees unredacted `vipTier`, and `note`/`apiKey` still never leak onto UserRecord
+    const modReadAttendee = await server.getUser({
+      actorUid: moderator.uid,
+      targetUid: attendee.uid
+    });
+    expect(modReadAttendee?.attributes).toEqual({ points: 50, vipTier: "gold" });
+    expect((modReadAttendee as any)?.note).toBeUndefined();
+    expect((modReadAttendee as any)?.apiKey).toBeUndefined();
+
+    // 2. Editing User Profiles (`updateUserProfileAs`):
+    // - Self profile edit (`actorUid === targetUid`) by `attendee` (who lacks `write:users`) is ALLOWED,
+    //   and preserves `roles`, `preferences`, and `attributes`!
+    const selfEdited = await server.updateUserProfile({
+      actorUid: attendee.uid,
+      targetUid: attendee.uid,
+      patch: {
+        firstName: "SelfRenamed",
+        lastName: "Attendee",
+        photoUrl: "javascript:alert(1)" // sanitized to null!
+      }
+    });
+    expect(selfEdited.displayName).toBe("SelfRenamed Attendee");
+    expect(selfEdited.photoUrl).toBeNull();
+    expect(selfEdited.roles).toEqual(["attendee"]);
+    expect(selfEdited.preferences).toEqual({ theme: "dark" });
+    expect(selfEdited.attributes).toEqual({ points: 50, vipTier: "gold" });
+
+    // - No-permission user (`attendee`) trying to edit another user -> Forbidden
+    await expect(
+      server.updateUserProfile({
+        actorUid: attendee.uid,
+        targetUid: scanner.uid,
+        patch: { firstName: "Hacked" }
+      })
+    ).rejects.toThrow(/Forbidden/);
+
+    // - Read-only user (`scanner` with `read:users`, lacking `write:users`) trying to edit another user -> Forbidden
+    await expect(
+      server.updateUserProfile({
+        actorUid: scanner.uid,
+        targetUid: attendee.uid,
+        patch: { firstName: "HackedByScanner" }
+      })
+    ).rejects.toThrow(/Forbidden/);
+
+    // - Role-assigner (`roleManager` with `assign:roles`, lacking `write:users`) trying to edit another user's profile -> Forbidden
+    await expect(
+      server.updateUserProfile({
+        actorUid: roleManager.uid,
+        targetUid: attendee.uid,
+        patch: { firstName: "HackedByRoleManager" }
+      })
+    ).rejects.toThrow(/Forbidden/);
+
+    // - Write-only user (`registrar` with `write:users`, lacking `read:users`) CAN edit another non-admin user's profile
+    const registrarEdited = await server.updateUserProfile({
+      actorUid: registrar.uid,
+      targetUid: attendee.uid,
+      patch: { firstName: "ReggieUpdated" }
+    });
+    expect(registrarEdited.firstName).toBe("ReggieUpdated");
+
+    // - Moderator (with `write:users`) CAN edit `attendee` or `merchSeller`, and syncs `displayName` to `adminAuth.updateUser`
+    const updatedProfile = await server.updateUserProfile({
+      actorUid: moderator.uid,
+      targetUid: attendee.uid,
+      patch: { firstName: "Renamed", lastName: "Attendee" }
+    });
+    expect(updatedProfile?.displayName).toBe("Renamed Attendee");
+    expect(adminAuth.updatedUsersByUid.get(attendee.uid)).toEqual({
+      displayName: "Renamed Attendee"
+    });
+
+    // - Non-existent target user throws not-found and never creates a phantom user doc
+    await expect(
+      server.updateUserProfile({
+        actorUid: moderator.uid,
+        targetUid: "non-existent-uid",
+        patch: { firstName: "Ghost" }
+      })
+    ).rejects.toThrow(/Target user 'non-existent-uid' not found/);
+    expect(await store.getUser("non-existent-uid")).toBeNull();
+
+    // - Non-system-admin Moderator CANNOT edit a `systemAdmin`!
+    await expect(
+      server.updateUserProfile({
+        actorUid: moderator.uid,
+        targetUid: sysAdmin!.uid,
+        patch: { firstName: "HijackedAdmin" }
+      })
+    ).rejects.toThrow(/Non-system administrators cannot modify a system administrator/);
+
+    // 3. Updating User Roles (`updateUserRolesAs` gated by `userCapabilities.assignRoles`):
+    // - No-permission user (`attendee`), read-only user (`scanner`), and `write:users`-only user (`moderator`) CANNOT call `updateUserRolesAs`!
+    await expect(
+      server.updateUserRoles({
+        actorUid: attendee.uid,
+        targetUid: attendee.uid,
+        roles: ["scanner"]
+      })
+    ).rejects.toThrow(/Forbidden/);
+    await expect(
+      server.updateUserRoles({
+        actorUid: scanner.uid,
+        targetUid: attendee.uid,
+        roles: ["scanner"]
+      })
+    ).rejects.toThrow(/Forbidden/);
+    await expect(
+      server.updateUserRoles({
+        actorUid: moderator.uid,
+        targetUid: attendee.uid,
+        roles: ["scanner"]
+      })
+    ).rejects.toThrow(/Forbidden: Insufficient permissions to assign user roles/);
+
+    // - Abstract role cannot be assigned via `updateUserRolesAs` (even by `roleManager` or `systemAdmin`!)
+    await expect(
+      server.updateUserRoles({
+        actorUid: sysAdmin!.uid,
+        isSystemAdmin: true,
+        targetUid: attendee.uid,
+        roles: ["user_writer_base"]
+      })
+    ).rejects.toThrow(/abstract roles cannot be directly assigned to a user/);
+
+    // - Non-system-admin `roleManager` (who holds `assign:roles`) CANNOT modify a `systemAdmin`!
+    await expect(
+      server.updateUserRoles({
+        actorUid: roleManager.uid,
+        targetUid: sysAdmin!.uid,
+        roles: ["attendee"]
+      })
+    ).rejects.toThrow(/Non-system administrators cannot modify a system administrator/);
+
+    // - Trusted `roleManager` (who holds `assign:roles`) CAN assign multiple concrete roles (e.g. `["scanner", "merch_seller"]`)
+    //   to `attendee`, even though `roleManager` does not personally hold `scanner` or `merch_seller`!
+    const updatedRoles = await server.updateUserRoles({
+      actorUid: roleManager.uid,
+      targetUid: attendee.uid,
+      roles: ["scanner", "merch_seller"]
+    });
+    expect(updatedRoles.roles).toEqual(["scanner", "merch_seller"]);
+    expect(policy.hasAllRoles(updatedRoles, ["attendee", "user_reader_base", "scanner", "merch_seller"])).toBe(true);
+    expect(policy.hasAllCapabilities(updatedRoles, ["read:users", "write:merch"])).toBe(true);
+
+    // 4. Unified User Deletion Safeguards (`deleteUser`):
+    // Safeguard A1: Swapped UIDs when target lacks `write:users` (`actorUid: attendee.uid, targetUid: moderator.uid`) -> Rejected by permission check!
+    await expect(
+      server.deleteUser({
+        actorUid: attendee.uid, // Swapped!
+        targetUid: moderator.uid,
+        confirmTargetEmail: "attendee@example.com"
+      })
+    ).rejects.toThrow(/Forbidden/);
+    expect(await store.getUser(moderator.uid)).not.toBeNull();
+
+    // Safeguard A2: Swapped UIDs when BOTH users have `write:users` (`actorUid: moderator2.uid, targetUid: moderator.uid`)
+    // or when `moderator` accidentally passes their own UID as `targetUid` while trying to delete `attendee@example.com`!
+    // `confirmTargetEmail` ("attendee@example.com") does NOT match `moderator.email` ("moderator@example.com"), so deletion is aborted before any data is touched!
+    await expect(
+      server.deleteUser({
+        actorUid: moderator.uid,
+        targetUid: moderator.uid, // ACCIDENTALLY PASSED OWN UID!
+        confirmTargetEmail: "attendee@example.com"
+      })
+    ).rejects.toThrow(/confirmTargetEmail 'attendee@example\.com' does not match target user's email/);
+    await expect(
+      server.deleteUser({
+        actorUid: moderator2.uid,
+        targetUid: moderator.uid, // ACCIDENTALLY SWAPPED!
+        confirmTargetEmail: "attendee@example.com"
+      })
+    ).rejects.toThrow(/confirmTargetEmail 'attendee@example\.com' does not match target user's email/);
+    expect(await store.getUser(moderator.uid)).not.toBeNull();
+    expect(adminAuth.deletedUids.has(moderator.uid)).toBe(false);
+
+    // Safeguard B: Empty or whitespace `confirmTargetEmail` is rejected
+    await expect(
+      server.deleteUser({
+        actorUid: moderator.uid,
+        targetUid: attendee.uid,
+        confirmTargetEmail: "   "
+      })
+    ).rejects.toThrow(/confirmTargetEmail is required/);
+
+    // Safeguard C: Role without `write:users` (`scanner`, `roleManager`, or `attendee`) cannot delete OTHER users
+    await expect(
+      server.deleteUser({
+        actorUid: scanner.uid,
+        targetUid: attendee.uid,
+        confirmTargetEmail: "attendee@example.com"
+      })
+    ).rejects.toThrow(/Forbidden/);
+    await expect(
+      server.deleteUser({
+        actorUid: roleManager.uid,
+        targetUid: attendee.uid,
+        confirmTargetEmail: "attendee@example.com"
+      })
+    ).rejects.toThrow(/Forbidden/);
+
+    // Safeguard D: Non-system-admin Moderator cannot delete a `systemAdmin` even with matching email!
+    await expect(
+      server.deleteUser({
+        actorUid: moderator.uid,
+        targetUid: sysAdmin!.uid,
+        confirmTargetEmail: "sysadmin@example.com"
+      })
+    ).rejects.toThrow(/Non-system administrators cannot delete a system administrator/);
+
+    // Safeguard E: Stale 1-hour admin JWT after demotion cannot delete or modify users
+    const tempAdmin = await server.setSystemAdminStatus({
+      email: "tempadmin@example.com",
+      isAdmin: true,
+      actorUid: sysAdmin!.uid
+    });
+    await server.setSystemAdminStatus({
+      email: "tempadmin@example.com",
+      isAdmin: false,
+      actorUid: sysAdmin!.uid
+    });
+    await expect(
+      server.deleteUser({
+        actorUid: tempAdmin!.uid,
+        isSystemAdmin: true, // Stale JWT claim!
+        targetUid: attendee.uid,
+        confirmTargetEmail: "attendee@example.com"
+      })
+    ).rejects.toThrow(/Forbidden/);
+
+    // Safeguard F: Authorized Moderator deleting `attendee` with matching `confirmTargetEmail`
+    // succeeds and cleans up store + hiddenAttributes + secrets + Auth
+    await server.deleteUser({
+      actorUid: moderator.uid,
+      targetUid: attendee.uid,
+      confirmTargetEmail: "  ATTENDEE@example.com "
+    });
+    expect(await store.getUser(attendee.uid)).toBeNull();
+    expect(await store.getUserHiddenAttributes(attendee.uid)).toEqual({});
+    expect(await store.getUserSecrets(attendee.uid)).toEqual({});
+    expect(adminAuth.deletedUids.has(attendee.uid)).toBe(true);
+
+    // Director (who holds `write:users`) CAN delete `merch_seller`
+    await server.deleteUser({
+      actorUid: director.uid,
+      targetUid: merchSeller.uid,
+      confirmTargetEmail: "merch@example.com"
+    });
+    expect(await store.getUser(merchSeller.uid)).toBeNull();
+
+    // Safeguard G: Self-deletion (`actorUid === targetUid` on `deleteUser`) works without `write:users`,
+    // requires non-empty matching `confirmTargetEmail`, and cleans up store + Auth
+    await expect(
+      server.deleteUser({
+        actorUid: scanner.uid,
+        targetUid: scanner.uid,
+        confirmTargetEmail: "   "
+      })
+    ).rejects.toThrow(/confirmTargetEmail is required/);
+    await expect(
+      server.deleteUser({
+        actorUid: scanner.uid,
+        targetUid: scanner.uid,
+        confirmTargetEmail: "wrong@example.com"
+      })
+    ).rejects.toThrow(/confirmTargetEmail 'wrong@example\.com' does not match target user's email/);
+    expect(await store.getUser(scanner.uid)).not.toBeNull();
+
+    await server.deleteUser({
+      actorUid: scanner.uid,
+      targetUid: scanner.uid,
+      confirmTargetEmail: "scanner@example.com"
+    });
+    expect(await store.getUser(scanner.uid)).toBeNull();
+    expect(adminAuth.deletedUids.has(scanner.uid)).toBe(true);
   });
 });

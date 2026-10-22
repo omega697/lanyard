@@ -20,24 +20,6 @@ import {
 
 const FORBIDDEN_KEYS = new Set(["__proto__", "constructor", "prototype"]);
 
-const RESERVED_USER_ENVELOPE_KEYS = new Set([
-  "uid",
-  "email",
-  "firstName",
-  "lastName",
-  "displayName",
-  "photoUrl",
-  "lastSeen",
-  "isSystemAdmin",
-  "addedBy",
-  "role",
-  "capabilities",
-  "preferences",
-  "attributes",
-  "createdAt",
-  "updatedAt"
-]);
-
 function sanitizeObjectPatch<T extends Record<string, any>>(input: unknown): Partial<T> {
   const clean: Record<string, any> = {};
   if (!input || typeof input !== "object" || Array.isArray(input)) {
@@ -61,10 +43,8 @@ function assertValidFirestoreDocId(id: string | null | undefined, label: string)
 
 export interface FirestoreClientStoreConfig<TRole extends string = string> {
   db: Firestore;
-  /** Default role assigned if a stored document does not have a `role` field. */
+  /** Default role assigned if a stored document does not have a `roles` field. */
   defaultRole: TRole;
-  /** Optional custom role resolver for migrating legacy documents (e.g., `isCreator` flags). */
-  resolveRole?: (data: Record<string, any>) => TRole;
   /** Canonical users collection name (defaults to `"users"`). */
   usersCollection?: string;
   scopeCollection?: string;
@@ -87,7 +67,7 @@ interface MultiplexedUserWatcher<
  * Firestore implementation of `LanyardClientStore`.
  *
  * Uses a single canonical `users/{uid}` collection for profile, presence, `isSystemAdmin`,
- * single-tenant `role`/`capabilities`, `preferences`, and `attributes`, and multiplexes
+ * single-tenant `roles`, `preferences`, and `attributes`, and multiplexes
  * `onSnapshot` listeners per UID so subscribing to both user state and preferences only
  * ever opens **1 Firestore document listener**.
  */
@@ -99,7 +79,6 @@ export class FirestoreClientStore<
 > implements LanyardClientStore<TRole, TCapability, TPreferences, TAttributes> {
   private readonly db: Firestore;
   private readonly defaultRole: TRole;
-  private readonly resolveRole?: (data: Record<string, any>) => TRole;
   private readonly usersCollection: string;
   private readonly scopeCollection: string;
   private readonly membersSubcollection: string;
@@ -112,7 +91,6 @@ export class FirestoreClientStore<
   constructor(config: FirestoreClientStoreConfig<TRole>) {
     this.db = config.db;
     this.defaultRole = config.defaultRole;
-    this.resolveRole = config.resolveRole;
     this.usersCollection = assertValidFirestoreDocId(config.usersCollection || "users", "usersCollection");
     this.scopeCollection = assertValidFirestoreDocId(config.scopeCollection || "workspaces", "scopeCollection");
     this.membersSubcollection = assertValidFirestoreDocId(
@@ -121,25 +99,18 @@ export class FirestoreClientStore<
     );
   }
 
-  private extractRole(data: Record<string, any>): TRole {
-    if (this.resolveRole) {
-      return this.resolveRole(data);
+  private extractRoles(data: Record<string, any>): TRole[] {
+    if (Array.isArray(data.roles) && data.roles.length > 0) {
+      return Array.from(new Set(data.roles as TRole[]));
     }
-    return (data.role as TRole) || this.defaultRole;
+    return [this.defaultRole];
   }
 
   private extractPreferencesFromDocData(data: Record<string, any>): Partial<TPreferences> {
     if (data.preferences && typeof data.preferences === "object" && !Array.isArray(data.preferences)) {
       return sanitizeObjectPatch<TPreferences>(data.preferences);
     }
-    // Backwards-compatible fallback if top-level preference fields exist on the doc
-    const legacy: Record<string, any> = {};
-    for (const [k, v] of Object.entries(data)) {
-      if (!FORBIDDEN_KEYS.has(k) && !RESERVED_USER_ENVELOPE_KEYS.has(k)) {
-        legacy[k] = v;
-      }
-    }
-    return legacy as Partial<TPreferences>;
+    return {} as Partial<TPreferences>;
   }
 
   private parseUserRecord(
@@ -162,8 +133,7 @@ export class FirestoreClientStore<
       ...(data.lastSeen !== undefined ? { lastSeen: data.lastSeen } : {}),
       ...(typeof data.isSystemAdmin === "boolean" ? { isSystemAdmin: data.isSystemAdmin } : {}),
       ...(data.addedBy !== undefined ? { addedBy: data.addedBy } : {}),
-      role: this.extractRole(data),
-      capabilities: Array.isArray(data.capabilities) ? data.capabilities : [],
+      roles: this.extractRoles(data),
       preferences: prefs,
       attributes: attrs,
       ...(data.createdAt !== undefined ? { createdAt: data.createdAt } : {}),
@@ -319,6 +289,7 @@ export class FirestoreClientStore<
       uid: cleanUid,
       updatedAt: new Date().toISOString()
     };
+    if (typeof patch.email === "string" && patch.email.trim()) safePayload.email = patch.email.toLowerCase().trim();
     if (typeof patch.firstName === "string") safePayload.firstName = patch.firstName.trim();
     if (typeof patch.lastName === "string") safePayload.lastName = patch.lastName.trim();
     if (typeof patch.displayName === "string") safePayload.displayName = patch.displayName.trim();
@@ -385,8 +356,7 @@ export class FirestoreClientStore<
       lastName: data.lastName,
       displayName: data.displayName,
       photoUrl: sanitizeAvatarUrl(data.photoUrl),
-      role: this.extractRole(data),
-      capabilities: Array.isArray(data.capabilities) ? data.capabilities : [],
+      roles: this.extractRoles(data),
       scopeId,
       scopeName: data.scopeName,
       lastSeen: data.lastSeen,

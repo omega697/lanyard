@@ -204,6 +204,7 @@ export class InMemoryLanyardStore<
       ...existing,
       uid
     };
+    if (typeof patch.email === "string" && patch.email.trim()) next.email = patch.email.toLowerCase().trim();
     if (typeof patch.firstName === "string") next.firstName = patch.firstName.trim();
     if (typeof patch.lastName === "string") next.lastName = patch.lastName.trim();
     if (typeof patch.displayName === "string") next.displayName = patch.displayName.trim();
@@ -318,6 +319,18 @@ export class InMemoryLanyardStore<
     return this.cloneUser(this.users.get(uid) || null);
   }
 
+  async listUsers(): Promise<UserRecord<TRole, TCapability, TPreferences, TAttributes>[]> {
+    return Array.from(this.users.values()).map((u) => this.cloneUser(u)!);
+  }
+
+  async deleteUser(uid: string): Promise<void> {
+    assertValidResourceId(uid, "uid");
+    this.users.delete(uid);
+    this.userHiddenAttributes.delete(uid);
+    this.userSecrets.delete(uid);
+    this.notifyUserAndPrefListeners(uid);
+  }
+
   async upsertUser(user: UserRecord<TRole, TCapability, TPreferences, TAttributes>): Promise<void> {
     assertValidResourceId(user.uid, "uid");
     const existing = this.users.get(user.uid);
@@ -330,10 +343,10 @@ export class InMemoryLanyardStore<
         : existing?.photoUrl !== undefined
           ? { photoUrl: existing.photoUrl }
           : {}),
-      ...(user.capabilities !== undefined
-        ? { capabilities: Array.from(new Set(user.capabilities)) }
-        : existing?.capabilities !== undefined
-          ? { capabilities: [...existing.capabilities] }
+      ...(user.roles !== undefined
+        ? { roles: Array.from(new Set(user.roles)) }
+        : existing?.roles !== undefined
+          ? { roles: [...existing.roles] }
           : {}),
       ...(user.preferences !== undefined
         ? { preferences: { ...(existing?.preferences || {}), ...sanitizePatch(user.preferences) } }
@@ -408,10 +421,10 @@ export class InMemoryLanyardStore<
     return this.toSecretStatusMap(updated);
   }
 
-  async grantUserCapabilities(
+  async grantUserRoles(
     uid: string,
-    capabilities: readonly TCapability[],
-    fallbackUser?: Omit<UserRecord<TRole, TCapability, TPreferences, TAttributes>, "capabilities">
+    roles: readonly TRole[],
+    fallbackUser?: Omit<UserRecord<TRole, TCapability, TPreferences, TAttributes>, "roles">
   ): Promise<UserRecord<TRole, TCapability, TPreferences, TAttributes>> {
     assertValidResourceId(uid, "uid");
     const existing = await this.getUser(uid);
@@ -421,28 +434,28 @@ export class InMemoryLanyardStore<
     const base = existing || {
       ...fallbackUser!,
       uid,
-      capabilities: [] as TCapability[]
+      roles: [] as TRole[]
     };
-    const mergedCapabilities = Array.from(new Set([...(base.capabilities || []), ...capabilities]));
+    const mergedRoles = Array.from(new Set([...(base.roles || []), ...roles]));
     const updated: UserRecord<TRole, TCapability, TPreferences, TAttributes> = {
       ...base,
       uid,
-      capabilities: mergedCapabilities,
+      roles: mergedRoles,
       updatedAt: new Date().toISOString()
     };
     await this.upsertUser(updated);
     return (await this.getUser(uid))!;
   }
 
-  async revokeUserCapabilities(uid: string, capabilities: readonly TCapability[]): Promise<void> {
+  async revokeUserRoles(uid: string, roles: readonly TRole[]): Promise<void> {
     assertValidResourceId(uid, "uid");
     const existing = await this.getUser(uid);
     if (!existing) return;
-    const revokeSet = new Set(capabilities);
-    const remaining = (existing.capabilities || []).filter((c) => !revokeSet.has(c));
+    const revokeSet = new Set(roles);
+    const remaining = (existing.roles || []).filter((r) => !revokeSet.has(r));
     await this.upsertUser({
       ...existing,
-      capabilities: remaining,
+      roles: remaining,
       updatedAt: new Date().toISOString()
     });
   }
@@ -524,7 +537,7 @@ export class InMemoryLanyardStore<
           ? { photoUrl: existing.photoUrl }
           : {}),
       scopeId,
-      capabilities: Array.from(new Set(member.capabilities || [])),
+      roles: Array.from(new Set(member.roles || [])),
       ...(member.preferences !== undefined
         ? { preferences: { ...(existing?.preferences || {}), ...sanitizePatch(member.preferences) } }
         : existing?.preferences !== undefined
@@ -636,11 +649,11 @@ export class InMemoryLanyardStore<
     return this.toSecretStatusMap(updated);
   }
 
-  async grantScopeCapabilities(
+  async grantScopeRoles(
     scopeId: string,
     uid: string,
-    capabilities: readonly TCapability[],
-    fallbackMember?: Omit<ScopedMember<TRole, TCapability, TPreferences, TAttributes>, "capabilities">
+    roles: readonly TRole[],
+    fallbackMember?: Omit<ScopedMember<TRole, TCapability, TPreferences, TAttributes>, "roles">
   ): Promise<ScopedMember<TRole, TCapability, TPreferences, TAttributes>> {
     assertValidResourceId(scopeId, "scopeId");
     assertValidResourceId(uid, "uid");
@@ -652,28 +665,28 @@ export class InMemoryLanyardStore<
       ...fallbackMember!,
       uid,
       scopeId,
-      capabilities: [] as TCapability[]
+      roles: [] as TRole[]
     };
-    const mergedCapabilities = Array.from(new Set([...(base.capabilities || []), ...capabilities]));
+    const mergedRoles = Array.from(new Set([...(base.roles || []), ...roles]));
     const updated: ScopedMember<TRole, TCapability, TPreferences, TAttributes> = {
       ...base,
       scopeId,
-      capabilities: mergedCapabilities
+      roles: mergedRoles
     };
     await this.upsertScopeMember(scopeId, updated);
     return this.cloneMember(updated);
   }
 
-  async revokeScopeCapabilities(scopeId: string, uid: string, capabilities: readonly TCapability[]): Promise<void> {
+  async revokeScopeRoles(scopeId: string, uid: string, roles: readonly TRole[]): Promise<void> {
     assertValidResourceId(scopeId, "scopeId");
     assertValidResourceId(uid, "uid");
     const existing = await this.getScopeMember(scopeId, uid);
     if (!existing) return;
-    const revokeSet = new Set(capabilities);
-    const remaining = (existing.capabilities || []).filter((c) => !revokeSet.has(c));
+    const revokeSet = new Set(roles);
+    const remaining = (existing.roles || []).filter((r) => !revokeSet.has(r));
     await this.upsertScopeMember(scopeId, {
       ...existing,
-      capabilities: remaining
+      roles: remaining
     });
   }
 
@@ -710,7 +723,7 @@ export class InMemoryLanyardStore<
     if (!user) return null;
     return {
       ...user,
-      ...(user.capabilities ? { capabilities: [...user.capabilities] } : {}),
+      ...(user.roles ? { roles: [...user.roles] } : {}),
       ...(user.preferences ? { preferences: { ...user.preferences } } : {}),
       ...(user.attributes ? { attributes: { ...user.attributes } } : {})
     };
@@ -721,7 +734,7 @@ export class InMemoryLanyardStore<
   ): ScopedMember<TRole, TCapability, TPreferences, TAttributes> {
     return {
       ...member,
-      capabilities: [...member.capabilities],
+      roles: [...member.roles],
       ...(member.preferences ? { preferences: { ...member.preferences } } : {}),
       ...(member.attributes ? { attributes: { ...member.attributes } } : {})
     };

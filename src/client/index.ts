@@ -13,12 +13,14 @@ import {
   verifyBeforeUpdateEmail,
   applyActionCode,
   fetchSignInMethodsForEmail,
+  updateProfile as firebaseUpdateProfile,
   type Auth,
   type User,
   type AuthProvider
 } from "firebase/auth";
 import {
   createWritableStore,
+  formatExistingAccountError,
   isValidEmail,
   isValidResourceId,
   sanitizeAvatarUrl,
@@ -31,6 +33,8 @@ import {
   type UserProfilePatch,
   type UserRecord
 } from "../core/index.js";
+
+export { formatExistingAccountError };
 
 export const HEARTBEAT_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
 
@@ -294,6 +298,23 @@ export function createLanyardClient<
             }
           }
 
+          // If a verified email change occurred on Firebase Auth, sync the new email to users/{uid}
+          const emailSyncKey = `email:${user.uid}`;
+          if (
+            user.email &&
+            user.emailVerified &&
+            record.email &&
+            record.email.toLowerCase() !== user.email.toLowerCase() &&
+            typeof store.updateUserProfile === "function"
+          ) {
+            if (syncedAvatars.get(emailSyncKey) !== user.email) {
+              syncedAvatars.set(emailSyncKey, user.email);
+              store.updateUserProfile(user.uid, { email: user.email }).catch(() => {
+                syncedAvatars.delete(emailSyncKey);
+              });
+            }
+          }
+
           // Real-time system admin promotion/demotion sync from users/{uid}
           if (typeof record.isSystemAdmin === "boolean") {
             const currentAuth = authStoreInternal.get();
@@ -369,7 +390,21 @@ export function createLanyardClient<
           const params = new URLSearchParams(window.location.search);
           const oobCode = params.get("oobCode");
           if (oobCode) {
-            applyActionCode(auth, oobCode).catch(() => {});
+            applyActionCode(auth, oobCode)
+              .then(async () => {
+                const fbUser = auth.currentUser;
+                if (!fbUser) return;
+                if (typeof fbUser.reload === "function") {
+                  await fbUser.reload();
+                }
+                let claims: Record<string, any> = {};
+                if (typeof fbUser.getIdTokenResult === "function") {
+                  const tokenResult = await fbUser.getIdTokenResult(true);
+                  claims = tokenResult?.claims || {};
+                }
+                setActiveUser(normalizeFirebaseUser(auth.currentUser || fbUser, claims));
+              })
+              .catch(() => {});
           }
         }
       }
@@ -609,7 +644,37 @@ export function createLanyardClient<
     if (typeof store.updateUserProfile !== "function") {
       throw new Error("Backing store does not implement updateUserProfile");
     }
-    await store.updateUserProfile(currentUser.uid, patch);
+    const resolvedPatch: UserProfilePatch = { ...patch };
+    if (
+      resolvedPatch.displayName === undefined &&
+      (typeof resolvedPatch.firstName === "string" || typeof resolvedPatch.lastName === "string")
+    ) {
+      const existingRecord = userRecordStoreInternal.get();
+      const first = (resolvedPatch.firstName ?? existingRecord?.firstName ?? "").trim();
+      const last = (resolvedPatch.lastName ?? existingRecord?.lastName ?? "").trim();
+      const computedDisplayName = [first, last].filter(Boolean).join(" ").trim();
+      if (computedDisplayName) {
+        resolvedPatch.displayName = computedDisplayName;
+      }
+    }
+    await store.updateUserProfile(currentUser.uid, resolvedPatch);
+    if (typeof resolvedPatch.displayName === "string") {
+      const trimmedDisplay = resolvedPatch.displayName.trim();
+      authStoreInternal.update((state) =>
+        state.user && state.user.uid === currentUser.uid
+          ? { ...state, user: { ...state.user, displayName: trimmedDisplay } }
+          : state
+      );
+      if (
+        auth?.currentUser &&
+        auth.currentUser.uid === currentUser.uid &&
+        typeof firebaseUpdateProfile === "function"
+      ) {
+        try {
+          await firebaseUpdateProfile(auth.currentUser, { displayName: trimmedDisplay });
+        } catch {}
+      }
+    }
   }
 
   // --- Unified Role, Capability, and Custom Property Accessors (Unscoped & Scoped) ---
@@ -627,25 +692,50 @@ export function createLanyardClient<
     return userRecordStoreInternal.get();
   }
 
-  function getRole(scopeId?: string): TRole | null {
+  function getRoles(scopeId?: string): TRole[] {
     const subject = resolveTargetSubject(scopeId);
-    return subject?.role ?? null;
+    return Array.isArray(subject?.roles) ? [...subject.roles] : [];
   }
 
-  function hasMinimumRole(minimumRole: TRole, scopeId?: string): boolean {
+  function getAssignableRoles(): readonly TRole[] {
+    return policy ? policy.assignableRoles : [];
+  }
+
+  function hasRole(requiredRole: TRole, scopeId?: string): boolean {
     const currentUser = authStoreInternal.get().user;
     if (!currentUser) return false;
     const isAdmin = Boolean(currentUser.isAdmin);
     const subject = resolveTargetSubject(scopeId);
     if (policy) {
-      return policy.hasMinimumRole(subject, minimumRole, isAdmin);
+      return policy.hasRole(subject, requiredRole, isAdmin);
     }
     if (isAdmin) return true;
-    return subject?.role === minimumRole;
+    return Array.isArray(subject?.roles) && subject.roles.includes(requiredRole);
   }
 
-  function hasRole(minimumRole: TRole, scopeId?: string): boolean {
-    return hasMinimumRole(minimumRole, scopeId);
+  function hasAnyRole(requiredRoles: readonly TRole[], scopeId?: string): boolean {
+    const currentUser = authStoreInternal.get().user;
+    if (!currentUser) return false;
+    const isAdmin = Boolean(currentUser.isAdmin);
+    const subject = resolveTargetSubject(scopeId);
+    if (policy) {
+      return policy.hasAnyRole(subject, requiredRoles, isAdmin);
+    }
+    if (isAdmin) return true;
+    if (requiredRoles.length === 0) return false;
+    return requiredRoles.some((r) => Array.isArray(subject?.roles) && subject.roles.includes(r));
+  }
+
+  function hasAllRoles(requiredRoles: readonly TRole[], scopeId?: string): boolean {
+    const currentUser = authStoreInternal.get().user;
+    if (!currentUser) return false;
+    const isAdmin = Boolean(currentUser.isAdmin);
+    const subject = resolveTargetSubject(scopeId);
+    if (policy) {
+      return policy.hasAllRoles(subject, requiredRoles, isAdmin);
+    }
+    if (isAdmin) return true;
+    return requiredRoles.every((r) => Array.isArray(subject?.roles) && subject.roles.includes(r));
   }
 
   function getCapabilities(scopeId?: string): TCapability[] {
@@ -653,26 +743,27 @@ export function createLanyardClient<
     if (!currentUser) return [];
     const isAdmin = Boolean(currentUser.isAdmin);
     const subject = resolveTargetSubject(scopeId);
-    const result = new Set<TCapability>(subject?.capabilities || []);
+    const result = new Set<TCapability>();
     if (policy) {
-      if (isAdmin) {
+      const addAllPolicyCaps = () => {
         for (const caps of Object.values(policy.roleCapabilities) as Array<readonly TCapability[] | "*" | undefined>) {
           if (Array.isArray(caps)) {
             for (const c of caps) result.add(c);
           }
         }
-      } else if (subject?.role && Object.hasOwn(policy.roleCapabilities, subject.role)) {
-        const roleCaps = policy.roleCapabilities[subject.role];
-        if (roleCaps === "*") {
-          for (const caps of Object.values(policy.roleCapabilities) as Array<
-            readonly TCapability[] | "*" | undefined
-          >) {
-            if (Array.isArray(caps)) {
-              for (const c of caps) result.add(c);
+      };
+      if (isAdmin) {
+        addAllPolicyCaps();
+      } else if (Array.isArray(subject?.roles)) {
+        for (const role of subject.roles) {
+          if (typeof role === "string" && Object.hasOwn(policy.roleCapabilities, role)) {
+            const roleCaps = policy.roleCapabilities[role];
+            if (roleCaps === "*") {
+              addAllPolicyCaps();
+            } else if (Array.isArray(roleCaps)) {
+              for (const c of roleCaps) result.add(c);
             }
           }
-        } else if (Array.isArray(roleCaps)) {
-          for (const c of roleCaps) result.add(c);
         }
       }
     }
@@ -687,8 +778,7 @@ export function createLanyardClient<
     if (policy) {
       return policy.hasCapability(subject, capability, isAdmin);
     }
-    if (isAdmin) return true;
-    return Boolean(subject?.capabilities?.includes(capability));
+    return isAdmin;
   }
 
   function hasAnyCapability(capabilities: readonly TCapability[], scopeId?: string): boolean {
@@ -699,9 +789,7 @@ export function createLanyardClient<
     if (policy) {
       return policy.hasAnyCapability(subject, capabilities, isAdmin);
     }
-    if (isAdmin) return true;
-    if (capabilities.length === 0) return true;
-    return capabilities.some((c) => Boolean(subject?.capabilities?.includes(c)));
+    return isAdmin;
   }
 
   function hasAllCapabilities(capabilities: readonly TCapability[], scopeId?: string): boolean {
@@ -713,7 +801,7 @@ export function createLanyardClient<
       return policy.hasAllCapabilities(subject, capabilities, isAdmin);
     }
     if (isAdmin) return true;
-    return capabilities.every((c) => Boolean(subject?.capabilities?.includes(c)));
+    return capabilities.length === 0;
   }
 
   function getAttributes(scopeId?: string): Partial<TAttributes> {
@@ -822,6 +910,53 @@ export function createLanyardClient<
     return isAdmin || isSelf;
   }
 
+  /**
+   * Checks whether the current user can read a user/member record (either unscoped or within `scopeId`).
+   * Defaults `isSelf: false` since reading *another* user's profile is the primary check.
+   */
+  function canReadUser(options?: string | { scopeId?: string; isSelf?: boolean }): boolean {
+    const currentUser = authStoreInternal.get().user;
+    if (!currentUser) return false;
+    const scopeId = typeof options === "string" ? options : options?.scopeId;
+    const isSelf = typeof options === "object" && options !== null ? (options.isSelf ?? false) : false;
+    if (scopeId !== undefined && !isValidResourceId(scopeId)) return false;
+    const isAdmin = Boolean(currentUser.isAdmin);
+    const subject = resolveTargetSubject(scopeId);
+    if (scopeId !== undefined && !isAdmin && !subject) return false;
+    if (policy) {
+      return policy.canReadUser(subject, { isSystemAdmin: isAdmin, isSelf });
+    }
+    return isAdmin || isSelf;
+  }
+
+  /**
+   * Checks whether the current user can write (update/delete) another user/member record
+   * (either unscoped or within `scopeId`).
+   */
+  function canWriteUser(scopeId?: string): boolean {
+    const currentUser = authStoreInternal.get().user;
+    if (!currentUser) return false;
+    if (scopeId !== undefined && !isValidResourceId(scopeId)) return false;
+    const isAdmin = Boolean(currentUser.isAdmin);
+    const subject = resolveTargetSubject(scopeId);
+    if (!policy) return isAdmin;
+    return policy.canWriteUser(subject, isAdmin);
+  }
+
+  /**
+   * Checks whether the current user can assign or modify roles on a user/member record
+   * (either unscoped or within `scopeId`).
+   */
+  function canAssignRoles(scopeId?: string): boolean {
+    const currentUser = authStoreInternal.get().user;
+    if (!currentUser) return false;
+    if (scopeId !== undefined && !isValidResourceId(scopeId)) return false;
+    const isAdmin = Boolean(currentUser.isAdmin);
+    const subject = resolveTargetSubject(scopeId);
+    if (!policy) return isAdmin;
+    return policy.canAssignRoles(subject, isAdmin);
+  }
+
   // --- Presence Tracking (5-minute localStorage-throttled) ---
 
   function getPresenceKeys(uid: string, scopeId?: string) {
@@ -838,10 +973,10 @@ export function createLanyardClient<
     if (scopeId !== undefined && !isValidResourceId(scopeId)) return false;
     if (currentUser.isAdmin) return true;
     if (!scopeId) {
-      // In single-tenant mode, check if the user's global UserRecord role has trackPresence enabled
+      // In single-tenant mode, check if the user's global UserRecord role (or policy.defaultRole) has trackPresence enabled
       const userRecord = userRecordStoreInternal.get();
-      if (userRecord?.role && policy) {
-        return policy.shouldTrackPresence(userRecord, currentUser.isAdmin);
+      if (policy) {
+        return policy.shouldTrackPresence(userRecord || {}, currentUser.isAdmin);
       }
       return false;
     }
@@ -1005,15 +1140,20 @@ export function createLanyardClient<
     updatePreferences,
     updateScopePreferences,
     updateProfile,
-    getRole,
+    getRoles,
+    getAssignableRoles,
     hasRole,
-    hasMinimumRole,
+    hasAnyRole,
+    hasAllRoles,
     getCapabilities,
     hasCapability,
     hasAnyCapability,
     hasAllCapabilities,
     getAttributes,
     getPreferences,
+    canReadUser,
+    canWriteUser,
+    canAssignRoles,
     canReadAttribute,
     canWriteAttribute,
     canReadHiddenAttribute,

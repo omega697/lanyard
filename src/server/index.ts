@@ -8,6 +8,7 @@ import {
   type PermissionPolicy,
   type ScopedMember,
   type SystemAdminProfile,
+  type UserProfilePatch,
   type UserRecord
 } from "../core/index.js";
 
@@ -63,6 +64,11 @@ export interface AdminAuthAdapter {
     emailVerified?: boolean;
   }): Promise<{ uid: string; email?: string; displayName?: string; customClaims?: Record<string, any> }>;
   setCustomUserClaims(uid: string, customUserClaims: Record<string, any> | null): Promise<void>;
+  updateUser?(
+    uid: string,
+    properties: { displayName?: string | null; email?: string; photoURL?: string | null }
+  ): Promise<any>;
+  deleteUser?(uid: string): Promise<void>;
 }
 
 const SAFE_AUTH_ERROR_PREFIXES = ["Token must contain an email claim", "Token email must be verified"];
@@ -239,11 +245,31 @@ export function createLanyardServer<
     next();
   }
 
+  function assertAssignableRole(role: TRole): void {
+    if (typeof role !== "string" || !Object.hasOwn(policy.roles, role)) {
+      throw new Error(`Invalid role '${String(role)}': role is not defined in policy.roles`);
+    }
+    if (!policy.isAssignableRole(role)) {
+      throw new Error(`Invalid role '${String(role)}': abstract roles cannot be directly assigned to a user`);
+    }
+  }
+
+  function assertAssignableRoles(roles: readonly TRole[]): void {
+    if (!Array.isArray(roles)) {
+      throw new Error("Invalid roles: must be an array of assignable roles");
+    }
+    for (const r of roles) {
+      assertAssignableRole(r);
+    }
+  }
+
   /**
    * Single-tenant role middleware: verifies the authenticated user's global `users/{uid}` record
-   * meets or exceeds `minimumRole` (via `inherits` or `weight`), or is an active system admin.
+   * holds `requiredRole` (or at least one from an array, directly or via `inherits`), or is an active system admin.
    */
-  function requireUserRole(minimumRole: TRole) {
+  function requireUserRole(requiredRoleOrRoles: TRole | readonly TRole[]) {
+    const requiredList = Array.isArray(requiredRoleOrRoles) ? requiredRoleOrRoles : [requiredRoleOrRoles as TRole];
+
     return async (
       req: AuthenticatedRequest<TRole, TCapability, TPreferences, TAttributes>,
       res: Response,
@@ -258,9 +284,14 @@ export function createLanyardServer<
         req.user.isAdmin = isAdmin;
         req.userRecord = userRecord;
 
-        if (!policy.hasMinimumRole(userRecord, minimumRole, isAdmin)) {
+        const isAllowed =
+          requiredList.length === 1
+            ? policy.hasRole(userRecord, requiredList[0], isAdmin)
+            : policy.hasAnyRole(userRecord, requiredList, isAdmin);
+
+        if (!isAllowed) {
           return res.status(403).json({
-            error: `Forbidden: Requires at least '${minimumRole}' role`
+            error: `Forbidden: Requires '${requiredList.join(" or ")}' role`
           });
         }
 
@@ -324,7 +355,9 @@ export function createLanyardServer<
     };
   }
 
-  function requireScopeRole(minimumRole: TRole, scopeParamName = defaultScopeParam) {
+  function requireScopeRole(requiredRoleOrRoles: TRole | readonly TRole[], scopeParamName = defaultScopeParam) {
+    const requiredList = Array.isArray(requiredRoleOrRoles) ? requiredRoleOrRoles : [requiredRoleOrRoles as TRole];
+
     return async (
       req: AuthenticatedRequest<TRole, TCapability, TPreferences, TAttributes>,
       res: Response,
@@ -346,9 +379,14 @@ export function createLanyardServer<
         const member = await store.getScopeMember(scopeId, req.user.uid);
         req.scopeMember = member;
 
-        if (!policy.hasMinimumRole(member, minimumRole, isAdmin)) {
+        const isAllowed =
+          requiredList.length === 1
+            ? policy.hasRole(member, requiredList[0], isAdmin)
+            : policy.hasAnyRole(member, requiredList, isAdmin);
+
+        if (!isAllowed) {
           return res.status(403).json({
-            error: `Forbidden: Requires at least '${minimumRole}' role in scope '${scopeId}'`
+            error: `Forbidden: Requires '${requiredList.join(" or ")}' role in scope '${scopeId}'`
           });
         }
 
@@ -515,13 +553,12 @@ export function createLanyardServer<
     email: string;
     firstName?: string;
     lastName?: string;
-    role?: TRole;
-    capabilities?: TCapability[];
+    roles?: readonly TRole[];
     preferences?: Partial<TPreferences>;
     attributes?: Partial<TAttributes>;
   }): Promise<UserRecord<TRole, TCapability, TPreferences, TAttributes>> {
-    if (params.role !== undefined && (typeof params.role !== "string" || !Object.hasOwn(policy.roles, params.role))) {
-      throw new Error(`Invalid role '${String(params.role)}': role is not defined in policy.roles`);
+    if (params.roles !== undefined) {
+      assertAssignableRoles(params.roles);
     }
     if (typeof store.upsertUser !== "function" || typeof store.getUser !== "function") {
       throw new Error("Backing store does not implement getUser / upsertUser");
@@ -535,6 +572,8 @@ export function createLanyardServer<
 
     const existing = await store.getUser(uid);
     const now = new Date().toISOString();
+    const resolvedRoles = params.roles ? Array.from(new Set(params.roles)) : (existing?.roles ?? [policy.defaultRole]);
+
     const record: UserRecord<TRole, TCapability, TPreferences, TAttributes> = {
       ...(existing || {}),
       uid,
@@ -542,8 +581,7 @@ export function createLanyardServer<
       firstName: params.firstName?.trim() ?? existing?.firstName,
       lastName: params.lastName?.trim() ?? existing?.lastName,
       displayName: params.firstName || params.lastName ? displayName : existing?.displayName || displayName,
-      role: params.role ?? existing?.role ?? policy.defaultRole,
-      capabilities: Array.from(new Set(params.capabilities ?? existing?.capabilities ?? [])),
+      roles: resolvedRoles,
       ...(params.preferences ? { preferences: { ...(existing?.preferences || {}), ...params.preferences } } : {}),
       ...(params.attributes ? { attributes: { ...(existing?.attributes || {}), ...params.attributes } } : {}),
       createdAt: existing?.createdAt || now,
@@ -554,19 +592,15 @@ export function createLanyardServer<
     return (await store.getUser(uid))!;
   }
 
-  async function grantUserCapabilitiesByEmail(params: {
+  async function grantUserRolesByEmail(params: {
     email: string;
-    capabilities: readonly TCapability[];
+    roles: readonly TRole[];
     firstName?: string;
     lastName?: string;
-    role?: TRole;
   }): Promise<UserRecord<TRole, TCapability, TPreferences, TAttributes>> {
-    const targetRole = params.role ?? policy.defaultRole;
-    if (typeof targetRole !== "string" || !Object.hasOwn(policy.roles, targetRole)) {
-      throw new Error(`Invalid role '${String(targetRole)}': role is not defined in policy.roles`);
-    }
-    if (typeof store.grantUserCapabilities !== "function") {
-      throw new Error("Backing store does not implement grantUserCapabilities");
+    assertAssignableRoles(params.roles);
+    if (typeof store.grantUserRoles !== "function") {
+      throw new Error("Backing store does not implement grantUserRoles");
     }
     const displayName =
       [params.firstName?.trim(), params.lastName?.trim()].filter(Boolean).join(" ") || params.email.trim();
@@ -575,22 +609,254 @@ export function createLanyardServer<
       displayName
     });
 
-    return store.grantUserCapabilities(uid, params.capabilities, {
+    return store.grantUserRoles(uid, params.roles, {
       uid,
       email: cleanEmail,
       firstName: params.firstName?.trim(),
       lastName: params.lastName?.trim(),
-      displayName,
-      role: targetRole
+      displayName
     });
   }
 
-  async function revokeUserCapabilities(uid: string, capabilities: readonly TCapability[]): Promise<void> {
+  async function revokeUserRoles(uid: string, roles: readonly TRole[]): Promise<void> {
     assertValidResourceId(uid, "uid");
-    if (typeof store.revokeUserCapabilities !== "function") {
-      throw new Error("Backing store does not implement revokeUserCapabilities");
+    if (typeof store.revokeUserRoles !== "function") {
+      throw new Error("Backing store does not implement revokeUserRoles");
     }
-    await store.revokeUserCapabilities(uid, capabilities);
+    await store.revokeUserRoles(uid, roles);
+  }
+
+  /**
+   * Reads a user's `UserRecord` (`users/{targetUid}`) after verifying the caller (`actorUid`)
+   * is the user themselves, holds the `read` capability in `userCapabilities`, or is an active system admin.
+   * Automatically filters `attributes` to only keys readable by `actorUid`.
+   */
+  async function getUser(params: {
+    actorUid: string;
+    isSystemAdmin?: boolean;
+    targetUid: string;
+  }): Promise<UserRecord<TRole, TCapability, TPreferences, TAttributes> | null> {
+    assertValidResourceId(params.actorUid, "actorUid");
+    assertValidResourceId(params.targetUid, "targetUid");
+    if (typeof store.getUser !== "function") {
+      throw new Error("Backing store does not implement getUser");
+    }
+    const { isAdmin, userRecord: actorRecord } = await resolveEffectiveAdminStatus(
+      params.actorUid,
+      Boolean(params.isSystemAdmin)
+    );
+    const isSelf = params.actorUid === params.targetUid;
+    if (!policy.canReadUser(actorRecord, { isSystemAdmin: isAdmin, isSelf })) {
+      throw new Error("Forbidden: Insufficient permissions to read user profile");
+    }
+    const targetUser = await store.getUser(params.targetUid);
+    if (!targetUser) return null;
+    const filteredAttributes = policy.filterReadableAttributes<TAttributes>(actorRecord, targetUser.attributes, {
+      isSystemAdmin: isAdmin,
+      isSelf
+    });
+    return {
+      ...targetUser,
+      ...(targetUser.attributes !== undefined ? { attributes: filteredAttributes } : {})
+    };
+  }
+
+  /**
+   * Lists all global `UserRecord` documents (`usersCollection`) after verifying the caller (`actorUid`)
+   * holds the `read` capability in `userCapabilities` or is an active system admin.
+   * Automatically filters each user's `attributes` to only keys readable by `actorUid`.
+   */
+  async function listUsers(params: {
+    actorUid: string;
+    isSystemAdmin?: boolean;
+  }): Promise<UserRecord<TRole, TCapability, TPreferences, TAttributes>[]> {
+    assertValidResourceId(params.actorUid, "actorUid");
+    if (typeof store.listUsers !== "function") {
+      throw new Error("Backing store does not implement listUsers");
+    }
+    const { isAdmin, userRecord: actorRecord } = await resolveEffectiveAdminStatus(
+      params.actorUid,
+      Boolean(params.isSystemAdmin)
+    );
+    if (!policy.canReadUser(actorRecord, { isSystemAdmin: isAdmin, isSelf: false })) {
+      throw new Error("Forbidden: Insufficient permissions to list users");
+    }
+    const allUsers = await store.listUsers();
+    return allUsers.map((u) => {
+      const isSelf = u.uid === params.actorUid;
+      const filteredAttributes = policy.filterReadableAttributes<TAttributes>(actorRecord, u.attributes, {
+        isSystemAdmin: isAdmin,
+        isSelf
+      });
+      return {
+        ...u,
+        ...(u.attributes !== undefined ? { attributes: filteredAttributes } : {})
+      };
+    });
+  }
+
+  /**
+   * Updates a user's profile fields (`firstName`, `lastName`, `displayName`, `photoUrl`, `email`) on `users/{targetUid}`
+   * after verifying the caller (`actorUid`) is the user themselves, holds the `write` capability in `userCapabilities`,
+   * or is an active system admin. Also syncs `displayName` to Firebase Auth when `adminAuth.updateUser` is available.
+   */
+  async function updateUserProfile(params: {
+    actorUid: string;
+    isSystemAdmin?: boolean;
+    targetUid: string;
+    patch: UserProfilePatch;
+  }): Promise<UserRecord<TRole, TCapability, TPreferences, TAttributes>> {
+    assertValidResourceId(params.actorUid, "actorUid");
+    assertValidResourceId(params.targetUid, "targetUid");
+    if (typeof store.getUser !== "function" || typeof store.upsertUser !== "function") {
+      throw new Error("Backing store does not implement getUser / upsertUser");
+    }
+    const { isAdmin, userRecord: actorRecord } = await resolveEffectiveAdminStatus(
+      params.actorUid,
+      Boolean(params.isSystemAdmin)
+    );
+    const isSelf = params.actorUid === params.targetUid;
+    if (!isSelf && !policy.canWriteUser(actorRecord, isAdmin)) {
+      throw new Error("Forbidden: Insufficient permissions to update user profile");
+    }
+    const existing = await store.getUser(params.targetUid);
+    if (!existing) {
+      throw new Error(`Target user '${params.targetUid}' not found`);
+    }
+    if (!isAdmin && !isSelf && existing.isSystemAdmin === true) {
+      throw new Error("Forbidden: Non-system administrators cannot modify a system administrator");
+    }
+
+    const patch = params.patch || {};
+    const firstName = typeof patch.firstName === "string" ? patch.firstName.trim() : existing.firstName;
+    const lastName = typeof patch.lastName === "string" ? patch.lastName.trim() : existing.lastName;
+    const computedDisplayName = [firstName, lastName].filter(Boolean).join(" ").trim();
+    const displayName =
+      typeof patch.displayName === "string"
+        ? patch.displayName.trim()
+        : typeof patch.firstName === "string" || typeof patch.lastName === "string"
+          ? computedDisplayName || existing.displayName
+          : existing.displayName;
+    const email =
+      typeof patch.email === "string" && patch.email.trim() ? patch.email.toLowerCase().trim() : existing.email;
+    const photoUrl = patch.photoUrl !== undefined ? sanitizeAvatarUrl(patch.photoUrl) : existing.photoUrl;
+
+    const updated: UserRecord<TRole, TCapability, TPreferences, TAttributes> = {
+      ...existing,
+      uid: params.targetUid,
+      email,
+      ...(firstName !== undefined ? { firstName } : {}),
+      ...(lastName !== undefined ? { lastName } : {}),
+      ...(displayName !== undefined ? { displayName } : {}),
+      ...(photoUrl !== undefined ? { photoUrl } : {}),
+      updatedAt: new Date().toISOString()
+    };
+
+    await store.upsertUser(updated);
+    if (displayName && displayName !== existing.displayName && typeof adminAuth.updateUser === "function") {
+      await adminAuth.updateUser(params.targetUid, { displayName }).catch(() => {});
+    }
+    return (await store.getUser(params.targetUid))!;
+  }
+
+  /**
+   * Replaces a user's `roles` on `users/{targetUid}` after verifying the caller (`actorUid`)
+   * holds the `assignRoles` capability in `userCapabilities` or is an active system admin,
+   * and that every role in `roles` is a concrete (`!abstract`) role defined in `policy.roles`.
+   */
+  async function updateUserRoles(params: {
+    actorUid: string;
+    isSystemAdmin?: boolean;
+    targetUid: string;
+    roles: readonly TRole[];
+  }): Promise<UserRecord<TRole, TCapability, TPreferences, TAttributes>> {
+    assertValidResourceId(params.actorUid, "actorUid");
+    assertValidResourceId(params.targetUid, "targetUid");
+    assertAssignableRoles(params.roles);
+    if (typeof store.getUser !== "function" || typeof store.upsertUser !== "function") {
+      throw new Error("Backing store does not implement getUser / upsertUser");
+    }
+    const { isAdmin, userRecord: actorRecord } = await resolveEffectiveAdminStatus(
+      params.actorUid,
+      Boolean(params.isSystemAdmin)
+    );
+    if (!policy.canAssignRoles(actorRecord, isAdmin)) {
+      throw new Error("Forbidden: Insufficient permissions to assign user roles");
+    }
+    const existing = await store.getUser(params.targetUid);
+    if (!existing) {
+      throw new Error(`Target user '${params.targetUid}' not found`);
+    }
+    if (!isAdmin && existing.isSystemAdmin === true) {
+      throw new Error("Forbidden: Non-system administrators cannot modify a system administrator");
+    }
+
+    const updated: UserRecord<TRole, TCapability, TPreferences, TAttributes> = {
+      ...existing,
+      uid: params.targetUid,
+      roles: Array.from(new Set(params.roles)),
+      updatedAt: new Date().toISOString()
+    };
+    await store.upsertUser(updated);
+    return (await store.getUser(params.targetUid))!;
+  }
+
+  /**
+   * Deletes a user's account (`users/{targetUid}`, private subdocuments, and Firebase Auth account)
+   * with email-confirmation protection against accidental or swapped-UID deletion:
+   * - If `actorUid === targetUid` (self-deletion), no `userCapabilities.write` capability is required.
+   * - If `actorUid !== targetUid` (deleting another user), `actorUid` must hold the `write` capability in
+   *   `userCapabilities` (or be `isSystemAdmin`), and non-system administrators cannot delete a `systemAdmin`.
+   * - In all cases, `confirmTargetEmail` must match `targetUid`'s stored email address case-insensitively,
+   *   preventing accidental deletion if `actorUid` and `targetUid` are ever swapped.
+   */
+  async function deleteUser(params: {
+    actorUid: string;
+    isSystemAdmin?: boolean;
+    targetUid: string;
+    confirmTargetEmail: string;
+  }): Promise<void> {
+    assertValidResourceId(params.actorUid, "actorUid");
+    assertValidResourceId(params.targetUid, "targetUid");
+    if (typeof store.getUser !== "function" || typeof store.deleteUser !== "function") {
+      throw new Error("Backing store does not implement getUser / deleteUser");
+    }
+    const cleanConfirmEmail = (params.confirmTargetEmail || "").toLowerCase().trim();
+    if (!cleanConfirmEmail) {
+      throw new Error("confirmTargetEmail is required to delete user");
+    }
+
+    const isSelf = params.actorUid === params.targetUid;
+    let isAdmin = false;
+    if (!isSelf) {
+      const resolved = await resolveEffectiveAdminStatus(params.actorUid, Boolean(params.isSystemAdmin));
+      isAdmin = resolved.isAdmin;
+      if (!policy.canWriteUser(resolved.userRecord, isAdmin)) {
+        throw new Error("Forbidden: Insufficient permissions to delete user");
+      }
+    }
+
+    const targetUser = await store.getUser(params.targetUid);
+    if (!targetUser) {
+      if (!isSelf) {
+        throw new Error(`Target user '${params.targetUid}' not found`);
+      }
+    } else {
+      if (!isSelf && !isAdmin && targetUser.isSystemAdmin === true) {
+        throw new Error("Forbidden: Non-system administrators cannot delete a system administrator");
+      }
+      const targetEmail = (targetUser.email || "").toLowerCase().trim();
+      if (!targetEmail || targetEmail !== cleanConfirmEmail) {
+        throw new Error(
+          `Refusing to delete user '${params.targetUid}': confirmTargetEmail '${cleanConfirmEmail}' does not match target user's email`
+        );
+      }
+    }
+
+    await store.deleteUser(params.targetUid);
+    if (typeof adminAuth.deleteUser === "function") {
+      await adminAuth.deleteUser(params.targetUid);
+    }
   }
 
   async function upsertScopeMemberByEmail(params: {
@@ -598,16 +864,13 @@ export function createLanyardServer<
     email: string;
     firstName?: string;
     lastName?: string;
-    role: TRole;
-    capabilities?: TCapability[];
+    roles: readonly TRole[];
     scopeName?: string;
     preferences?: Partial<TPreferences>;
     attributes?: Partial<TAttributes>;
   }): Promise<ScopedMember<TRole, TCapability, TPreferences, TAttributes>> {
     assertValidResourceId(params.scopeId, "scopeId");
-    if (typeof params.role !== "string" || !Object.hasOwn(policy.roles, params.role)) {
-      throw new Error(`Invalid role '${String(params.role)}': role is not defined in policy.roles`);
-    }
+    assertAssignableRoles(params.roles);
     const displayName =
       [params.firstName?.trim(), params.lastName?.trim()].filter(Boolean).join(" ") || params.email.trim();
     const { uid, email: cleanEmail } = await getOrProvisionUidByEmail({
@@ -622,8 +885,7 @@ export function createLanyardServer<
       email: cleanEmail,
       firstName: params.firstName?.trim() ?? existing?.firstName,
       lastName: params.lastName?.trim() ?? existing?.lastName,
-      role: params.role,
-      capabilities: Array.from(new Set(params.capabilities ?? existing?.capabilities ?? [])),
+      roles: Array.from(new Set(params.roles)),
       scopeId: params.scopeId,
       scopeName: params.scopeName ?? existing?.scopeName,
       ...(params.preferences ? { preferences: { ...(existing?.preferences || {}), ...params.preferences } } : {}),
@@ -634,20 +896,16 @@ export function createLanyardServer<
     return member;
   }
 
-  async function grantScopeCapabilitiesByEmail(params: {
+  async function grantScopeRolesByEmail(params: {
     scopeId: string;
     email: string;
-    capabilities: readonly TCapability[];
+    roles: readonly TRole[];
     firstName?: string;
     lastName?: string;
-    role?: TRole;
     scopeName?: string;
   }): Promise<ScopedMember<TRole, TCapability, TPreferences, TAttributes>> {
     assertValidResourceId(params.scopeId, "scopeId");
-    const targetRole = params.role ?? policy.defaultRole;
-    if (typeof targetRole !== "string" || !Object.hasOwn(policy.roles, targetRole)) {
-      throw new Error(`Invalid role '${String(targetRole)}': role is not defined in policy.roles`);
-    }
+    assertAssignableRoles(params.roles);
     const displayName =
       [params.firstName?.trim(), params.lastName?.trim()].filter(Boolean).join(" ") || params.email.trim();
     const { uid, email: cleanEmail } = await getOrProvisionUidByEmail({
@@ -655,25 +913,20 @@ export function createLanyardServer<
       displayName
     });
 
-    return store.grantScopeCapabilities(params.scopeId, uid, params.capabilities, {
+    return store.grantScopeRoles(params.scopeId, uid, params.roles, {
       uid,
       email: cleanEmail,
       firstName: params.firstName?.trim(),
       lastName: params.lastName?.trim(),
-      role: targetRole,
       scopeId: params.scopeId,
       scopeName: params.scopeName
     });
   }
 
-  async function revokeScopeCapabilities(
-    scopeId: string,
-    uid: string,
-    capabilities: readonly TCapability[]
-  ): Promise<void> {
+  async function revokeScopeRoles(scopeId: string, uid: string, roles: readonly TRole[]): Promise<void> {
     assertValidResourceId(scopeId, "scopeId");
     assertValidResourceId(uid, "uid");
-    await store.revokeScopeCapabilities(scopeId, uid, capabilities);
+    await store.revokeScopeRoles(scopeId, uid, roles);
   }
 
   // --- Capability-Gated Attributes & Secrets Operations ---
@@ -683,7 +936,7 @@ export function createLanyardServer<
    * Global user operations NEVER consult tenant-scoped roles—only the caller's global `users/{actorUid}` record
    * or `isSystemAdmin` status is evaluated.
    */
-  async function readUserAttributesAs(params: {
+  async function readUserAttributes(params: {
     actorUid: string;
     isSystemAdmin?: boolean;
     targetUid: string;
@@ -709,7 +962,7 @@ export function createLanyardServer<
    * holds the required write capability for every key in `patch` (or is an active system admin).
    * Self-ownership (`actorUid === targetUid`) and tenant-scoped roles NEVER grant write access to global `attributes`.
    */
-  async function updateUserAttributesAs(params: {
+  async function updateUserAttributes(params: {
     actorUid: string;
     isSystemAdmin?: boolean;
     targetUid: string;
@@ -736,7 +989,7 @@ export function createLanyardServer<
    * Self-ownership (`actorUid === targetUid`) never grants read access to `hiddenAttributes`.
    * Throws `Forbidden` if a non-admin caller has no readable hiddenAttribute keys and no read capability.
    */
-  async function readUserHiddenAttributesAs(params: {
+  async function readUserHiddenAttributes(params: {
     actorUid: string;
     isSystemAdmin?: boolean;
     targetUid: string;
@@ -766,7 +1019,7 @@ export function createLanyardServer<
    * Updates a user's global `hiddenAttributes` (`users/{targetUid}/private/hiddenAttributes`) after verifying
    * the caller (`actorUid`) holds the required `write` capability for every key in `patch` (or is an active system admin).
    */
-  async function updateUserHiddenAttributesAs(params: {
+  async function updateUserHiddenAttributes(params: {
     actorUid: string;
     isSystemAdmin?: boolean;
     targetUid: string;
@@ -791,7 +1044,7 @@ export function createLanyardServer<
    * Reads a scoped member's `attributes` within `scopeId`, filtering out any keys the caller (`actorUid`)
    * is not permitted to read in that exact `scopeId` (or returning all keys if `isSystemAdmin`).
    */
-  async function readScopeMemberAttributesAs(params: {
+  async function readScopeMemberAttributes(params: {
     scopeId: string;
     actorUid: string;
     isSystemAdmin?: boolean;
@@ -817,7 +1070,7 @@ export function createLanyardServer<
    * holds the required write capability **within that exact `scopeId`** (or is an active system admin).
    * Roles in other scopes grant zero privileges in `scopeId`.
    */
-  async function updateScopeMemberAttributesAs(params: {
+  async function updateScopeMemberAttributes(params: {
     scopeId: string;
     actorUid: string;
     isSystemAdmin?: boolean;
@@ -842,7 +1095,7 @@ export function createLanyardServer<
    * Reads a scoped member's `hiddenAttributes` within `scopeId`, strictly checking the caller's membership
    * in `scopeId` (or active system admin status). Self-ownership (`actorUid === targetUid`) never grants read access.
    */
-  async function readScopeMemberHiddenAttributesAs(params: {
+  async function readScopeMemberHiddenAttributes(params: {
     scopeId: string;
     actorUid: string;
     isSystemAdmin?: boolean;
@@ -877,7 +1130,7 @@ export function createLanyardServer<
    * Updates a scoped member's `hiddenAttributes` within `scopeId`, strictly checking the caller's membership
    * and capabilities in `scopeId` (or active system admin status).
    */
-  async function updateScopeMemberHiddenAttributesAs(params: {
+  async function updateScopeMemberHiddenAttributes(params: {
     scopeId: string;
     actorUid: string;
     isSystemAdmin?: boolean;
@@ -908,7 +1161,7 @@ export function createLanyardServer<
    * Allowed for the user themselves (`actorUid === targetUid`), any actor who can write at least one
    * secret key in the status map, or an active system admin.
    */
-  async function getUserSecretsStatusAs(params: {
+  async function getUserSecretsStatus(params: {
     actorUid: string;
     isSystemAdmin?: boolean;
     targetUid: string;
@@ -944,7 +1197,7 @@ export function createLanyardServer<
    * `users/{targetUid}/private/secrets`. Returns the updated boolean status map (`{ [key]: boolean }`)
    * and NEVER returns plaintext or ciphertext values.
    */
-  async function updateUserSecretsAs(params: {
+  async function updateUserSecrets(params: {
     actorUid: string;
     isSystemAdmin?: boolean;
     targetUid: string;
@@ -985,7 +1238,7 @@ export function createLanyardServer<
    * Returns a boolean status map (`{ [key]: boolean }`) indicating which secrets are configured
    * on `{scopeCollection}/{scopeId}/{membersSubcollection}/{targetUid}/private/secrets`.
    */
-  async function getScopeMemberSecretsStatusAs(params: {
+  async function getScopeMemberSecretsStatus(params: {
     scopeId: string;
     actorUid: string;
     isSystemAdmin?: boolean;
@@ -1026,7 +1279,7 @@ export function createLanyardServer<
    * `{scopeCollection}/{scopeId}/{membersSubcollection}/{targetUid}/private/secrets`.
    * Returns the updated boolean status map (`{ [key]: boolean }`).
    */
-  async function updateScopeMemberSecretsAs(params: {
+  async function updateScopeMemberSecrets(params: {
     scopeId: string;
     actorUid: string;
     isSystemAdmin?: boolean;
@@ -1072,7 +1325,7 @@ export function createLanyardServer<
    * on `{scopeCollection}/{scopeId}/private/secrets` (e.g. BYOK workspace API keys).
    * Allowed for any member of `scopeId` or an active system admin.
    */
-  async function getScopeSecretsStatusAs(params: {
+  async function getScopeSecretsStatus(params: {
     scopeId: string;
     actorUid: string;
     isSystemAdmin?: boolean;
@@ -1096,7 +1349,7 @@ export function createLanyardServer<
    * Requires the caller to hold the configured `write` capability in `secretCapabilities` within `scopeId`
    * (or be an active system admin). Note: `isSelf` is always `false` for shared scope-level secrets.
    */
-  async function updateScopeSecretsAs(params: {
+  async function updateScopeSecrets(params: {
     scopeId: string;
     actorUid: string;
     isSystemAdmin?: boolean;
@@ -1144,27 +1397,32 @@ export function createLanyardServer<
     getOrProvisionUidByEmail,
     setSystemAdminStatus,
     upsertUserByEmail,
-    grantUserCapabilitiesByEmail,
-    revokeUserCapabilities,
+    grantUserRolesByEmail,
+    revokeUserRoles,
+    getUser,
+    listUsers,
+    updateUserProfile,
+    updateUserRoles,
+    deleteUser,
     upsertScopeMemberByEmail,
-    grantScopeCapabilitiesByEmail,
-    revokeScopeCapabilities,
-    readUserAttributesAs,
-    updateUserAttributesAs,
-    readUserHiddenAttributesAs,
-    updateUserHiddenAttributesAs,
-    readScopeMemberAttributesAs,
-    updateScopeMemberAttributesAs,
-    readScopeMemberHiddenAttributesAs,
-    updateScopeMemberHiddenAttributesAs,
-    getUserSecretsStatusAs,
-    updateUserSecretsAs,
+    grantScopeRolesByEmail,
+    revokeScopeRoles,
+    readUserAttributes,
+    updateUserAttributes,
+    readUserHiddenAttributes,
+    updateUserHiddenAttributes,
+    readScopeMemberAttributes,
+    updateScopeMemberAttributes,
+    readScopeMemberHiddenAttributes,
+    updateScopeMemberHiddenAttributes,
+    getUserSecretsStatus,
+    updateUserSecrets,
     getDecryptedUserSecrets,
-    getScopeMemberSecretsStatusAs,
-    updateScopeMemberSecretsAs,
+    getScopeMemberSecretsStatus,
+    updateScopeMemberSecrets,
     getDecryptedScopeMemberSecrets,
-    getScopeSecretsStatusAs,
-    updateScopeSecretsAs,
+    getScopeSecretsStatus,
+    updateScopeSecrets,
     getDecryptedScopeSecrets
   };
 }

@@ -45,10 +45,8 @@ function assertValidFirestoreDocId(id: string | null | undefined, label: string)
 
 export interface FirestoreServerStoreConfig<TRole extends string = string> {
   db: Firestore;
-  /** Default role assigned if a stored document does not have a `role` field. */
+  /** Default role assigned if a stored document does not have a `roles` field. */
   defaultRole: TRole;
-  /** Optional custom role resolver for migrating legacy documents (e.g., `isCreator` flags). */
-  resolveRole?: (data: Record<string, any>) => TRole;
   /** Canonical users collection name (defaults to `"users"`). */
   usersCollection?: string;
   scopeCollection?: string;
@@ -66,7 +64,7 @@ export interface FirestoreServerStoreConfig<TRole extends string = string> {
  * Firebase Admin Firestore implementation of `LanyardServerStore`.
  *
  * Uses a single canonical `users/{uid}` collection for profile, presence, `isSystemAdmin`,
- * single-tenant `role`/`capabilities`, `preferences`, and `attributes`, plus isolated
+ * single-tenant `roles`, `preferences`, and `attributes`, plus isolated
  * `private/hiddenAttributes` and AES-256-GCM encrypted `private/secrets` subdocuments.
  */
 export class FirestoreServerStore<
@@ -79,7 +77,6 @@ export class FirestoreServerStore<
 > implements LanyardServerStore<TRole, TCapability, TPreferences, TAttributes, THiddenAttributes, TSecrets> {
   private readonly db: Firestore;
   private readonly defaultRole: TRole;
-  private readonly resolveRole?: (data: Record<string, any>) => TRole;
   private readonly usersCollection: string;
   private readonly scopeCollection: string;
   private readonly membersSubcollection: string;
@@ -88,7 +85,6 @@ export class FirestoreServerStore<
   constructor(config: FirestoreServerStoreConfig<TRole>) {
     this.db = config.db;
     this.defaultRole = config.defaultRole;
-    this.resolveRole = config.resolveRole;
     this.usersCollection = assertValidFirestoreDocId(config.usersCollection || "users", "usersCollection");
     this.scopeCollection = assertValidFirestoreDocId(config.scopeCollection || "workspaces", "scopeCollection");
     this.membersSubcollection = assertValidFirestoreDocId(
@@ -109,11 +105,11 @@ export class FirestoreServerStore<
     );
   }
 
-  private extractRole(data: Record<string, any>): TRole {
-    if (this.resolveRole) {
-      return this.resolveRole(data);
+  private extractRoles(data: Record<string, any>): TRole[] {
+    if (Array.isArray(data.roles) && data.roles.length > 0) {
+      return Array.from(new Set(data.roles as TRole[]));
     }
-    return (data.role as TRole) || this.defaultRole;
+    return [this.defaultRole];
   }
 
   private userDocRef(uid: string) {
@@ -221,8 +217,7 @@ export class FirestoreServerStore<
       ...(data.lastSeen !== undefined ? { lastSeen: data.lastSeen } : {}),
       ...(typeof data.isSystemAdmin === "boolean" ? { isSystemAdmin: data.isSystemAdmin } : {}),
       ...(data.addedBy !== undefined ? { addedBy: data.addedBy } : {}),
-      role: this.extractRole(data),
-      capabilities: Array.isArray(data.capabilities) ? data.capabilities : [],
+      roles: this.extractRoles(data),
       ...(data.preferences && typeof data.preferences === "object" && !Array.isArray(data.preferences)
         ? { preferences: sanitizeObjectPatch<TPreferences>(data.preferences) }
         : {}),
@@ -240,13 +235,31 @@ export class FirestoreServerStore<
     return this.parseUserRecord(snap.id, snap.data() || {});
   }
 
+  async listUsers(): Promise<UserRecord<TRole, TCapability, TPreferences, TAttributes>[]> {
+    const snap = await this.db.collection(this.usersCollection).get();
+    return snap.docs.map((doc) => this.parseUserRecord(doc.id, doc.data() || {}));
+  }
+
+  async deleteUser(uid: string): Promise<void> {
+    const cleanUid = assertValidFirestoreDocId(uid, "uid");
+    const userRef = this.userDocRef(cleanUid);
+    await Promise.all([
+      userRef.delete(),
+      this.userHiddenAttributesDocRef(cleanUid).delete(),
+      this.userSecretsDocRef(cleanUid).delete()
+    ]);
+    if (typeof (this.db as any).recursiveDelete === "function") {
+      await (this.db as any).recursiveDelete(userRef);
+    }
+  }
+
   async upsertUser(user: UserRecord<TRole, TCapability, TPreferences, TAttributes>): Promise<void> {
     const cleanUid = assertValidFirestoreDocId(user.uid, "uid");
     const payload = stripUndefinedFields({
       ...user,
       uid: cleanUid,
       ...(user.photoUrl !== undefined ? { photoUrl: sanitizeAvatarUrl(user.photoUrl) } : {}),
-      ...(user.capabilities !== undefined ? { capabilities: Array.from(new Set(user.capabilities)) } : {}),
+      ...(user.roles !== undefined ? { roles: Array.from(new Set(user.roles)) } : {}),
       ...(user.preferences !== undefined ? { preferences: sanitizeObjectPatch<TPreferences>(user.preferences) } : {}),
       ...(user.attributes !== undefined ? { attributes: sanitizeObjectPatch<TAttributes>(user.attributes) } : {})
     });
@@ -307,10 +320,10 @@ export class FirestoreServerStore<
     return this.writeEncryptedSecretsToRef(ref, patch);
   }
 
-  async grantUserCapabilities(
+  async grantUserRoles(
     uid: string,
-    capabilities: readonly TCapability[],
-    fallbackUser?: Omit<UserRecord<TRole, TCapability, TPreferences, TAttributes>, "capabilities">
+    roles: readonly TRole[],
+    fallbackUser?: Omit<UserRecord<TRole, TCapability, TPreferences, TAttributes>, "roles">
   ): Promise<UserRecord<TRole, TCapability, TPreferences, TAttributes>> {
     const cleanUid = assertValidFirestoreDocId(uid, "uid");
     const ref = this.userDocRef(cleanUid);
@@ -319,33 +332,33 @@ export class FirestoreServerStore<
       if (!fallbackUser) {
         throw new Error(`User '${cleanUid}' does not exist`);
       }
+      const initialRoles = roles.length > 0 ? Array.from(new Set(roles)) : [this.defaultRole];
       const created: UserRecord<TRole, TCapability, TPreferences, TAttributes> = {
         ...fallbackUser,
         ...(fallbackUser.photoUrl !== undefined ? { photoUrl: sanitizeAvatarUrl(fallbackUser.photoUrl) } : {}),
         uid: cleanUid,
-        role: fallbackUser.role ?? this.defaultRole,
-        capabilities: Array.from(new Set(capabilities))
+        roles: initialRoles
       };
       await ref.set(stripUndefinedFields(created), { merge: true });
       return created;
     }
 
-    if (capabilities.length > 0) {
+    if (roles.length > 0) {
       await ref.update({
-        capabilities: FieldValue.arrayUnion(...capabilities)
+        roles: FieldValue.arrayUnion(...roles)
       });
     }
     return (await this.getUser(cleanUid))!;
   }
 
-  async revokeUserCapabilities(uid: string, capabilities: readonly TCapability[]): Promise<void> {
-    if (capabilities.length === 0) return;
+  async revokeUserRoles(uid: string, roles: readonly TRole[]): Promise<void> {
+    if (roles.length === 0) return;
     const cleanUid = assertValidFirestoreDocId(uid, "uid");
     const ref = this.userDocRef(cleanUid);
     const snap = await ref.get();
     if (!snap.exists) return;
     await ref.update({
-      capabilities: FieldValue.arrayRemove(...capabilities)
+      roles: FieldValue.arrayRemove(...roles)
     });
   }
 
@@ -431,8 +444,7 @@ export class FirestoreServerStore<
       ...(data.lastName !== undefined ? { lastName: data.lastName } : {}),
       ...(data.displayName !== undefined ? { displayName: data.displayName } : {}),
       photoUrl: sanitizeAvatarUrl(data.photoUrl),
-      role: this.extractRole(data),
-      capabilities: Array.isArray(data.capabilities) ? data.capabilities : [],
+      roles: this.extractRoles(data),
       scopeId: cleanScopeId,
       ...(data.scopeName !== undefined ? { scopeName: data.scopeName } : {}),
       ...(data.lastSeen !== undefined ? { lastSeen: data.lastSeen } : {}),
@@ -472,7 +484,7 @@ export class FirestoreServerStore<
       ...(member.photoUrl !== undefined ? { photoUrl: sanitizeAvatarUrl(member.photoUrl) } : {}),
       uid: cleanUid,
       scopeId: cleanScopeId,
-      capabilities: Array.from(new Set(member.capabilities || [])),
+      roles: Array.from(new Set(member.roles || [])),
       ...(member.preferences !== undefined
         ? { preferences: sanitizeObjectPatch<TPreferences>(member.preferences) }
         : {}),
@@ -563,11 +575,11 @@ export class FirestoreServerStore<
     return this.writeEncryptedSecretsToRef(ref, patch);
   }
 
-  async grantScopeCapabilities(
+  async grantScopeRoles(
     scopeId: string,
     uid: string,
-    capabilities: readonly TCapability[],
-    fallbackMember?: Omit<ScopedMember<TRole, TCapability, TPreferences, TAttributes>, "capabilities">
+    roles: readonly TRole[],
+    fallbackMember?: Omit<ScopedMember<TRole, TCapability, TPreferences, TAttributes>, "roles">
   ): Promise<ScopedMember<TRole, TCapability, TPreferences, TAttributes>> {
     const ref = this.memberDocRef(scopeId, uid);
     const snap = await ref.get();
@@ -575,32 +587,33 @@ export class FirestoreServerStore<
       if (!fallbackMember) {
         throw new Error(`Member '${uid}' does not exist in scope '${scopeId}'`);
       }
+      const initialRoles = roles.length > 0 ? Array.from(new Set(roles)) : [this.defaultRole];
       const created: ScopedMember<TRole, TCapability, TPreferences, TAttributes> = {
         ...fallbackMember,
         ...(fallbackMember.photoUrl !== undefined ? { photoUrl: sanitizeAvatarUrl(fallbackMember.photoUrl) } : {}),
         uid,
         scopeId,
-        capabilities: Array.from(new Set(capabilities))
+        roles: initialRoles
       };
       await ref.set(stripUndefinedFields(created), { merge: true });
       return created;
     }
 
-    if (capabilities.length > 0) {
+    if (roles.length > 0) {
       await ref.update({
-        capabilities: FieldValue.arrayUnion(...capabilities)
+        roles: FieldValue.arrayUnion(...roles)
       });
     }
     return (await this.getScopeMember(scopeId, uid))!;
   }
 
-  async revokeScopeCapabilities(scopeId: string, uid: string, capabilities: readonly TCapability[]): Promise<void> {
-    if (capabilities.length === 0) return;
+  async revokeScopeRoles(scopeId: string, uid: string, roles: readonly TRole[]): Promise<void> {
+    if (roles.length === 0) return;
     const ref = this.memberDocRef(scopeId, uid);
     const snap = await ref.get();
     if (!snap.exists) return;
     await ref.update({
-      capabilities: FieldValue.arrayRemove(...capabilities)
+      roles: FieldValue.arrayRemove(...roles)
     });
   }
 

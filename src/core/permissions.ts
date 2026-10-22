@@ -17,6 +17,10 @@ interface NormalizedFieldRule<TCapability extends string> {
   write?: TCapability;
 }
 
+interface NormalizedUserRule<TCapability extends string> extends NormalizedFieldRule<TCapability> {
+  assignRoles?: TCapability;
+}
+
 interface NormalizedSecretRule<TCapability extends string> {
   write?: TCapability;
   allowSelfWrite?: boolean;
@@ -24,8 +28,9 @@ interface NormalizedSecretRule<TCapability extends string> {
 
 /**
  * Creates a reusable `PermissionPolicy<TRole, TCapability>` that defines an application's
- * role hierarchy (`weight`), explicit role inheritance (`inherits`), role-implied capabilities (`capabilities`),
- * role-level presence heartbeat tracking (`trackPresence`), and field-level `attributes` / `secrets` rules.
+ * explicit role inheritance (`inherits`), role-implied capabilities (`capabilities`),
+ * role-level presence heartbeat tracking (`trackPresence`), user access (`userCapabilities`),
+ * and field-level `attributes` / `secrets` rules.
  */
 export function createPermissionPolicy<TRole extends string = string, TCapability extends string = string>(
   config: PermissionPolicyConfig<TRole, TCapability>
@@ -40,14 +45,12 @@ export function createPermissionPolicy<TRole extends string = string, TCapabilit
   }
 
   const rawRoles = Object.create(null) as Record<TRole, RoleDefinition<TRole, TCapability>>;
-  const roleWeights = Object.create(null) as Record<TRole, number>;
 
   for (const [role, def] of entries) {
-    if (!def || typeof def.weight !== "number" || Number.isNaN(def.weight)) {
-      throw new Error(`Invalid weight for role '${role}'.`);
+    if (!def || typeof def !== "object") {
+      throw new Error(`Invalid definition for role '${role}'.`);
     }
     rawRoles[role] = def;
-    roleWeights[role] = def.weight;
   }
 
   // Validate explicit `inherits` references and compute transitive closure with cycle detection (DFS)
@@ -129,14 +132,51 @@ export function createPermissionPolicy<TRole extends string = string, TCapabilit
   const roles = Object.create(null) as Record<TRole, Readonly<RoleDefinition<TRole, TCapability>>>;
   for (const [role, def] of entries) {
     roles[role] = Object.freeze({
-      weight: def.weight,
       ...(def.inherits !== undefined ? { inherits: Object.freeze([...def.inherits]) } : {}),
       ...(resolvedCapabilities[role] !== undefined ? { capabilities: resolvedCapabilities[role] } : {}),
-      trackPresence: resolvedTrackPresence[role]
+      trackPresence: resolvedTrackPresence[role],
+      ...(def.abstract !== undefined ? { abstract: Boolean(def.abstract) } : {})
     });
   }
 
-  // Normalize attributeCapabilities, hiddenAttributeCapabilities & secretCapabilities
+  const assignableEntries = entries.filter(([, def]) => !def.abstract);
+  if (assignableEntries.length === 0) {
+    throw new Error("PermissionPolicyConfig requires at least one concrete (non-abstract) role in roles.");
+  }
+  const assignableRoles = Object.freeze(assignableEntries.map(([r]) => r));
+
+  if (
+    config.defaultRole !== undefined &&
+    Object.hasOwn(roles, config.defaultRole) &&
+    roles[config.defaultRole].abstract
+  ) {
+    throw new Error(`Invalid defaultRole '${config.defaultRole}': abstract roles cannot be used as defaultRole.`);
+  }
+
+  // Normalize userCapabilities, attributeCapabilities, hiddenAttributeCapabilities & secretCapabilities
+  let userRule: NormalizedUserRule<TCapability> = Object.freeze({});
+  if (config.userCapabilities) {
+    if (typeof config.userCapabilities === "string" && isSafeKey(config.userCapabilities)) {
+      userRule = Object.freeze({
+        read: config.userCapabilities as TCapability,
+        write: config.userCapabilities as TCapability,
+        assignRoles: config.userCapabilities as TCapability
+      });
+    } else if (typeof config.userCapabilities === "object" && !Array.isArray(config.userCapabilities)) {
+      userRule = Object.freeze({
+        ...(config.userCapabilities.read && isSafeKey(config.userCapabilities.read)
+          ? { read: config.userCapabilities.read }
+          : {}),
+        ...(config.userCapabilities.write && isSafeKey(config.userCapabilities.write)
+          ? { write: config.userCapabilities.write }
+          : {}),
+        ...(config.userCapabilities.assignRoles && isSafeKey(config.userCapabilities.assignRoles)
+          ? { assignRoles: config.userCapabilities.assignRoles }
+          : {})
+      });
+    }
+  }
+
   const attrRules = Object.create(null) as Record<string, NormalizedFieldRule<TCapability>>;
   if (config.attributeCapabilities && typeof config.attributeCapabilities === "object") {
     for (const [key, rule] of Object.entries(config.attributeCapabilities)) {
@@ -185,42 +225,55 @@ export function createPermissionPolicy<TRole extends string = string, TCapabilit
   }
 
   Object.freeze(roles);
-  Object.freeze(roleWeights);
   Object.freeze(resolvedCapabilities);
   Object.freeze(roleInherits);
 
-  const usesExplicitInheritance = entries.some(([, def]) => Array.isArray(def.inherits) && def.inherits.length > 0);
-
-  // Default to explicit config.defaultRole or the lowest-weighted role
-  const lowestRole = entries.reduce((min, cur) => (cur[1].weight < min[1].weight ? cur : min))[0];
+  // Default to explicit config.defaultRole or the first concrete root role (or first concrete role)
+  const rootConcreteRole =
+    assignableEntries.find(([, def]) => !Array.isArray(def.inherits) || def.inherits.length === 0)?.[0] ??
+    assignableEntries[0][0];
   const defaultRole: TRole =
-    config.defaultRole && Object.hasOwn(roles, config.defaultRole) ? config.defaultRole : lowestRole;
+    config.defaultRole && Object.hasOwn(roles, config.defaultRole) ? config.defaultRole : rootConcreteRole;
 
-  function inheritsRole(
-    member: PolicySubject<TRole, TCapability> | null | undefined,
-    targetRole: TRole,
-    isSystemAdmin = false
-  ): boolean {
-    if (isSystemAdmin) return true;
-    if (!member || typeof member.role !== "string" || typeof targetRole !== "string") return false;
-    if (!Object.hasOwn(roles, member.role) || !Object.hasOwn(roles, targetRole)) return false;
-    if (member.role === targetRole) return true;
-    return roleInherits[member.role].includes(targetRole);
+  function isAssignableRole(role: TRole): boolean {
+    if (typeof role !== "string" || !Object.hasOwn(roles, role)) return false;
+    return !roles[role].abstract;
   }
 
-  function hasMinimumRole(
+  function hasRole(
     member: PolicySubject<TRole, TCapability> | null | undefined,
-    minimumRole: TRole,
+    requiredRole: TRole,
     isSystemAdmin = false
   ): boolean {
     if (isSystemAdmin) return true;
-    if (!member || typeof member.role !== "string" || typeof minimumRole !== "string") return false;
-    if (!Object.hasOwn(roleWeights, member.role) || !Object.hasOwn(roleWeights, minimumRole)) return false;
-    if (inheritsRole(member, minimumRole, false)) return true;
-    if (usesExplicitInheritance) return false;
-    const userWeight = roleWeights[member.role];
-    const requiredWeight = roleWeights[minimumRole];
-    return userWeight > requiredWeight;
+    if (!member || !Array.isArray(member.roles) || typeof requiredRole !== "string") return false;
+    if (!Object.hasOwn(roles, requiredRole)) return false;
+    return member.roles.some(
+      (role: TRole) =>
+        typeof role === "string" &&
+        Object.hasOwn(roles, role) &&
+        (role === requiredRole || roleInherits[role as TRole].includes(requiredRole))
+    );
+  }
+
+  function hasAnyRole(
+    member: PolicySubject<TRole, TCapability> | null | undefined,
+    requiredRoles: readonly TRole[],
+    isSystemAdmin = false
+  ): boolean {
+    if (isSystemAdmin) return true;
+    if (!member || !Array.isArray(requiredRoles) || requiredRoles.length === 0) return false;
+    return requiredRoles.some((req) => hasRole(member, req, false));
+  }
+
+  function hasAllRoles(
+    member: PolicySubject<TRole, TCapability> | null | undefined,
+    requiredRoles: readonly TRole[],
+    isSystemAdmin = false
+  ): boolean {
+    if (isSystemAdmin) return true;
+    if (!member || !Array.isArray(requiredRoles)) return false;
+    return requiredRoles.every((req) => hasRole(member, req, false));
   }
 
   function roleImpliesCapability(role: TRole, capability: TCapability): boolean {
@@ -237,11 +290,8 @@ export function createPermissionPolicy<TRole extends string = string, TCapabilit
     isSystemAdmin = false
   ): boolean {
     if (isSystemAdmin) return true;
-    if (!member || !isSafeKey(capability)) return false;
-    if (member.role && roleImpliesCapability(member.role, capability)) {
-      return true;
-    }
-    return Array.isArray(member.capabilities) && member.capabilities.includes(capability);
+    if (!member || !isSafeKey(capability) || !Array.isArray(member.roles)) return false;
+    return member.roles.some((role) => roleImpliesCapability(role, capability));
   }
 
   function hasAnyCapability(
@@ -269,8 +319,34 @@ export function createPermissionPolicy<TRole extends string = string, TCapabilit
     isSystemAdmin = false
   ): boolean {
     if (isSystemAdmin) return true;
-    if (!member || typeof member.role !== "string" || !Object.hasOwn(roles, member.role)) return false;
-    return Boolean(roles[member.role]?.trackPresence);
+    if (!member || typeof member !== "object") return false;
+    const effectiveRoles = member.roles === undefined ? [defaultRole] : Array.isArray(member.roles) ? member.roles : [];
+    return effectiveRoles.some(
+      (role: TRole) =>
+        typeof role === "string" && Object.hasOwn(roles, role) && Boolean(roles[role as TRole]?.trackPresence)
+    );
+  }
+
+  function canReadUser(
+    actor: PolicySubject<TRole, TCapability> | null | undefined,
+    options: { isSystemAdmin?: boolean; isSelf?: boolean } = {}
+  ): boolean {
+    const { isSystemAdmin = false, isSelf = false } = options;
+    if (isSystemAdmin || isSelf) return true;
+    if (!userRule.read) return false;
+    return hasCapability(actor, userRule.read, false);
+  }
+
+  function canWriteUser(actor: PolicySubject<TRole, TCapability> | null | undefined, isSystemAdmin = false): boolean {
+    if (isSystemAdmin) return true;
+    if (!userRule.write) return false;
+    return hasCapability(actor, userRule.write, false);
+  }
+
+  function canAssignRoles(actor: PolicySubject<TRole, TCapability> | null | undefined, isSystemAdmin = false): boolean {
+    if (isSystemAdmin) return true;
+    if (!userRule.assignRoles) return false;
+    return hasCapability(actor, userRule.assignRoles, false);
   }
 
   function canReadAttribute(
@@ -425,16 +501,21 @@ export function createPermissionPolicy<TRole extends string = string, TCapabilit
 
   return Object.freeze({
     roles,
-    roleWeights,
     roleCapabilities: resolvedCapabilities,
     roleInherits,
+    assignableRoles,
     defaultRole,
-    hasMinimumRole,
-    inheritsRole,
+    isAssignableRole,
+    hasRole,
+    hasAnyRole,
+    hasAllRoles,
     hasCapability,
     hasAnyCapability,
     hasAllCapabilities,
     shouldTrackPresence,
+    canReadUser,
+    canWriteUser,
+    canAssignRoles,
     canReadAttribute,
     canWriteAttribute,
     canWriteAttributesPatch,

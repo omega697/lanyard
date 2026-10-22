@@ -11,11 +11,6 @@ export type SocialProviderType = "google" | "microsoft" | "github";
  */
 export interface RoleDefinition<TRole extends string = string, TCapability extends string = string> {
   /**
-   * Numeric weight for hierarchical role comparisons (`hasMinimumRole`).
-   * Higher numbers outrank lower numbers (e.g., `owner: 30, coordinator: 20, member: 10`).
-   */
-  weight: number;
-  /**
    * Optional list of roles whose capabilities (and `trackPresence`, unless explicitly overridden)
    * this role explicitly inherits. Supports directed acyclic graphs (e.g. sibling roles).
    */
@@ -24,8 +19,7 @@ export interface RoleDefinition<TRole extends string = string, TCapability exten
    * Capabilities automatically granted to any member holding this role:
    * - `"*"` grants all capabilities in `TCapability`.
    * - `readonly TCapability[]` grants a specific subset of capabilities (e.g. `["edit_content", "invite_members"]`).
-   * - Omitting or passing `[]` means the role only holds capabilities inherited via `inherits`
-   *   or explicitly listed on `member.capabilities`.
+   * - Omitting or passing `[]` means the role only holds capabilities inherited via `inherits`.
    */
   capabilities?: readonly TCapability[] | "*";
   /**
@@ -34,7 +28,26 @@ export interface RoleDefinition<TRole extends string = string, TCapability exten
    * (Global system admins always emit presence heartbeats.)
    */
   trackPresence?: boolean;
+  /**
+   * If `true`, this role is an abstract grouping of capabilities/inheritance only:
+   * - It is excluded from `policy.assignableRoles` (so it does not appear in UI role pickers).
+   * - It cannot be used as `defaultRole` or directly assigned to a user/member.
+   * - Concrete roles that inherit from it still inherit all of its capabilities and satisfy `hasRole(user, abstractRole)`.
+   */
+  abstract?: boolean;
 }
+
+/**
+ * Specifies the required capabilities for reading, updating/deleting, or assigning roles on user records.
+ * If a string `TCapability` is passed directly, it gates `read`, `write`, and `assignRoles`.
+ */
+export type UserCapabilitiesRule<TCapability extends string = string> =
+  | TCapability
+  | {
+      read?: TCapability;
+      write?: TCapability;
+      assignRoles?: TCapability;
+    };
 
 /**
  * Specifies the required capability for reading and/or writing a specific `attributes` or `hiddenAttributes` field.
@@ -86,15 +99,20 @@ export interface SecretCipher {
  */
 export interface PermissionPolicyConfig<TRole extends string = string, TCapability extends string = string> {
   /**
-   * Map of every role in `TRole` to its `RoleDefinition` (weight, inherited roles, implied capabilities, and presence tracking).
+   * Map of every role in `TRole` to its `RoleDefinition` (inherited roles, implied capabilities, and presence tracking).
    */
   roles: Record<TRole, RoleDefinition<TRole, TCapability>>;
   /**
    * Default role assigned when provisioning a member without an explicit role
    * (e.g., via `grantScopeCapabilitiesByEmail` or when reading a document missing a `role` field).
-   * If omitted, defaults to the role with the lowest numeric weight in `roles`.
+   * If omitted, defaults to the first root role (a role that does not inherit from any other role).
    */
   defaultRole?: TRole;
+  /**
+   * Optional capability rule governing who can read, write (update profile/delete), or assign roles (`assignRoles`)
+   * on other users' records (beyond global system admins). `self` can always read and update their own profile/account.
+   */
+  userCapabilities?: UserCapabilitiesRule<TCapability>;
   /**
    * Optional capability rules governing who can read or write specific keys in `attributes`
    * (beyond global system admins). `self` can always read their own `attributes`.
@@ -116,46 +134,59 @@ export interface PermissionPolicyConfig<TRole extends string = string, TCapabili
 /**
  * Minimal subject shape accepted by `PermissionPolicy` evaluation methods
  * (satisfied by both `ScopedMember` and `UserRecord`).
+ * Users/members hold one or more roles (`roles`), and all capabilities are derived from those roles.
  */
-export interface PolicySubject<TRole extends string = string, TCapability extends string = string> {
-  role?: TRole;
-  capabilities?: readonly TCapability[];
+export interface PolicySubject<TRole extends string = string, _TCapability extends string = string> {
+  roles?: readonly TRole[];
 }
 
 /**
- * Evaluates hierarchical roles, explicit role inheritance (`inherits`), capabilities,
- * presence tracking, and field-level `attributes` / `secrets` access control.
+ * Evaluates explicit role inheritance (`inherits`), role-derived capabilities,
+ * presence tracking, user record access, and field-level `attributes` / `secrets` access control.
  */
 export interface PermissionPolicy<TRole extends string = string, TCapability extends string = string> {
   readonly roles: Readonly<Record<TRole, Readonly<RoleDefinition<TRole, TCapability>>>>;
-  readonly roleWeights: Readonly<Record<TRole, number>>;
   readonly roleCapabilities: Readonly<Partial<Record<TRole, readonly TCapability[] | "*">>>;
   readonly roleInherits: Readonly<Record<TRole, readonly TRole[]>>;
+  readonly assignableRoles: readonly TRole[];
   readonly defaultRole: TRole;
 
   /**
-   * Evaluates whether a member/user (or global system admin) meets or exceeds the required `minimumRole`
-   * (either via explicit `inherits` or numeric `weight`).
+   * Returns `true` if `role` is defined in `policy.roles` and is concrete (`!roleDef.abstract`).
    */
-  hasMinimumRole(
+  isAssignableRole(role: TRole): boolean;
+
+  /**
+   * Evaluates whether a member/user (or global system admin) holds `requiredRole`
+   * directly in `member.roles` or transitively via `inherits`.
+   */
+  hasRole(
     member: PolicySubject<TRole, TCapability> | null | undefined,
-    minimumRole: TRole,
+    requiredRole: TRole,
     isSystemAdmin?: boolean
   ): boolean;
 
   /**
-   * Evaluates whether `member.role` is `targetRole` or explicitly inherits from `targetRole` via `inherits`.
+   * Evaluates whether a member/user holds at least one of the specified roles (directly or via `inherits`).
    */
-  inheritsRole(
+  hasAnyRole(
     member: PolicySubject<TRole, TCapability> | null | undefined,
-    targetRole: TRole,
+    requiredRoles: readonly TRole[],
     isSystemAdmin?: boolean
   ): boolean;
 
   /**
-   * Evaluates whether a member/user holds a specific capability—either implied by their `role`
-   * (including inherited roles) or explicitly listed in `member.capabilities`.
-   * Global system admins always return `true`.
+   * Evaluates whether a member/user holds all of the specified roles (directly or via `inherits`).
+   */
+  hasAllRoles(
+    member: PolicySubject<TRole, TCapability> | null | undefined,
+    requiredRoles: readonly TRole[],
+    isSystemAdmin?: boolean
+  ): boolean;
+
+  /**
+   * Evaluates whether a member/user holds a specific capability implied by any of their `roles`
+   * (including inherited roles). Global system admins always return `true`.
    */
   hasCapability(
     member: PolicySubject<TRole, TCapability> | null | undefined,
@@ -185,6 +216,28 @@ export interface PermissionPolicy<TRole extends string = string, TCapability ext
    * Evaluates whether presence heartbeats should be tracked for the given member/user or system admin.
    */
   shouldTrackPresence(member: PolicySubject<TRole, TCapability> | null | undefined, isSystemAdmin?: boolean): boolean;
+
+  /**
+   * Evaluates whether the caller can read a user/member record.
+   * Returns `true` if `isSelf = true`, `isSystemAdmin = true`, or the caller holds the `read` capability
+   * configured in `userCapabilities`.
+   */
+  canReadUser(
+    actor: PolicySubject<TRole, TCapability> | null | undefined,
+    options?: { isSystemAdmin?: boolean; isSelf?: boolean }
+  ): boolean;
+
+  /**
+   * Evaluates whether the caller can write (update profile or delete) another user/member record.
+   * Returns `true` if `isSystemAdmin = true` or the caller holds the `write` capability configured in `userCapabilities`.
+   */
+  canWriteUser(actor: PolicySubject<TRole, TCapability> | null | undefined, isSystemAdmin?: boolean): boolean;
+
+  /**
+   * Evaluates whether the caller can assign or modify roles on a user/member record.
+   * Returns `true` if `isSystemAdmin = true` or the caller holds the `assignRoles` capability configured in `userCapabilities`.
+   */
+  canAssignRoles(actor: PolicySubject<TRole, TCapability> | null | undefined, isSystemAdmin?: boolean): boolean;
 
   /**
    * Evaluates whether the caller can read a specific `attributes` key.
@@ -313,6 +366,7 @@ export interface LanyardUser {
  * Self-editable profile fields on a `UserRecord` (`users/{uid}`).
  */
 export interface UserProfilePatch {
+  email?: string;
   firstName?: string;
   lastName?: string;
   displayName?: string;
@@ -330,7 +384,7 @@ export interface UserProfilePatch {
  */
 export interface UserRecord<
   TRole extends string = string,
-  TCapability extends string = string,
+  _TCapability extends string = string,
   TPreferences extends Record<string, any> = Record<string, any>,
   TAttributes extends Record<string, any> = Record<string, any>
 > {
@@ -346,10 +400,8 @@ export interface UserRecord<
   isSystemAdmin?: boolean;
   /** UID or identifier of the administrator who promoted this user. */
   addedBy?: string;
-  /** Optional single-tenant role for applications that assign roles at the global user level. */
-  role?: TRole;
-  /** Optional single-tenant capabilities explicitly granted to this user at the global level. */
-  capabilities?: TCapability[];
+  /** Single-tenant roles assigned to this user at the global level (capabilities are derived from these roles). */
+  roles?: TRole[];
   /** User-writable custom properties (`preferences`). */
   preferences?: Partial<TPreferences>;
   /** System/Admin/Role-writable custom properties (`attributes`), readable by the user. */
@@ -382,12 +434,12 @@ export interface SystemAdminProfile {
 /**
  * Membership record for a user within a specific tenant/scope (e.g., `workspaces/{scopeId}/members/{uid}`).
  *
- * Combines a hierarchical `role` (`TRole`) with an array of orthogonal `capabilities` (`TCapability[]`),
+ * Assigns one or more `roles` (`TRole[]`) within the scope (from which all capabilities are derived),
  * plus optional tenant-scoped user-writable `preferences` and role/admin-writable `attributes`.
  */
 export interface ScopedMember<
   TRole extends string = string,
-  TCapability extends string = string,
+  _TCapability extends string = string,
   TPreferences extends Record<string, any> = Record<string, any>,
   TAttributes extends Record<string, any> = Record<string, any>
 > {
@@ -397,10 +449,8 @@ export interface ScopedMember<
   lastName?: string;
   displayName?: string;
   photoUrl?: string | null;
-  /** Hierarchical role tier within this scope. */
-  role: TRole;
-  /** Orthogonal capabilities explicitly granted to this user within this scope. */
-  capabilities: TCapability[];
+  /** Assigned roles within this scope (capabilities are derived from these roles). */
+  roles: TRole[];
   /** Identifier of the parent scope/workspace (e.g., `workspaceId`). */
   scopeId?: string;
   /** Human-readable name of the parent scope/workspace. */
@@ -508,7 +558,9 @@ export interface LanyardServerStore<
 > {
   // --- Global User (`users/{uid}`) & System Admin Operations ---
   getUser?(uid: string): Promise<UserRecord<TRole, TCapability, TPreferences, TAttributes> | null>;
+  listUsers?(): Promise<UserRecord<TRole, TCapability, TPreferences, TAttributes>[]>;
   upsertUser?(user: UserRecord<TRole, TCapability, TPreferences, TAttributes>): Promise<void>;
+  deleteUser?(uid: string): Promise<void>;
   updateUserAttributes?(
     uid: string,
     patch: Partial<TAttributes>
@@ -533,18 +585,18 @@ export interface LanyardServerStore<
     patch: Partial<Record<keyof TSecrets & string, string | null | undefined>>
   ): Promise<Partial<Record<keyof TSecrets & string, boolean>>>;
   /**
-   * Optional: Additively grants `capabilities` to global `users/{uid}` without clobbering existing capabilities.
+   * Optional: Additively grants `roles` to global `users/{uid}` without clobbering existing roles.
    * If the user does not yet exist, initializes the record using `fallbackUser`.
    */
-  grantUserCapabilities?(
+  grantUserRoles?(
     uid: string,
-    capabilities: readonly TCapability[],
-    fallbackUser?: Omit<UserRecord<TRole, TCapability, TPreferences, TAttributes>, "capabilities">
+    roles: readonly TRole[],
+    fallbackUser?: Omit<UserRecord<TRole, TCapability, TPreferences, TAttributes>, "roles">
   ): Promise<UserRecord<TRole, TCapability, TPreferences, TAttributes>>;
   /**
-   * Optional: Removes the specified `capabilities` from global `users/{uid}` while preserving all other capabilities.
+   * Optional: Removes the specified `roles` from global `users/{uid}` while preserving all other roles.
    */
-  revokeUserCapabilities?(uid: string, capabilities: readonly TCapability[]): Promise<void>;
+  revokeUserRoles?(uid: string, roles: readonly TRole[]): Promise<void>;
 
   getSystemAdmin(uid: string): Promise<SystemAdminProfile | null>;
   listSystemAdmins(): Promise<SystemAdminProfile[]>;
@@ -610,18 +662,18 @@ export interface LanyardServerStore<
     patch: Partial<Record<keyof TSecrets & string, string | null | undefined>>
   ): Promise<Partial<Record<keyof TSecrets & string, boolean>>>;
   /**
-   * Additively grants `capabilities` to `(scopeId, uid)` without clobbering existing capabilities.
+   * Additively grants `roles` to `(scopeId, uid)` without clobbering existing roles.
    * If the member does not yet exist in `scopeId`, initializes the record using `fallbackMember`.
    */
-  grantScopeCapabilities(
+  grantScopeRoles(
     scopeId: string,
     uid: string,
-    capabilities: readonly TCapability[],
-    fallbackMember?: Omit<ScopedMember<TRole, TCapability, TPreferences, TAttributes>, "capabilities">
+    roles: readonly TRole[],
+    fallbackMember?: Omit<ScopedMember<TRole, TCapability, TPreferences, TAttributes>, "roles">
   ): Promise<ScopedMember<TRole, TCapability, TPreferences, TAttributes>>;
   /**
-   * Removes the specified `capabilities` from `(scopeId, uid)` while preserving all other capabilities.
+   * Removes the specified `roles` from `(scopeId, uid)` while preserving all other roles.
    */
-  revokeScopeCapabilities(scopeId: string, uid: string, capabilities: readonly TCapability[]): Promise<void>;
+  revokeScopeRoles(scopeId: string, uid: string, roles: readonly TRole[]): Promise<void>;
   deleteScopeMember(scopeId: string, uid: string): Promise<void>;
 }

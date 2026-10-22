@@ -25,17 +25,16 @@ type TestCapability = "edit_content" | "invite_members" | "billing";
 const TEST_POLICY = createPermissionPolicy<TestRole, TestCapability>({
   roles: {
     owner: {
-      weight: 30,
+      inherits: ["manager"],
       capabilities: "*",
       trackPresence: true
     },
     manager: {
-      weight: 20,
+      inherits: ["member"],
       capabilities: ["edit_content", "invite_members"],
       trackPresence: true
     },
     member: {
-      weight: 10,
       capabilities: [],
       trackPresence: false
     }
@@ -44,79 +43,82 @@ const TEST_POLICY = createPermissionPolicy<TestRole, TestCapability>({
 
 describe("lanyard/core unit tests", () => {
   describe("Custom PermissionPolicy (Generic TRole & TCapability)", () => {
-    it("throws if roles configuration is empty and respects explicit or lowest-weighted defaultRole", () => {
+    it("throws if roles configuration is empty and respects explicit or root defaultRole", () => {
       expect(() => createPermissionPolicy({ roles: {} as any })).toThrow(/at least one role/);
       expect(TEST_POLICY.defaultRole).toBe("member");
 
       const explicitDefault = createPermissionPolicy<TestRole, TestCapability>({
         roles: {
-          owner: { weight: 30 },
-          manager: { weight: 20 },
-          member: { weight: 10 }
+          owner: { inherits: ["manager"] },
+          manager: { inherits: ["member"] },
+          member: {}
         },
         defaultRole: "manager"
       });
       expect(explicitDefault.defaultRole).toBe("manager");
     });
 
-    it("evaluates custom role hierarchies and edge cases via policy.hasMinimumRole", () => {
+    it("evaluates custom role hierarchies and edge cases via policy.hasRole, hasAnyRole, and hasAllRoles", () => {
       const owner: ScopedMember<TestRole, TestCapability> = {
         uid: "u1",
         email: "owner@example.com",
-        role: "owner",
-        capabilities: []
+        roles: ["owner"]
       };
       const manager: ScopedMember<TestRole, TestCapability> = {
         uid: "u2",
         email: "manager@example.com",
-        role: "manager",
-        capabilities: []
+        roles: ["manager"]
       };
       const member: ScopedMember<TestRole, TestCapability> = {
         uid: "u3",
         email: "member@example.com",
-        role: "member",
-        capabilities: ["edit_content"]
+        roles: ["member"]
       };
       const unknownRoleMember = {
         uid: "u4",
         email: "unknown@example.com",
-        role: "guest" as TestRole,
-        capabilities: []
+        roles: ["guest" as TestRole]
       };
 
-      expect(TEST_POLICY.hasMinimumRole(owner, "owner")).toBe(true);
-      expect(TEST_POLICY.hasMinimumRole(owner, "manager")).toBe(true);
-      expect(TEST_POLICY.hasMinimumRole(manager, "owner")).toBe(false);
-      expect(TEST_POLICY.hasMinimumRole(manager, "manager")).toBe(true);
-      expect(TEST_POLICY.hasMinimumRole(manager, "member")).toBe(true);
-      expect(TEST_POLICY.hasMinimumRole(member, "manager")).toBe(false);
-      expect(TEST_POLICY.hasMinimumRole(member, "member")).toBe(true);
-      expect(TEST_POLICY.hasMinimumRole(unknownRoleMember, "member")).toBe(false);
-      expect(TEST_POLICY.hasMinimumRole(member, "unknown" as TestRole)).toBe(false);
-      expect(TEST_POLICY.hasMinimumRole(null, "member")).toBe(false);
-      expect(TEST_POLICY.hasMinimumRole(undefined, "member")).toBe(false);
-      expect(TEST_POLICY.hasMinimumRole(null, "owner", true)).toBe(true); // System Admin override
+      expect(TEST_POLICY.hasRole(owner, "owner")).toBe(true);
+      expect(TEST_POLICY.hasRole(owner, "manager")).toBe(true);
+      expect(TEST_POLICY.hasRole(owner, "member")).toBe(true);
+      expect(TEST_POLICY.hasRole(manager, "owner")).toBe(false);
+      expect(TEST_POLICY.hasRole(manager, "manager")).toBe(true);
+      expect(TEST_POLICY.hasRole(manager, "member")).toBe(true);
+      expect(TEST_POLICY.hasRole(member, "manager")).toBe(false);
+      expect(TEST_POLICY.hasRole(member, "member")).toBe(true);
+      expect(TEST_POLICY.hasRole(unknownRoleMember, "member")).toBe(false);
+      expect(TEST_POLICY.hasRole(member, "unknown" as TestRole)).toBe(false);
+      expect(TEST_POLICY.hasRole(null, "member")).toBe(false);
+      expect(TEST_POLICY.hasRole(undefined, "member")).toBe(false);
+      expect(TEST_POLICY.hasRole(null, "owner", true)).toBe(true); // System Admin override
+
+      expect(TEST_POLICY.hasAnyRole(manager, ["owner", "manager"])).toBe(true);
+      expect(TEST_POLICY.hasAnyRole(member, ["owner", "manager"])).toBe(false);
+      expect(TEST_POLICY.hasAnyRole(manager, [])).toBe(false);
+      expect(TEST_POLICY.hasAnyRole(null, ["member"], true)).toBe(true);
+
+      expect(TEST_POLICY.hasAllRoles(owner, ["owner", "manager", "member"])).toBe(true);
+      expect(TEST_POLICY.hasAllRoles(manager, ["owner", "manager"])).toBe(false);
+      expect(TEST_POLICY.hasAllRoles(null, ["member"], true)).toBe(true);
     });
 
-    it("evaluates role-implied capabilities (e.g. all managers have invite_members) and explicit capabilities", () => {
+    it("evaluates role-implied capabilities across single and multiple roles", () => {
       const owner: ScopedMember<TestRole, TestCapability> = {
         uid: "u-owner",
         email: "owner@example.com",
-        role: "owner",
-        capabilities: []
+        roles: ["owner"]
       };
       const manager: ScopedMember<TestRole, TestCapability> = {
         uid: "u-mgr",
         email: "manager@example.com",
-        role: "manager",
-        capabilities: []
+        roles: ["manager"]
       };
       const multiMember: ScopedMember<TestRole, TestCapability> = {
         uid: "u-mem",
         email: "member@example.com",
-        role: "member",
-        capabilities: ["edit_content", "invite_members"]
+        roles: ["member", "manager"]
       };
 
       // Owner has "*" -> implies all capabilities including "billing"
@@ -124,12 +126,12 @@ describe("lanyard/core unit tests", () => {
       expect(TEST_POLICY.hasCapability(owner, "invite_members")).toBe(true);
       expect(TEST_POLICY.hasCapability(owner, "billing")).toBe(true);
 
-      // Manager has ["edit_content", "invite_members"] implied by role, but NOT "billing" unless explicitly added
+      // Manager has ["edit_content", "invite_members"] implied by role, but NOT "billing"
       expect(TEST_POLICY.hasCapability(manager, "edit_content")).toBe(true);
       expect(TEST_POLICY.hasCapability(manager, "invite_members")).toBe(true);
       expect(TEST_POLICY.hasCapability(manager, "billing")).toBe(false);
 
-      // Member has no role-implied capabilities, only explicit member.capabilities
+      // Member holding both ["member", "manager"] gets capabilities from the union of their roles
       expect(TEST_POLICY.hasCapability(multiMember, "edit_content")).toBe(true);
       expect(TEST_POLICY.hasCapability(multiMember, "invite_members")).toBe(true);
       expect(TEST_POLICY.hasCapability(multiMember, "billing")).toBe(false);
@@ -143,14 +145,12 @@ describe("lanyard/core unit tests", () => {
       const manager: ScopedMember<TestRole, TestCapability> = {
         uid: "u-mgr",
         email: "manager@example.com",
-        role: "manager",
-        capabilities: []
+        roles: ["manager"]
       };
       const member: ScopedMember<TestRole, TestCapability> = {
         uid: "u-mem",
         email: "mem@example.com",
-        role: "member",
-        capabilities: ["edit_content"]
+        roles: ["member"]
       };
 
       expect(TEST_POLICY.hasAnyCapability(manager, ["invite_members", "billing"])).toBe(true);
@@ -172,9 +172,10 @@ describe("lanyard/core unit tests", () => {
 
       // Object.prototype key injection ("toString", "constructor", "__proto__") must never match or throw
       for (const protoKey of ["toString", "valueOf", "constructor", "__proto__"] as any[]) {
-        const protoMember = { uid: "u-proto", email: "p@example.com", role: protoKey, capabilities: [] };
-        expect(TEST_POLICY.hasMinimumRole(protoMember, "member")).toBe(false);
-        expect(TEST_POLICY.hasMinimumRole(member, protoKey)).toBe(false);
+        const protoMember = { uid: "u-proto", email: "p@example.com", roles: [protoKey] };
+        expect(TEST_POLICY.hasRole(protoMember, "member")).toBe(false);
+        expect(TEST_POLICY.hasRole(member, protoKey)).toBe(false);
+        expect(TEST_POLICY.isAssignableRole(protoKey)).toBe(false);
         expect(TEST_POLICY.hasCapability(protoMember, "edit_content")).toBe(false);
         expect(TEST_POLICY.hasAnyCapability(protoMember, ["edit_content"])).toBe(false);
         expect(TEST_POLICY.hasAllCapabilities(protoMember, ["edit_content"])).toBe(false);
@@ -369,28 +370,25 @@ describe("lanyard/core unit tests", () => {
         scopeSnapshots.push(members);
       });
 
-      // Throws if granting capabilities to a non-existent member without fallbackMember
-      await expect(store.grantScopeCapabilities("ws-1", "missing-uid", ["edit_content"])).rejects.toThrow(
-        /does not exist/
-      );
+      // Throws if granting roles to a non-existent member without fallbackMember
+      await expect(store.grantScopeRoles("ws-1", "missing-uid", ["member"])).rejects.toThrow(/does not exist/);
 
-      await store.grantScopeCapabilities("ws-1", "uid-1", ["edit_content"], {
+      await store.grantScopeRoles("ws-1", "uid-1", ["member"], {
         uid: "uid-1",
         email: "accenty@example.com",
         firstName: "Accenty",
-        lastName: "McÉccent",
-        role: "member"
+        lastName: "McÉccent"
       });
 
-      const afterSecondGrant = await store.grantScopeCapabilities("ws-1", "uid-1", ["invite_members"]);
-      expect(afterSecondGrant.capabilities).toEqual(["edit_content", "invite_members"]);
+      const afterSecondGrant = await store.grantScopeRoles("ws-1", "uid-1", ["manager"]);
+      expect(afterSecondGrant.roles).toEqual(["member", "manager"]);
 
-      await store.revokeScopeCapabilities("ws-1", "uid-1", ["edit_content"]);
+      await store.revokeScopeRoles("ws-1", "uid-1", ["member"]);
       const afterRevoke = await store.getScopeMember("ws-1", "uid-1");
-      expect(afterRevoke?.capabilities).toEqual(["invite_members"]);
+      expect(afterRevoke?.roles).toEqual(["manager"]);
 
       // Revoking on non-existent member is a safe no-op
-      await store.revokeScopeCapabilities("ws-1", "non-existent", ["invite_members"]);
+      await store.revokeScopeRoles("ws-1", "non-existent", ["manager"]);
 
       expect(await store.listScopeMembers("ws-1")).toHaveLength(1);
       await store.deleteScopeMember("ws-1", "uid-1");
@@ -436,8 +434,7 @@ describe("lanyard/core unit tests", () => {
       await store.upsertScopeMember("ws-1", {
         uid: "uid-1",
         email: "accenty@example.com",
-        role: "manager",
-        capabilities: []
+        roles: ["manager"]
       });
 
       await store.syncAvatar({
@@ -462,8 +459,7 @@ describe("lanyard/core unit tests", () => {
       await store.upsertScopeMember("ws-1", {
         uid: "uid-1",
         email: "accenty@example.com",
-        role: "manager",
-        capabilities: [],
+        roles: ["manager"],
         photoUrl: "https://example.com/same.png"
       });
       await store.upsertSystemAdmin({
@@ -511,8 +507,7 @@ describe("lanyard/core unit tests", () => {
       await store.upsertScopeMember("ws-1", {
         uid: "uid-1",
         email: "accenty@example.com",
-        role: "manager",
-        capabilities: [],
+        roles: ["manager"],
         photoUrl: "data:image/svg+xml;base64,PHN2Zz48L3N2Zz4="
       });
       expect((await store.getScopeMember("ws-1", "uid-1"))?.photoUrl).toBeNull();
@@ -529,8 +524,8 @@ describe("lanyard/core unit tests", () => {
       // 2. Explicit defaultRole vs unrecognized defaultRole fallback + omitted capabilities
       const customDefaultPolicy = createPermissionPolicy<"lead" | "viewer", "read">({
         roles: {
-          lead: { weight: 20, capabilities: "*" },
-          viewer: { weight: 5 }
+          lead: { inherits: ["viewer"], capabilities: "*" },
+          viewer: {}
         },
         defaultRole: "lead"
       });
@@ -538,8 +533,8 @@ describe("lanyard/core unit tests", () => {
 
       const fallbackDefaultPolicy = createPermissionPolicy<"lead" | "viewer", "read">({
         roles: {
-          lead: { weight: 20 },
-          viewer: { weight: 5 }
+          lead: { inherits: ["viewer"] },
+          viewer: {}
         },
         defaultRole: "nonexistent" as any
       });
@@ -549,8 +544,7 @@ describe("lanyard/core unit tests", () => {
       const viewerMember: ScopedMember<"lead" | "viewer", "read"> = {
         uid: "u-v",
         email: "v@example.com",
-        role: "viewer",
-        capabilities: []
+        roles: ["viewer"]
       };
       expect(fallbackDefaultPolicy.hasAllCapabilities(viewerMember, [])).toBe(true);
       expect(fallbackDefaultPolicy.hasAllCapabilities(null, [])).toBe(false);
@@ -596,14 +590,22 @@ describe("lanyard/core unit tests", () => {
         uid: "ghost-admin",
         lastSeenIso: "2026-10-20T00:00:00.000Z"
       });
-      await store.revokeScopeCapabilities("ws-ghost", "ghost-user", ["edit_content"]);
+      await store.revokeScopeRoles("ws-ghost", "ghost-user", ["member"]);
       expect(await store.getScopeMember("ws-ghost", "ghost-user")).toBeNull();
     });
 
-    it("resolves explicit role inheritance (DAGs, sibling roles, wildcard propagation, trackPresence override) and rejects cycles or unknown roles", () => {
-      type EventRole = "attendee" | "scanner" | "merch_seller" | "moderator" | "director" | "quiet_director";
+    it("resolves explicit role inheritance (DAGs, abstract roles, sibling roles, wildcard propagation, trackPresence override) and rejects cycles or unknown roles", () => {
+      type EventRole =
+        | "staff_base"
+        | "attendee"
+        | "scanner"
+        | "merch_seller"
+        | "moderator"
+        | "director"
+        | "quiet_director";
       type EventCap =
         | "view:events"
+        | "staff:radio"
         | "manage:points"
         | "manage:merch"
         | "manage:badges"
@@ -612,82 +614,133 @@ describe("lanyard/core unit tests", () => {
 
       const dagPolicy = createPermissionPolicy<EventRole, EventCap>({
         roles: {
+          // Abstract role at the very top of the map: must NOT be picked as defaultRole or listed in assignableRoles!
+          staff_base: {
+            abstract: true,
+            capabilities: ["staff:radio"],
+            trackPresence: true
+          },
           attendee: {
-            weight: 10,
             capabilities: ["view:events"],
             trackPresence: false
           },
           scanner: {
-            weight: 20,
-            inherits: ["attendee"],
-            capabilities: ["manage:points"],
-            trackPresence: true
+            inherits: ["attendee", "staff_base"],
+            capabilities: ["manage:points"]
+            // trackPresence inherited from staff_base -> true!
           },
           merch_seller: {
-            weight: 20,
-            inherits: ["attendee"],
+            inherits: ["attendee", "staff_base"],
             capabilities: ["manage:merch"],
-            trackPresence: false
+            trackPresence: false // explicitly overrides staff_base trackPresence -> false
           },
           // Diamond inheritance: moderator inherits from both sibling roles (scanner & merch_seller)
           moderator: {
-            weight: 30,
             inherits: ["scanner", "merch_seller"],
             capabilities: ["manage:badges"]
             // trackPresence omitted -> inherits true from scanner!
           },
           director: {
-            weight: 40,
             inherits: ["moderator"],
             capabilities: "*"
           },
           quiet_director: {
-            weight: 5, // Intentionally lower weight than director, but explicitly inherits director!
             inherits: ["director"],
             trackPresence: false // Explicitly overrides inherited trackPresence: true -> false
           }
         }
       });
 
-      const scannerSubj = { role: "scanner" as const, capabilities: [] };
-      const merchSubj = { role: "merch_seller" as const, capabilities: [] };
-      const modSubj = { role: "moderator" as const, capabilities: [] };
-      const quietDirSubj = { role: "quiet_director" as const, capabilities: [] };
+      // Abstract role `staff_base` is skipped when selecting `defaultRole` and excluded from `assignableRoles`
+      expect(dagPolicy.defaultRole).toBe("attendee");
+      expect(dagPolicy.assignableRoles).toEqual([
+        "attendee",
+        "scanner",
+        "merch_seller",
+        "moderator",
+        "director",
+        "quiet_director"
+      ]);
+      expect(dagPolicy.isAssignableRole("staff_base")).toBe(false);
+      expect(dagPolicy.isAssignableRole("scanner")).toBe(true);
 
-      // Sibling isolation: scanner cannot manage:merch; merch_seller cannot manage:points
+      const scannerSubj = { roles: ["scanner"] as const };
+      const merchSubj = { roles: ["merch_seller"] as const };
+      const dualSubj = { roles: ["scanner", "merch_seller"] as const };
+      const modSubj = { roles: ["moderator"] as const };
+      const quietDirSubj = { roles: ["quiet_director"] as const };
+
+      // Multi-role subject holding ["scanner", "merch_seller"] gets capabilities of both roles + inherited staff_base/attendee
+      expect(dagPolicy.hasAllRoles(dualSubj, ["scanner", "merch_seller", "staff_base", "attendee"])).toBe(true);
+      expect(dagPolicy.hasRole(dualSubj, "moderator")).toBe(false);
+      expect(
+        dagPolicy.hasAllCapabilities(dualSubj, ["view:events", "staff:radio", "manage:points", "manage:merch"])
+      ).toBe(true);
+
+      // Sibling isolation + abstract role inheritance:
+      // Both scanner and merch_seller inherit abstract `staff_base` (passing `hasRole(..., "staff_base")` and getting `staff:radio`),
+      // while scanner cannot manage:merch and merch_seller cannot manage:points!
+      expect(dagPolicy.hasRole(scannerSubj, "staff_base")).toBe(true);
+      expect(dagPolicy.hasRole(merchSubj, "staff_base")).toBe(true);
+      expect(dagPolicy.hasCapability(scannerSubj, "staff:radio")).toBe(true);
+      expect(dagPolicy.hasCapability(merchSubj, "staff:radio")).toBe(true);
       expect(dagPolicy.hasCapability(scannerSubj, "view:events")).toBe(true);
       expect(dagPolicy.hasCapability(scannerSubj, "manage:points")).toBe(true);
       expect(dagPolicy.hasCapability(scannerSubj, "manage:merch")).toBe(false);
-      expect(dagPolicy.inheritsRole(scannerSubj, "merch_seller")).toBe(false);
-      expect(dagPolicy.hasMinimumRole(scannerSubj, "merch_seller")).toBe(false);
-      expect(dagPolicy.hasMinimumRole(merchSubj, "scanner")).toBe(false);
+      expect(dagPolicy.hasRole(scannerSubj, "merch_seller")).toBe(false);
+      expect(dagPolicy.hasRole(merchSubj, "scanner")).toBe(false);
 
       expect(dagPolicy.hasCapability(merchSubj, "view:events")).toBe(true);
       expect(dagPolicy.hasCapability(merchSubj, "manage:merch")).toBe(true);
       expect(dagPolicy.hasCapability(merchSubj, "manage:points")).toBe(false);
 
-      // Diamond convergence: moderator has attendee + scanner + merch_seller + moderator capabilities
+      // Diamond convergence: moderator has attendee + staff_base + scanner + merch_seller + moderator capabilities
       expect(
-        dagPolicy.hasAllCapabilities(modSubj, ["view:events", "manage:points", "manage:merch", "manage:badges"])
+        dagPolicy.hasAllCapabilities(modSubj, [
+          "view:events",
+          "staff:radio",
+          "manage:points",
+          "manage:merch",
+          "manage:badges"
+        ])
       ).toBe(true);
       expect(dagPolicy.hasCapability(modSubj, "manage:notes")).toBe(false);
-      expect(dagPolicy.inheritsRole(modSubj, "attendee")).toBe(true);
-      expect(dagPolicy.inheritsRole(modSubj, "scanner")).toBe(true);
-      expect(dagPolicy.inheritsRole(modSubj, "merch_seller")).toBe(true);
-      expect(dagPolicy.inheritsRole(modSubj, "director")).toBe(false);
-      expect(dagPolicy.shouldTrackPresence(modSubj)).toBe(true); // inherited from scanner
+      expect(dagPolicy.hasRole(modSubj, "attendee")).toBe(true);
+      expect(dagPolicy.hasRole(modSubj, "staff_base")).toBe(true);
+      expect(dagPolicy.hasRole(modSubj, "scanner")).toBe(true);
+      expect(dagPolicy.hasRole(modSubj, "merch_seller")).toBe(true);
+      expect(dagPolicy.hasRole(modSubj, "director")).toBe(false);
+      expect(dagPolicy.shouldTrackPresence(modSubj)).toBe(true); // inherited from scanner/staff_base
 
-      // quiet_director inherits wildcard "*" from director and passes hasMinimumRole("director") despite weight 5 < 40
+      // quiet_director inherits wildcard "*" from director and passes hasRole("director")
       expect(dagPolicy.hasCapability(quietDirSubj, "manage:notes")).toBe(true);
-      expect(dagPolicy.inheritsRole(quietDirSubj, "director")).toBe(true);
-      expect(dagPolicy.hasMinimumRole(quietDirSubj, "director")).toBe(true);
+      expect(dagPolicy.hasRole(quietDirSubj, "director")).toBe(true);
       expect(dagPolicy.shouldTrackPresence(quietDirSubj)).toBe(false); // explicit override
+
+      // Abstract role validation errors (all roles abstract, or explicit defaultRole is abstract)
+      expect(() =>
+        createPermissionPolicy({
+          roles: {
+            onlyAbstract: { abstract: true, capabilities: [] }
+          }
+        })
+      ).toThrow(/requires at least one concrete \(non-abstract\) role/);
+
+      expect(() =>
+        createPermissionPolicy<"abstractBase" | "concreteRole", never>({
+          roles: {
+            abstractBase: { abstract: true, capabilities: [] },
+            concreteRole: { inherits: ["abstractBase"] }
+          },
+          defaultRole: "abstractBase"
+        })
+      ).toThrow(/abstract roles cannot be used as defaultRole/);
 
       // Cycle detection & validation errors
       expect(() =>
         createPermissionPolicy({
           roles: {
-            selfLoop: { weight: 10, inherits: ["selfLoop"] }
+            selfLoop: { inherits: ["selfLoop"] }
           }
         })
       ).toThrow(/Circular role inheritance detected: selfLoop -> selfLoop/);
@@ -695,9 +748,9 @@ describe("lanyard/core unit tests", () => {
       expect(() =>
         createPermissionPolicy({
           roles: {
-            a: { weight: 10, inherits: ["b"] },
-            b: { weight: 20, inherits: ["c"] },
-            c: { weight: 30, inherits: ["a"] }
+            a: { inherits: ["b"] },
+            b: { inherits: ["c"] },
+            c: { inherits: ["a"] }
           }
         })
       ).toThrow(/Circular role inheritance detected: a -> b -> c -> a/);
@@ -705,7 +758,7 @@ describe("lanyard/core unit tests", () => {
       expect(() =>
         createPermissionPolicy({
           roles: {
-            a: { weight: 10, inherits: ["nonexistent" as any] }
+            a: { inherits: ["nonexistent" as any] }
           }
         })
       ).toThrow(/inherits from unknown role 'nonexistent'/);
@@ -713,23 +766,18 @@ describe("lanyard/core unit tests", () => {
       expect(() =>
         createPermissionPolicy({
           roles: {
-            a: { weight: 10, inherits: ["__proto__" as any] }
+            a: { inherits: ["__proto__" as any] }
           }
         })
       ).toThrow(/inherits from unknown role '__proto__'/);
-
-      expect(() =>
-        createPermissionPolicy({
-          roles: {
-            badWeight: { weight: Number.NaN }
-          }
-        })
-      ).toThrow(/Invalid weight for role 'badWeight'/);
     });
 
-    it("enforces independent read/write capabilities on attributes, hiddenAttributes, and write-only secrets with strict self/admin/prototype invariants", () => {
-      type Role = "attendee" | "scanner" | "auditor" | "moderator";
+    it("enforces independent read/write capabilities on userCapabilities, attributes, hiddenAttributes, and write-only secrets with strict self/admin/prototype invariants", () => {
+      type Role = "attendee" | "scanner" | "auditor" | "moderator" | "role_manager";
       type Cap =
+        | "read:users"
+        | "write:users"
+        | "assign:roles"
         | "write:points"
         | "read:internal_tier"
         | "write:internal_tier"
@@ -740,14 +788,22 @@ describe("lanyard/core unit tests", () => {
 
       const policy = createPermissionPolicy<Role, Cap>({
         roles: {
-          attendee: { weight: 10, capabilities: [] },
-          scanner: { weight: 20, inherits: ["attendee"], capabilities: ["write:points"] },
-          auditor: { weight: 25, inherits: ["attendee"], capabilities: ["read:internal_tier", "read:notes"] },
+          attendee: { capabilities: [] },
+          scanner: { inherits: ["attendee"], capabilities: ["read:users", "write:points"] },
+          auditor: { inherits: ["attendee"], capabilities: ["read:users", "read:internal_tier", "read:notes"] },
           moderator: {
-            weight: 30,
             inherits: ["scanner", "auditor"],
-            capabilities: ["write:internal_tier", "write:notes", "full:risk", "write:ai_keys"]
+            capabilities: ["write:users", "write:internal_tier", "write:notes", "full:risk", "write:ai_keys"]
+          },
+          role_manager: {
+            inherits: ["attendee"],
+            capabilities: ["read:users", "assign:roles"]
           }
+        },
+        userCapabilities: {
+          read: "read:users",
+          write: "write:users",
+          assignRoles: "assign:roles"
         },
         attributeCapabilities: {
           // String shorthand: anyone (including self) can read, only 'write:points' can write
@@ -775,10 +831,33 @@ describe("lanyard/core unit tests", () => {
         }
       });
 
-      const attendee = { role: "attendee" as const, capabilities: [] };
-      const scanner = { role: "scanner" as const, capabilities: [] };
-      const auditor = { role: "auditor" as const, capabilities: [] };
-      const moderator = { role: "moderator" as const, capabilities: [] };
+      const attendee = { roles: ["attendee"] as const };
+      const scanner = { roles: ["scanner"] as const };
+      const auditor = { roles: ["auditor"] as const };
+      const moderator = { roles: ["moderator"] as const };
+      const roleManager = { roles: ["role_manager"] as const };
+
+      // 0. User records (canReadUser, canWriteUser, canAssignRoles):
+      // Self can always read own user record; reading other users requires `read:users` or systemAdmin;
+      // writing/deleting other users requires `write:users` or systemAdmin; assigning roles requires `assign:roles` or systemAdmin.
+      expect(policy.canReadUser(attendee, { isSelf: true })).toBe(true);
+      expect(policy.canReadUser(attendee, { isSelf: false })).toBe(false);
+      expect(policy.canReadUser(scanner, { isSelf: false })).toBe(true);
+      expect(policy.canReadUser(auditor, { isSelf: false })).toBe(true);
+      expect(policy.canReadUser(null, { isSystemAdmin: true })).toBe(true);
+
+      expect(policy.canWriteUser(attendee)).toBe(false);
+      expect(policy.canWriteUser(scanner)).toBe(false);
+      expect(policy.canWriteUser(auditor)).toBe(false);
+      expect(policy.canWriteUser(roleManager)).toBe(false);
+      expect(policy.canWriteUser(moderator)).toBe(true);
+      expect(policy.canWriteUser(null, true)).toBe(true);
+
+      expect(policy.canAssignRoles(attendee)).toBe(false);
+      expect(policy.canAssignRoles(scanner)).toBe(false);
+      expect(policy.canAssignRoles(moderator)).toBe(false); // moderator has write:users, NOT assign:roles!
+      expect(policy.canAssignRoles(roleManager)).toBe(true);
+      expect(policy.canAssignRoles(null, true)).toBe(true);
 
       // 1. Attributes: self can ALWAYS read their own attributes, but can NEVER write attributes without capability
       expect(policy.canReadAttribute(attendee, "pointsAllTime", { isSelf: true })).toBe(true);
@@ -952,8 +1031,7 @@ describe("lanyard/core unit tests", () => {
       await store.upsertScopeMember("ws-1", {
         uid: "u-hybrid",
         email: "hybrid@example.com",
-        role: "member",
-        capabilities: []
+        roles: ["member"]
       });
       await store.updateScopeMemberAttributes("ws-1", "u-hybrid", { pointsAllTime: 99 });
       await store.updateScopeMemberHiddenAttributes("ws-1", "u-hybrid", { internalNotes: "Scoped note" });
