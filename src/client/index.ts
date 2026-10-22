@@ -5,7 +5,6 @@ import {
   signInWithPopup,
   linkWithPopup,
   unlink,
-  signInAnonymously,
   signOut as firebaseSignOut,
   onAuthStateChanged,
   sendSignInLinkToEmail,
@@ -411,17 +410,6 @@ export function createLanyardClient<
         claims = tokenResult?.claims || {};
       } catch {}
       const normalized = normalizeFirebaseUser(result.user, claims);
-      setActiveUser(normalized);
-      return normalized;
-    }
-    return null;
-  }
-
-  async function loginAnonymously(): Promise<LanyardUser | null> {
-    if (!auth) throw new Error("Firebase Auth is not initialized");
-    const result = await signInAnonymously(auth);
-    if (result?.user) {
-      const normalized = normalizeFirebaseUser(result.user);
       setActiveUser(normalized);
       return normalized;
     }
@@ -959,6 +947,28 @@ export function createLanyardClient<
     return authStoreInternal.subscribe((state) => cb(state.user));
   }
 
+  function subscribeToUsers(
+    cb: (users: UserRecord<TRole, TCapability, TPreferences, TAttributes>[]) => void
+  ): () => void {
+    if (typeof store.subscribeToUsers !== "function") {
+      throw new Error("Backing store does not implement subscribeToUsers");
+    }
+    return store.subscribeToUsers(cb);
+  }
+
+  function subscribeToScopeMembers(
+    scopeId: string,
+    cb: (members: ScopedMember<TRole, TCapability, TPreferences, TAttributes>[]) => void
+  ): () => void {
+    if (!isValidResourceId(scopeId)) {
+      throw new Error("Invalid scopeId");
+    }
+    if (typeof store.subscribeToScopeMembers !== "function") {
+      throw new Error("Backing store does not implement subscribeToScopeMembers");
+    }
+    return store.subscribeToScopeMembers(scopeId, cb);
+  }
+
   function destroy(): void {
     cleanupUserSubscriptions();
     if (unsubAuth) {
@@ -982,8 +992,9 @@ export function createLanyardClient<
     preferencesStore: preferencesStoreInternal as LanyardReadable<TPreferences>,
     setActiveUser,
     subscribeToAuthUser,
+    subscribeToUsers,
+    subscribeToScopeMembers,
     loginWithSocialProvider,
-    loginAnonymously,
     sendPasswordlessEmailLink,
     completePasswordlessSignIn,
     signOut,

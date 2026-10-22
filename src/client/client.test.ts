@@ -213,7 +213,7 @@ describe("lanyard/client unit tests", () => {
     expect(authUsersObserved).toEqual([null, "u-1", "u-admin", null]);
   });
 
-  it("handles OAuth login, anonymous login, magic email links, dev mode login, and account linking", async () => {
+  it("handles OAuth login, magic email links, and account linking", async () => {
     const store = new InMemoryLanyardStore<TestRole, TestCap, TestPrefs>();
     const fakeAuth: any = {
       currentUser: {
@@ -249,14 +249,7 @@ describe("lanyard/client unit tests", () => {
     const socialRes = await client.loginWithSocialProvider("google");
     expect(socialRes?.uid).toBe("u-social");
 
-    // 2. Anonymous login
-    vi.mocked(firebaseAuth.signInAnonymously).mockResolvedValueOnce({
-      user: { uid: "u-anon", isAnonymous: true, providerData: [] }
-    } as any);
-    const anonRes = await client.loginAnonymously();
-    expect(anonRes?.isAnonymous).toBe(true);
-
-    // 3. Passwordless Magic Email Link
+    // 2. Passwordless Magic Email Link
     await expect(client.sendPasswordlessEmailLink("   ")).rejects.toThrow(/valid email/);
     await client.sendPasswordlessEmailLink("  Magic@Example.com ", "https://app.example.com/callback");
     expect(firebaseAuth.sendSignInLinkToEmail).toHaveBeenCalledWith(
@@ -1028,7 +1021,6 @@ describe("lanyard/client unit tests", () => {
 
     // 3. Uninitialized auth guards & fallbacks
     await expect(clientNoPolicy.loginWithSocialProvider("google")).rejects.toThrow(/not initialized/);
-    await expect(clientNoPolicy.loginAnonymously()).rejects.toThrow(/not initialized/);
     await expect(clientNoPolicy.sendPasswordlessEmailLink("a@b.com")).rejects.toThrow(/not initialized/);
     await expect(clientNoPolicy.completePasswordlessSignIn("a@b.com")).rejects.toThrow(/not initialized/);
     await expect(clientNoPolicy.linkSocialProvider("google")).rejects.toThrow(/No authenticated user/);
@@ -1309,6 +1301,20 @@ describe("lanyard/client unit tests", () => {
     client.recordActivity();
     await client.syncPresence();
     expect((await store.getUser("u-single"))?.lastSeen).toBe(new Date(t0).toISOString());
+
+    // 6. Unscoped subscribeToUsers directory subscription on client & store
+    const observedDirectory: string[][] = [];
+    const unsubDir = client.subscribeToUsers((users) => {
+      observedDirectory.push(users.map((u) => u.uid));
+    });
+    expect(observedDirectory.at(-1)).toEqual(["u-single"]);
+    await store.upsertUser({
+      uid: "u-second",
+      email: "second@example.com",
+      role: "member"
+    });
+    expect(observedDirectory.at(-1)?.sort()).toEqual(["u-second", "u-single"]);
+    unsubDir();
 
     client.destroy();
     vi.restoreAllMocks();

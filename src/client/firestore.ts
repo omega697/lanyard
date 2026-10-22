@@ -252,6 +252,23 @@ export class FirestoreClientStore<
     };
   }
 
+  subscribeToUsers(onChange: (users: UserRecord<TRole, TCapability, TPreferences, TAttributes>[]) => void): () => void {
+    const colRef = collection(this.db, this.usersCollection);
+    return onSnapshot(
+      colRef,
+      (snapshot) => {
+        const list: UserRecord<TRole, TCapability, TPreferences, TAttributes>[] = [];
+        snapshot.forEach((docSnap) => {
+          list.push(this.parseUserRecord(docSnap.id, docSnap.data() || {}));
+        });
+        onChange(list);
+      },
+      () => {
+        onChange([]);
+      }
+    );
+  }
+
   subscribeToPreferences(uid: string, onChange: (prefs: Partial<TPreferences>) => void): () => void {
     const cleanUid = assertValidFirestoreDocId(uid, "uid");
     const watcher = this.ensureUserWatcher(cleanUid);

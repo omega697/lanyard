@@ -691,6 +691,26 @@ describe.skipIf(!existsSync(EMULATOR_JAR) || !existsSync(AUTH_EMULATOR_SERVER_JS
       );
       expect(stubAllowedAsAttendee).toBe(true);
 
+      // 12. Unscoped directory subscription (`client.subscribeToUsers`) on real Firestore
+      const directoryUsers = await new Promise<any[]>((resolve) => {
+        const unsub = client.subscribeToUsers((users) => {
+          if (users.length >= 6) {
+            unsub();
+            resolve(users);
+          }
+        });
+      });
+      expect(directoryUsers.map((u) => u.uid)).toEqual(
+        expect.arrayContaining([
+          attendee.uid,
+          scanner.uid,
+          merchSeller.uid,
+          auditor.uid,
+          moderator.uid,
+          "prefs-only-uid"
+        ])
+      );
+
       client.destroy();
     });
 

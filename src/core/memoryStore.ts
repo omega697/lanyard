@@ -112,6 +112,9 @@ export class InMemoryLanyardStore<
     string,
     Set<(user: UserRecord<TRole, TCapability, TPreferences, TAttributes> | null) => void>
   >();
+  private usersDirectoryListeners = new Set<
+    (users: UserRecord<TRole, TCapability, TPreferences, TAttributes>[]) => void
+  >();
   private userMembershipListeners = new Map<
     string,
     Set<(members: ScopedMember<TRole, TCapability, TPreferences, TAttributes>[]) => void>
@@ -181,6 +184,15 @@ export class InMemoryLanyardStore<
 
     return () => {
       this.userListeners.get(uid)?.delete(onChange);
+    };
+  }
+
+  subscribeToUsers(onChange: (users: UserRecord<TRole, TCapability, TPreferences, TAttributes>[]) => void): () => void {
+    this.usersDirectoryListeners.add(onChange);
+    onChange(Array.from(this.users.values()).map((u) => this.cloneUser(u)!));
+
+    return () => {
+      this.usersDirectoryListeners.delete(onChange);
     };
   }
 
@@ -745,6 +757,12 @@ export class InMemoryLanyardStore<
     if (userCallbacks) {
       for (const cb of userCallbacks) {
         cb(this.cloneUser(user));
+      }
+    }
+    if (this.usersDirectoryListeners.size > 0) {
+      const allUsers = Array.from(this.users.values()).map((u) => this.cloneUser(u)!);
+      for (const cb of this.usersDirectoryListeners) {
+        cb(allUsers);
       }
     }
   }

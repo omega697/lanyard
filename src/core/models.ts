@@ -454,6 +454,9 @@ export interface LanyardClientStore<
     onChange: (user: UserRecord<TRole, TCapability, TPreferences, TAttributes> | null) => void
   ): () => void;
 
+  /** Optional: Subscribe to all global `UserRecord` documents (`usersCollection`) for single-tenant user directories. */
+  subscribeToUsers?(onChange: (users: UserRecord<TRole, TCapability, TPreferences, TAttributes>[]) => void): () => void;
+
   /** Optional: Self-service update of the user's own profile fields (`firstName`, `lastName`, `displayName`, `photoUrl`). */
   updateUserProfile?(uid: string, patch: UserProfilePatch): Promise<void>;
 
