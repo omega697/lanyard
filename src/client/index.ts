@@ -19,22 +19,25 @@ import {
   type AuthProvider
 } from "firebase/auth";
 import {
+  GLOBAL_SCOPE,
   createWritableStore,
   formatExistingAccountError,
   isValidEmail,
   isValidResourceId,
   sanitizeAvatarUrl,
+  type GlobalScope,
   type LanyardClientStore,
   type LanyardReadable,
   type LanyardUser,
   type PermissionPolicy,
+  type ScopeId,
   type ScopedMember,
   type SocialProviderType,
   type UserProfilePatch,
   type UserRecord
 } from "../core/index.js";
 
-export { formatExistingAccountError };
+export { GLOBAL_SCOPE, formatExistingAccountError, type GlobalScope, type ScopeId };
 
 export const HEARTBEAT_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
 
@@ -102,7 +105,6 @@ export function normalizeFirebaseUser(user: User, claims: Record<string, any> = 
     emailVerified: Boolean(user.emailVerified),
     displayName: user.displayName || null,
     photoUrl: providerPhoto,
-    isAnonymous: Boolean(user.isAnonymous),
     isAdmin: Boolean(claims.admin),
     providerIds
   };
@@ -145,7 +147,7 @@ export interface LanyardClientConfig<
  * Creates a storage-agnostic Lanyard client instance managing authentication flows,
  * reactive Svelte-compatible stores (`authStore`, `userRecordStore`, `attributesStore`,
  * `membershipsStore`, `preferencesStore`), smart deduplicated avatar syncing, and
- * 5-minute `localStorage`-throttled presence heartbeats.
+ * 5-minute `localStorage`-throttled presence heartbeats unified around explicit `scopeId: ScopeId` (`GLOBAL_SCOPE` or tenant `string`).
  */
 export function createLanyardClient<
   TRole extends string = string,
@@ -573,17 +575,38 @@ export function createLanyardClient<
     });
   }
 
-  // --- Self-Service Profile & Preferences ---
+  // --- Self-Service Profile & Preferences (Unified with Explicit ScopeId) ---
 
-  async function updateScopePreferences(
-    scopeId: string,
+  async function updatePreferences(
+    scopeId: ScopeId,
     patch: Partial<TPreferences>,
-    syncToStore = true
+    options: boolean | { syncToStore?: boolean } = true
   ): Promise<void> {
+    const syncToStore = typeof options === "boolean" ? options : (options?.syncToStore ?? true);
+    const cleanPatch = sanitizePreferencesObject<TPreferences>(patch);
+
+    if (scopeId === GLOBAL_SCOPE) {
+      preferencesStoreInternal.update((current) => {
+        const updated = { ...current, ...cleanPatch };
+        if (typeof localStorage !== "undefined") {
+          try {
+            localStorage.setItem(prefStorageKey, JSON.stringify(updated));
+          } catch {}
+        }
+        return updated;
+      });
+
+      const currentUser = authStoreInternal.get().user;
+      if (syncToStore && currentUser?.uid) {
+        await store.savePreferences(currentUser.uid, cleanPatch);
+      }
+      return;
+    }
+
     if (!isValidResourceId(scopeId)) {
       throw new Error("Invalid scopeId");
     }
-    const cleanPatch = sanitizePreferencesObject<TPreferences>(patch);
+
     membershipsStoreInternal.update((state) => ({
       ...state,
       memberships: state.memberships.map((m) =>
@@ -608,91 +631,90 @@ export function createLanyardClient<
     }
   }
 
-  async function updatePreferences(
-    patch: Partial<TPreferences>,
-    options: boolean | { syncToStore?: boolean; scopeId?: string } = true
-  ): Promise<void> {
-    const syncToStore = typeof options === "boolean" ? options : (options?.syncToStore ?? true);
-    const scopeId = typeof options === "object" && options !== null ? options.scopeId : undefined;
-
-    if (scopeId !== undefined) {
-      return updateScopePreferences(scopeId, patch, syncToStore);
-    }
-
-    const cleanPatch = sanitizePreferencesObject<TPreferences>(patch);
-    preferencesStoreInternal.update((current) => {
-      const updated = { ...current, ...cleanPatch };
-      if (typeof localStorage !== "undefined") {
-        try {
-          localStorage.setItem(prefStorageKey, JSON.stringify(updated));
-        } catch {}
-      }
-      return updated;
-    });
-
-    const currentUser = authStoreInternal.get().user;
-    if (syncToStore && currentUser?.uid) {
-      await store.savePreferences(currentUser.uid, cleanPatch);
-    }
-  }
-
-  async function updateProfile(patch: UserProfilePatch): Promise<void> {
+  async function updateProfile(scopeId: ScopeId, patch: UserProfilePatch): Promise<void> {
     const currentUser = authStoreInternal.get().user;
     if (!currentUser?.uid) {
       throw new Error("No authenticated user.");
     }
-    if (typeof store.updateUserProfile !== "function") {
-      throw new Error("Backing store does not implement updateUserProfile");
+
+    if (scopeId === GLOBAL_SCOPE) {
+      if (typeof store.updateUserProfile !== "function") {
+        throw new Error("Backing store does not implement updateUserProfile");
+      }
+      const resolvedPatch: UserProfilePatch = { ...patch };
+      if (
+        resolvedPatch.displayName === undefined &&
+        (typeof resolvedPatch.firstName === "string" || typeof resolvedPatch.lastName === "string")
+      ) {
+        const existingRecord = userRecordStoreInternal.get();
+        const first = (resolvedPatch.firstName ?? existingRecord?.firstName ?? "").trim();
+        const last = (resolvedPatch.lastName ?? existingRecord?.lastName ?? "").trim();
+        const computedDisplayName = [first, last].filter(Boolean).join(" ").trim();
+        if (computedDisplayName) {
+          resolvedPatch.displayName = computedDisplayName;
+        }
+      }
+      await store.updateUserProfile(currentUser.uid, resolvedPatch);
+      if (typeof resolvedPatch.displayName === "string") {
+        const trimmedDisplay = resolvedPatch.displayName.trim();
+        authStoreInternal.update((state) =>
+          state.user && state.user.uid === currentUser.uid
+            ? { ...state, user: { ...state.user, displayName: trimmedDisplay } }
+            : state
+        );
+        if (
+          auth?.currentUser &&
+          auth.currentUser.uid === currentUser.uid &&
+          typeof firebaseUpdateProfile === "function"
+        ) {
+          try {
+            await firebaseUpdateProfile(auth.currentUser, { displayName: trimmedDisplay });
+          } catch {}
+        }
+      }
+      return;
     }
+
+    if (!isValidResourceId(scopeId)) {
+      throw new Error("Invalid scopeId");
+    }
+    if (typeof store.updateScopeMemberProfile !== "function") {
+      throw new Error("Backing store does not implement updateScopeMemberProfile");
+    }
+
+    const existingMember = membershipsStoreInternal.get().memberships.find((m) => m.scopeId === scopeId);
     const resolvedPatch: UserProfilePatch = { ...patch };
     if (
       resolvedPatch.displayName === undefined &&
       (typeof resolvedPatch.firstName === "string" || typeof resolvedPatch.lastName === "string")
     ) {
-      const existingRecord = userRecordStoreInternal.get();
-      const first = (resolvedPatch.firstName ?? existingRecord?.firstName ?? "").trim();
-      const last = (resolvedPatch.lastName ?? existingRecord?.lastName ?? "").trim();
+      const first = (resolvedPatch.firstName ?? existingMember?.firstName ?? "").trim();
+      const last = (resolvedPatch.lastName ?? existingMember?.lastName ?? "").trim();
       const computedDisplayName = [first, last].filter(Boolean).join(" ").trim();
       if (computedDisplayName) {
         resolvedPatch.displayName = computedDisplayName;
       }
     }
-    await store.updateUserProfile(currentUser.uid, resolvedPatch);
-    if (typeof resolvedPatch.displayName === "string") {
-      const trimmedDisplay = resolvedPatch.displayName.trim();
-      authStoreInternal.update((state) =>
-        state.user && state.user.uid === currentUser.uid
-          ? { ...state, user: { ...state.user, displayName: trimmedDisplay } }
-          : state
-      );
-      if (
-        auth?.currentUser &&
-        auth.currentUser.uid === currentUser.uid &&
-        typeof firebaseUpdateProfile === "function"
-      ) {
-        try {
-          await firebaseUpdateProfile(auth.currentUser, { displayName: trimmedDisplay });
-        } catch {}
-      }
-    }
+
+    await store.updateScopeMemberProfile(scopeId, currentUser.uid, resolvedPatch);
   }
 
-  // --- Unified Role, Capability, and Custom Property Accessors (Unscoped & Scoped) ---
+  // --- Unified Role, Capability, and Custom Property Accessors (Explicit ScopeId) ---
 
   function resolveTargetSubject(
-    scopeId?: string
+    scopeId: ScopeId
   ):
     | UserRecord<TRole, TCapability, TPreferences, TAttributes>
     | ScopedMember<TRole, TCapability, TPreferences, TAttributes>
     | null {
-    if (scopeId !== undefined) {
-      if (!isValidResourceId(scopeId)) return null;
-      return membershipsStoreInternal.get().memberships.find((m) => m.scopeId === scopeId) || null;
+    if (scopeId === GLOBAL_SCOPE) {
+      return userRecordStoreInternal.get();
     }
-    return userRecordStoreInternal.get();
+    if (!isValidResourceId(scopeId)) return null;
+    return membershipsStoreInternal.get().memberships.find((m) => m.scopeId === scopeId) || null;
   }
 
-  function getRoles(scopeId?: string): TRole[] {
+  function getRoles(scopeId: ScopeId): TRole[] {
     const subject = resolveTargetSubject(scopeId);
     return Array.isArray(subject?.roles) ? [...subject.roles] : [];
   }
@@ -701,7 +723,7 @@ export function createLanyardClient<
     return policy ? policy.assignableRoles : [];
   }
 
-  function hasRole(requiredRole: TRole, scopeId?: string): boolean {
+  function hasRole(requiredRole: TRole, scopeId: ScopeId): boolean {
     const currentUser = authStoreInternal.get().user;
     if (!currentUser) return false;
     const isAdmin = Boolean(currentUser.isAdmin);
@@ -713,7 +735,7 @@ export function createLanyardClient<
     return Array.isArray(subject?.roles) && subject.roles.includes(requiredRole);
   }
 
-  function hasAnyRole(requiredRoles: readonly TRole[], scopeId?: string): boolean {
+  function hasAnyRole(requiredRoles: readonly TRole[], scopeId: ScopeId): boolean {
     const currentUser = authStoreInternal.get().user;
     if (!currentUser) return false;
     const isAdmin = Boolean(currentUser.isAdmin);
@@ -726,7 +748,7 @@ export function createLanyardClient<
     return requiredRoles.some((r) => Array.isArray(subject?.roles) && subject.roles.includes(r));
   }
 
-  function hasAllRoles(requiredRoles: readonly TRole[], scopeId?: string): boolean {
+  function hasAllRoles(requiredRoles: readonly TRole[], scopeId: ScopeId): boolean {
     const currentUser = authStoreInternal.get().user;
     if (!currentUser) return false;
     const isAdmin = Boolean(currentUser.isAdmin);
@@ -738,7 +760,7 @@ export function createLanyardClient<
     return requiredRoles.every((r) => Array.isArray(subject?.roles) && subject.roles.includes(r));
   }
 
-  function getCapabilities(scopeId?: string): TCapability[] {
+  function getCapabilities(scopeId: ScopeId): TCapability[] {
     const currentUser = authStoreInternal.get().user;
     if (!currentUser) return [];
     const isAdmin = Boolean(currentUser.isAdmin);
@@ -770,7 +792,7 @@ export function createLanyardClient<
     return Array.from(result);
   }
 
-  function hasCapability(capability: TCapability, scopeId?: string): boolean {
+  function hasCapability(capability: TCapability, scopeId: ScopeId): boolean {
     const currentUser = authStoreInternal.get().user;
     if (!currentUser) return false;
     const isAdmin = Boolean(currentUser.isAdmin);
@@ -781,7 +803,7 @@ export function createLanyardClient<
     return isAdmin;
   }
 
-  function hasAnyCapability(capabilities: readonly TCapability[], scopeId?: string): boolean {
+  function hasAnyCapability(capabilities: readonly TCapability[], scopeId: ScopeId): boolean {
     const currentUser = authStoreInternal.get().user;
     if (!currentUser) return false;
     const isAdmin = Boolean(currentUser.isAdmin);
@@ -792,7 +814,7 @@ export function createLanyardClient<
     return isAdmin;
   }
 
-  function hasAllCapabilities(capabilities: readonly TCapability[], scopeId?: string): boolean {
+  function hasAllCapabilities(capabilities: readonly TCapability[], scopeId: ScopeId): boolean {
     const currentUser = authStoreInternal.get().user;
     if (!currentUser) return false;
     const isAdmin = Boolean(currentUser.isAdmin);
@@ -804,44 +826,44 @@ export function createLanyardClient<
     return capabilities.length === 0;
   }
 
-  function getAttributes(scopeId?: string): Partial<TAttributes> {
-    if (scopeId !== undefined) {
-      if (!isValidResourceId(scopeId)) return {};
-      const membership = membershipsStoreInternal.get().memberships.find((m) => m.scopeId === scopeId);
-      return sanitizePreferencesObject<TAttributes>(membership?.attributes || {});
+  function getAttributes(scopeId: ScopeId): Partial<TAttributes> {
+    if (scopeId === GLOBAL_SCOPE) {
+      return { ...attributesStoreInternal.get() };
     }
-    return { ...attributesStoreInternal.get() };
+    if (!isValidResourceId(scopeId)) return {};
+    const membership = membershipsStoreInternal.get().memberships.find((m) => m.scopeId === scopeId);
+    return sanitizePreferencesObject<TAttributes>(membership?.attributes || {});
   }
 
-  function getPreferences(scopeId?: string): TPreferences {
-    if (scopeId !== undefined) {
-      if (!isValidResourceId(scopeId)) return { ...defaultPreferences };
-      const membership = membershipsStoreInternal.get().memberships.find((m) => m.scopeId === scopeId);
-      return {
-        ...defaultPreferences,
-        ...sanitizePreferencesObject<TPreferences>(membership?.preferences || {})
-      };
+  function getPreferences(scopeId: ScopeId): TPreferences {
+    if (scopeId === GLOBAL_SCOPE) {
+      return { ...preferencesStoreInternal.get() };
     }
-    return { ...preferencesStoreInternal.get() };
+    if (!isValidResourceId(scopeId)) return { ...defaultPreferences };
+    const membership = membershipsStoreInternal.get().memberships.find((m) => m.scopeId === scopeId);
+    return {
+      ...defaultPreferences,
+      ...sanitizePreferencesObject<TPreferences>(membership?.preferences || {})
+    };
   }
 
   /**
-   * Checks whether the current user can read `key` on `attributes` (either unscoped or within `scopeId`).
+   * Checks whether the current user can read `key` on `attributes` within `scopeId` (`GLOBAL_SCOPE` or tenant `string`).
    * Defaults `isSelf: true` when checking the current user's own attributes; pass `{ isSelf: false }`
    * when checking whether the current user can read another user's/member's `attributes` key.
    */
   function canReadAttribute(
+    scopeId: ScopeId,
     key: (keyof TAttributes & string) | string,
-    options?: string | { scopeId?: string; isSelf?: boolean }
+    options?: { isSelf?: boolean }
   ): boolean {
     const currentUser = authStoreInternal.get().user;
     if (!currentUser) return false;
-    const scopeId = typeof options === "string" ? options : options?.scopeId;
-    const isSelf = typeof options === "object" && options !== null ? (options.isSelf ?? true) : true;
-    if (scopeId !== undefined && !isValidResourceId(scopeId)) return false;
+    const isSelf = options?.isSelf ?? true;
+    if (scopeId !== GLOBAL_SCOPE && !isValidResourceId(scopeId)) return false;
     const isAdmin = Boolean(currentUser.isAdmin);
     const subject = resolveTargetSubject(scopeId);
-    if (scopeId !== undefined && !isAdmin && !subject) return false;
+    if (scopeId !== GLOBAL_SCOPE && !isAdmin && !subject) return false;
     if (policy) {
       return policy.canReadAttribute(subject, key, { isSystemAdmin: isAdmin, isSelf });
     }
@@ -849,12 +871,12 @@ export function createLanyardClient<
   }
 
   /**
-   * Checks whether the current user can write `key` on `attributes` (either unscoped or within `scopeId`).
+   * Checks whether the current user can write `key` on `attributes` within `scopeId` (`GLOBAL_SCOPE` or tenant `string`).
    */
-  function canWriteAttribute(key: (keyof TAttributes & string) | string, scopeId?: string): boolean {
+  function canWriteAttribute(scopeId: ScopeId, key: (keyof TAttributes & string) | string): boolean {
     const currentUser = authStoreInternal.get().user;
     if (!currentUser) return false;
-    if (scopeId !== undefined && !isValidResourceId(scopeId)) return false;
+    if (scopeId !== GLOBAL_SCOPE && !isValidResourceId(scopeId)) return false;
     const isAdmin = Boolean(currentUser.isAdmin);
     const subject = resolveTargetSubject(scopeId);
     if (!policy) return isAdmin;
@@ -862,13 +884,13 @@ export function createLanyardClient<
   }
 
   /**
-   * Checks whether the current user can read `key` on `hiddenAttributes` (either unscoped or within `scopeId`).
+   * Checks whether the current user can read `key` on `hiddenAttributes` within `scopeId` (`GLOBAL_SCOPE` or tenant `string`).
    * Self-ownership never grants read access to `hiddenAttributes`.
    */
-  function canReadHiddenAttribute(key: string, scopeId?: string): boolean {
+  function canReadHiddenAttribute(scopeId: ScopeId, key: string): boolean {
     const currentUser = authStoreInternal.get().user;
     if (!currentUser) return false;
-    if (scopeId !== undefined && !isValidResourceId(scopeId)) return false;
+    if (scopeId !== GLOBAL_SCOPE && !isValidResourceId(scopeId)) return false;
     const isAdmin = Boolean(currentUser.isAdmin);
     const subject = resolveTargetSubject(scopeId);
     if (!policy) return isAdmin;
@@ -876,13 +898,13 @@ export function createLanyardClient<
   }
 
   /**
-   * Checks whether the current user can write `key` on `hiddenAttributes` (either unscoped or within `scopeId`).
+   * Checks whether the current user can write `key` on `hiddenAttributes` within `scopeId` (`GLOBAL_SCOPE` or tenant `string`).
    * Self-ownership never grants write access to `hiddenAttributes`.
    */
-  function canWriteHiddenAttribute(key: string, scopeId?: string): boolean {
+  function canWriteHiddenAttribute(scopeId: ScopeId, key: string): boolean {
     const currentUser = authStoreInternal.get().user;
     if (!currentUser) return false;
-    if (scopeId !== undefined && !isValidResourceId(scopeId)) return false;
+    if (scopeId !== GLOBAL_SCOPE && !isValidResourceId(scopeId)) return false;
     const isAdmin = Boolean(currentUser.isAdmin);
     const subject = resolveTargetSubject(scopeId);
     if (!policy) return isAdmin;
@@ -891,19 +913,18 @@ export function createLanyardClient<
 
   /**
    * Checks whether the current user can write/clear `key` on write-only encrypted `secrets`
-   * (either unscoped or within `scopeId`).
-   * Defaults `isSelf: true` when checking user/member-owned secrets; pass `{ scopeId, isSelf: false }`
-   * when checking shared scope-level secrets (e.g. workspace BYOK API keys) or another user's secrets.
+   * within `scopeId` (`GLOBAL_SCOPE` or tenant `string`).
+   * Defaults `isSelf: true` when checking the current user's own secrets; pass `{ isSelf: false }`
+   * when checking whether the current user can write another user's/member's secrets.
    */
-  function canWriteSecret(key: string, options?: string | { scopeId?: string; isSelf?: boolean }): boolean {
+  function canWriteSecret(scopeId: ScopeId, key: string, options?: { isSelf?: boolean }): boolean {
     const currentUser = authStoreInternal.get().user;
     if (!currentUser) return false;
-    const scopeId = typeof options === "string" ? options : options?.scopeId;
-    const isSelf = typeof options === "object" && options !== null ? (options.isSelf ?? true) : true;
-    if (scopeId !== undefined && !isValidResourceId(scopeId)) return false;
+    const isSelf = options?.isSelf ?? true;
+    if (scopeId !== GLOBAL_SCOPE && !isValidResourceId(scopeId)) return false;
     const isAdmin = Boolean(currentUser.isAdmin);
     const subject = resolveTargetSubject(scopeId);
-    if (scopeId !== undefined && !isAdmin && !subject) return false;
+    if (scopeId !== GLOBAL_SCOPE && !isAdmin && !subject) return false;
     if (policy) {
       return policy.canWriteSecret(subject, key, { isSystemAdmin: isAdmin, isSelf });
     }
@@ -911,18 +932,17 @@ export function createLanyardClient<
   }
 
   /**
-   * Checks whether the current user can read a user/member record (either unscoped or within `scopeId`).
+   * Checks whether the current user can read a user/member record within `scopeId` (`GLOBAL_SCOPE` or tenant `string`).
    * Defaults `isSelf: false` since reading *another* user's profile is the primary check.
    */
-  function canReadUser(options?: string | { scopeId?: string; isSelf?: boolean }): boolean {
+  function canReadUser(scopeId: ScopeId, options?: { isSelf?: boolean }): boolean {
     const currentUser = authStoreInternal.get().user;
     if (!currentUser) return false;
-    const scopeId = typeof options === "string" ? options : options?.scopeId;
-    const isSelf = typeof options === "object" && options !== null ? (options.isSelf ?? false) : false;
-    if (scopeId !== undefined && !isValidResourceId(scopeId)) return false;
+    const isSelf = options?.isSelf ?? false;
+    if (scopeId !== GLOBAL_SCOPE && !isValidResourceId(scopeId)) return false;
     const isAdmin = Boolean(currentUser.isAdmin);
     const subject = resolveTargetSubject(scopeId);
-    if (scopeId !== undefined && !isAdmin && !subject) return false;
+    if (scopeId !== GLOBAL_SCOPE && !isAdmin && !subject) return false;
     if (policy) {
       return policy.canReadUser(subject, { isSystemAdmin: isAdmin, isSelf });
     }
@@ -931,12 +951,12 @@ export function createLanyardClient<
 
   /**
    * Checks whether the current user can write (update/delete) another user/member record
-   * (either unscoped or within `scopeId`).
+   * within `scopeId` (`GLOBAL_SCOPE` or tenant `string`).
    */
-  function canWriteUser(scopeId?: string): boolean {
+  function canWriteUser(scopeId: ScopeId): boolean {
     const currentUser = authStoreInternal.get().user;
     if (!currentUser) return false;
-    if (scopeId !== undefined && !isValidResourceId(scopeId)) return false;
+    if (scopeId !== GLOBAL_SCOPE && !isValidResourceId(scopeId)) return false;
     const isAdmin = Boolean(currentUser.isAdmin);
     const subject = resolveTargetSubject(scopeId);
     if (!policy) return isAdmin;
@@ -945,12 +965,12 @@ export function createLanyardClient<
 
   /**
    * Checks whether the current user can assign or modify roles on a user/member record
-   * (either unscoped or within `scopeId`).
+   * within `scopeId` (`GLOBAL_SCOPE` or tenant `string`).
    */
-  function canAssignRoles(scopeId?: string): boolean {
+  function canAssignRoles(scopeId: ScopeId): boolean {
     const currentUser = authStoreInternal.get().user;
     if (!currentUser) return false;
-    if (scopeId !== undefined && !isValidResourceId(scopeId)) return false;
+    if (scopeId !== GLOBAL_SCOPE && !isValidResourceId(scopeId)) return false;
     const isAdmin = Boolean(currentUser.isAdmin);
     const subject = resolveTargetSubject(scopeId);
     if (!policy) return isAdmin;
@@ -959,21 +979,20 @@ export function createLanyardClient<
 
   // --- Presence Tracking (5-minute localStorage-throttled) ---
 
-  function getPresenceKeys(uid: string, scopeId?: string) {
-    const scopePart = scopeId ? `${scopeId}_` : "";
+  function getPresenceKeys(uid: string, scopeId: ScopeId) {
+    const scopePart = scopeId === GLOBAL_SCOPE ? "" : `${scopeId}_`;
     return {
       lastActiveKey: `${storageKeyPrefix}_last_active_${scopePart}${uid}`,
       lastSyncedKey: `${storageKeyPrefix}_last_synced_${scopePart}${uid}`
     };
   }
 
-  function shouldTrackPresence(scopeId?: string): boolean {
+  function shouldTrackPresence(scopeId: ScopeId): boolean {
     const currentUser = authStoreInternal.get().user;
     if (!currentUser) return false;
-    if (scopeId !== undefined && !isValidResourceId(scopeId)) return false;
+    if (scopeId !== GLOBAL_SCOPE && !isValidResourceId(scopeId)) return false;
     if (currentUser.isAdmin) return true;
-    if (!scopeId) {
-      // In single-tenant mode, check if the user's global UserRecord role (or policy.defaultRole) has trackPresence enabled
+    if (scopeId === GLOBAL_SCOPE) {
       const userRecord = userRecordStoreInternal.get();
       if (policy) {
         return policy.shouldTrackPresence(userRecord || {}, currentUser.isAdmin);
@@ -991,20 +1010,20 @@ export function createLanyardClient<
     return true;
   }
 
-  function recordActivity(scopeId?: string): void {
+  function recordActivity(scopeId: ScopeId): void {
     const currentUser = authStoreInternal.get().user;
     if (!currentUser?.uid || typeof localStorage === "undefined") return;
-    if (scopeId !== undefined && !isValidResourceId(scopeId)) return;
+    if (scopeId !== GLOBAL_SCOPE && !isValidResourceId(scopeId)) return;
     const { lastActiveKey } = getPresenceKeys(currentUser.uid, scopeId);
     localStorage.setItem(lastActiveKey, Date.now().toString());
   }
 
-  function getPresenceStatus(scopeId?: string): { lastActive: number; lastSynced: number } {
+  function getPresenceStatus(scopeId: ScopeId): { lastActive: number; lastSynced: number } {
     const currentUser = authStoreInternal.get().user;
     if (!currentUser?.uid || typeof localStorage === "undefined") {
       return { lastActive: 0, lastSynced: 0 };
     }
-    if (scopeId !== undefined && !isValidResourceId(scopeId)) {
+    if (scopeId !== GLOBAL_SCOPE && !isValidResourceId(scopeId)) {
       return { lastActive: 0, lastSynced: 0 };
     }
     const { lastActiveKey, lastSyncedKey } = getPresenceKeys(currentUser.uid, scopeId);
@@ -1014,8 +1033,8 @@ export function createLanyardClient<
     };
   }
 
-  async function syncPresence(options: { scopeId?: string; isUnloading?: boolean } = {}): Promise<void> {
-    const { scopeId, isUnloading = false } = options;
+  async function syncPresence(scopeId: ScopeId, options: { isUnloading?: boolean } = {}): Promise<void> {
+    const { isUnloading = false } = options;
     const currentUser = authStoreInternal.get().user;
     if (!currentUser?.uid || typeof localStorage === "undefined") return;
     if (!shouldTrackPresence(scopeId)) return;
@@ -1035,7 +1054,7 @@ export function createLanyardClient<
       try {
         await store.recordPresenceHeartbeat({
           uid: currentUser.uid,
-          scopeId,
+          scopeId: scopeId === GLOBAL_SCOPE ? undefined : scopeId,
           lastSeenIso,
           photoUrl: currentUser.photoUrl
         });
@@ -1045,12 +1064,10 @@ export function createLanyardClient<
     }
   }
 
-  function startPresenceHeartbeat(options: { scopeId?: string } = {}): () => void {
-    const { scopeId } = options;
-
+  function startPresenceHeartbeat(scopeId: ScopeId): () => void {
     const tick = () => {
       recordActivity(scopeId);
-      syncPresence({ scopeId }).catch(() => {});
+      syncPresence(scopeId).catch(() => {});
     };
 
     tick();
@@ -1060,7 +1077,7 @@ export function createLanyardClient<
       recordActivity(scopeId);
       const { lastSynced } = getPresenceStatus(scopeId);
       if (Date.now() - lastSynced >= HEARTBEAT_INTERVAL_MS) {
-        syncPresence({ scopeId }).catch(() => {});
+        syncPresence(scopeId).catch(() => {});
       }
     };
 
@@ -1083,25 +1100,48 @@ export function createLanyardClient<
   }
 
   function subscribeToUsers(
+    scopeId: GlobalScope,
     cb: (users: UserRecord<TRole, TCapability, TPreferences, TAttributes>[]) => void
-  ): () => void {
-    if (typeof store.subscribeToUsers !== "function") {
-      throw new Error("Backing store does not implement subscribeToUsers");
-    }
-    return store.subscribeToUsers(cb);
-  }
-
-  function subscribeToScopeMembers(
+  ): () => void;
+  function subscribeToUsers(
     scopeId: string,
     cb: (members: ScopedMember<TRole, TCapability, TPreferences, TAttributes>[]) => void
+  ): () => void;
+  function subscribeToUsers(
+    scopeId: ScopeId,
+    cb: (
+      users:
+        | UserRecord<TRole, TCapability, TPreferences, TAttributes>[]
+        | ScopedMember<TRole, TCapability, TPreferences, TAttributes>[]
+    ) => void
+  ): () => void;
+  function subscribeToUsers(
+    scopeId: ScopeId,
+    cb:
+      | ((users: UserRecord<TRole, TCapability, TPreferences, TAttributes>[]) => void)
+      | ((members: ScopedMember<TRole, TCapability, TPreferences, TAttributes>[]) => void)
+      | ((
+          users:
+            | UserRecord<TRole, TCapability, TPreferences, TAttributes>[]
+            | ScopedMember<TRole, TCapability, TPreferences, TAttributes>[]
+        ) => void)
   ): () => void {
+    if (scopeId === GLOBAL_SCOPE) {
+      if (typeof store.subscribeToUsers !== "function") {
+        throw new Error("Backing store does not implement subscribeToUsers");
+      }
+      return store.subscribeToUsers(cb as (users: UserRecord<TRole, TCapability, TPreferences, TAttributes>[]) => void);
+    }
     if (!isValidResourceId(scopeId)) {
       throw new Error("Invalid scopeId");
     }
     if (typeof store.subscribeToScopeMembers !== "function") {
       throw new Error("Backing store does not implement subscribeToScopeMembers");
     }
-    return store.subscribeToScopeMembers(scopeId, cb);
+    return store.subscribeToScopeMembers(
+      scopeId,
+      cb as (members: ScopedMember<TRole, TCapability, TPreferences, TAttributes>[]) => void
+    );
   }
 
   function destroy(): void {
@@ -1128,7 +1168,6 @@ export function createLanyardClient<
     setActiveUser,
     subscribeToAuthUser,
     subscribeToUsers,
-    subscribeToScopeMembers,
     loginWithSocialProvider,
     sendPasswordlessEmailLink,
     completePasswordlessSignIn,
@@ -1138,7 +1177,6 @@ export function createLanyardClient<
     getSignInMethodsForEmail,
     sendEmailUpdateVerification,
     updatePreferences,
-    updateScopePreferences,
     updateProfile,
     getRoles,
     getAssignableRoles,

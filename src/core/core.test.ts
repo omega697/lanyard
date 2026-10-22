@@ -1052,14 +1052,6 @@ describe("lanyard/core unit tests", () => {
       expect(await store.getScopeMemberHiddenAttributes("ws-1", "u-hybrid")).toEqual({});
       expect(await store.getScopeMemberSecrets("ws-1", "u-hybrid")).toEqual({});
 
-      // Scope-wide secrets lifecycle (e.g. BYOK workspace keys)
-      await store.updateScopeSecrets("ws-1", { geminiKey: "AIzaSyWorkspaceByok" });
-      expect(await store.getScopeSecretsStatus("ws-1")).toEqual({ geminiKey: true });
-      expect(await store.getScopeSecrets("ws-1")).toEqual({ geminiKey: "AIzaSyWorkspaceByok" });
-      await store.updateScopeSecrets("ws-1", { geminiKey: null });
-      expect(await store.getScopeSecretsStatus("ws-1")).toEqual({});
-      expect(await store.getScopeSecrets("ws-1")).toEqual({});
-
       unsubUser();
       expect(observedUsers.length).toBeGreaterThanOrEqual(5);
     });

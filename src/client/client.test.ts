@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
 import * as firebaseAuth from "firebase/auth";
 import * as firebaseFirestore from "firebase/firestore";
-import { createPermissionPolicy, InMemoryLanyardStore } from "../core/index.js";
+import { createPermissionPolicy, GLOBAL_SCOPE, InMemoryLanyardStore } from "../core/index.js";
 import {
   createLanyardClient,
   formatExistingAccountError,
@@ -28,7 +28,6 @@ vi.mock("firebase/auth", async () => {
     signInWithPopup: vi.fn(),
     linkWithPopup: vi.fn(),
     unlink: vi.fn(),
-    signInAnonymously: vi.fn(),
     signInWithCustomToken: vi.fn(),
     signOut: vi.fn(),
     onAuthStateChanged: vi.fn(),
@@ -129,7 +128,6 @@ describe("lanyard/client unit tests", () => {
       emailVerified: true,
       displayName: "Alice",
       photoURL: null, // e.g., user first signed up via Magic Email Link and later linked Google
-      isAnonymous: false,
       providerData: [
         { providerId: "password", photoURL: null },
         { providerId: "google.com", photoURL: "https://example.com/provider-avatar.png" }
@@ -143,7 +141,6 @@ describe("lanyard/client unit tests", () => {
       emailVerified: true,
       displayName: "Alice",
       photoUrl: "https://example.com/provider-avatar.png",
-      isAnonymous: false,
       isAdmin: true,
       providerIds: ["password", "google.com"]
     });
@@ -179,7 +176,6 @@ describe("lanyard/client unit tests", () => {
       emailVerified: true,
       displayName: "User One",
       photoUrl: "https://example.com/u1-oauth.png",
-      isAnonymous: false,
       isAdmin: false,
       providerIds: ["google.com"]
     });
@@ -200,7 +196,6 @@ describe("lanyard/client unit tests", () => {
       emailVerified: true,
       displayName: "Root Admin",
       photoUrl: "https://example.com/admin.png",
-      isAnonymous: false,
       isAdmin: true,
       providerIds: ["google.com"]
     });
@@ -209,9 +204,9 @@ describe("lanyard/client unit tests", () => {
     expect(await store.getScopeMember("ws-1", "u-admin")).toBeNull();
 
     // Update preferences with syncToStore = false and syncToStore = true
-    await client.updatePreferences({ use12h: false }, false);
+    await client.updatePreferences(GLOBAL_SCOPE, { use12h: false }, false);
     expect(client.preferencesStore.get()).toEqual({ theme: "dark", use12h: false });
-    await client.updatePreferences({ theme: "light" }, true);
+    await client.updatePreferences(GLOBAL_SCOPE, { theme: "light" }, true);
 
     await client.signOut();
     unsubAuthUser();
@@ -337,13 +332,12 @@ describe("lanyard/client unit tests", () => {
       emailVerified: true,
       displayName: "Member",
       photoUrl: null,
-      isAnonymous: false,
       isAdmin: false,
       providerIds: []
     });
 
     client.recordActivity("ws-1");
-    await client.syncPresence({ scopeId: "ws-1" });
+    await client.syncPresence("ws-1");
     expect((await store.getScopeMember("ws-1", "u-mem"))?.lastSeen).toBeUndefined();
 
     // 2. Manager ('manager' has trackPresence: true)
@@ -353,7 +347,6 @@ describe("lanyard/client unit tests", () => {
       emailVerified: true,
       displayName: "Manager",
       photoUrl: "https://example.com/mgr.png",
-      isAnonymous: false,
       isAdmin: false,
       providerIds: []
     });
@@ -365,25 +358,25 @@ describe("lanyard/client unit tests", () => {
     const hbSpy = vi.spyOn(store, "recordPresenceHeartbeat");
     hbSpy.mockRejectedValueOnce(new Error("Write failed"));
     client.recordActivity("ws-1");
-    await client.syncPresence({ scopeId: "ws-1" });
+    await client.syncPresence("ws-1");
     expect(client.getPresenceStatus("ws-1").lastSynced).toBe(0);
 
     // Next attempt succeeds
-    await client.syncPresence({ scopeId: "ws-1" });
+    await client.syncPresence("ws-1");
     expect(client.getPresenceStatus("ws-1").lastSynced).toBe(baseTime);
 
     // Activity 1 minute later is throttled (not written to store yet)
     vi.spyOn(Date, "now").mockReturnValue(baseTime + 60_000);
     client.recordActivity("ws-1");
-    await client.syncPresence({ scopeId: "ws-1" });
+    await client.syncPresence("ws-1");
     expect((await store.getScopeMember("ws-1", "u-mgr"))?.lastSeen).toBe(new Date(baseTime).toISOString());
 
     // Unless isUnloading: true is passed
-    await client.syncPresence({ scopeId: "ws-1", isUnloading: true });
+    await client.syncPresence("ws-1", { isUnloading: true });
     expect((await store.getScopeMember("ws-1", "u-mgr"))?.lastSeen).toBe(new Date(baseTime + 60_000).toISOString());
 
     // startPresenceHeartbeat starts interval and cleans up cleanly
-    const stopHeartbeat = client.startPresenceHeartbeat({ scopeId: "ws-1" });
+    const stopHeartbeat = client.startPresenceHeartbeat("ws-1");
     stopHeartbeat();
 
     vi.restoreAllMocks();
@@ -566,7 +559,6 @@ describe("lanyard/client unit tests", () => {
       emailVerified: true,
       displayName: "User One",
       photoUrl: "https://example.com/already-synced.png",
-      isAnonymous: false,
       isAdmin: false,
       providerIds: ["google.com"]
     });
@@ -580,7 +572,6 @@ describe("lanyard/client unit tests", () => {
       emailVerified: true,
       displayName: "User One",
       photoUrl: "https://example.com/new-avatar.png",
-      isAnonymous: false,
       isAdmin: false,
       providerIds: ["google.com"]
     });
@@ -714,15 +705,14 @@ describe("lanyard/client unit tests", () => {
       emailVerified: true,
       displayName: "Alice",
       photoUrl: null,
-      isAnonymous: false,
       isAdmin: false,
       providerIds: []
     });
 
     client.recordActivity("ws-1");
     client.recordActivity("ws-2");
-    await client.syncPresence({ scopeId: "ws-1" });
-    await client.syncPresence({ scopeId: "ws-2" });
+    await client.syncPresence("ws-1");
+    await client.syncPresence("ws-2");
 
     expect(hbSpy).toHaveBeenCalledTimes(1);
     expect((await store.getScopeMember("ws-1", "u-alice"))?.lastSeen).toBe(new Date(t0).toISOString());
@@ -730,7 +720,7 @@ describe("lanyard/client unit tests", () => {
 
     // 2. No-new-activity guard: 10 minutes pass, but Alice has NOT triggered recordActivity since t0
     vi.spyOn(Date, "now").mockReturnValue(t0 + 10 * 60_000);
-    await client.syncPresence({ scopeId: "ws-1" });
+    await client.syncPresence("ws-1");
     expect(hbSpy).toHaveBeenCalledTimes(1); // still 1!
 
     // 3. Real-time role demotion mid-session: Alice is demoted from 'manager' to 'member' in ws-1
@@ -741,7 +731,7 @@ describe("lanyard/client unit tests", () => {
       lastSeen: new Date(t0).toISOString()
     });
     client.recordActivity("ws-1");
-    await client.syncPresence({ scopeId: "ws-1", isUnloading: true });
+    await client.syncPresence("ws-1", { isUnloading: true });
     expect(hbSpy).toHaveBeenCalledTimes(1); // blocked immediately upon demotion!
 
     // Real-time role promotion: Alice is promoted in ws-2 from 'member' to 'manager'
@@ -751,7 +741,7 @@ describe("lanyard/client unit tests", () => {
       roles: ["manager"]
     });
     client.recordActivity("ws-2");
-    await client.syncPresence({ scopeId: "ws-2" });
+    await client.syncPresence("ws-2");
     expect(hbSpy).toHaveBeenCalledTimes(2);
     expect((await store.getScopeMember("ws-2", "u-alice"))?.lastSeen).toBe(new Date(t0 + 10 * 60_000).toISOString());
 
@@ -763,7 +753,6 @@ describe("lanyard/client unit tests", () => {
       emailVerified: true,
       displayName: "Bob",
       photoUrl: null,
-      isAnonymous: false,
       isAdmin: false,
       providerIds: []
     });
@@ -778,7 +767,7 @@ describe("lanyard/client unit tests", () => {
       removeEventListener: vi.fn((evt: string) => listeners.delete(evt))
     });
 
-    const stopBobHeartbeat = client.startPresenceHeartbeat({ scopeId: "ws-1" });
+    const stopBobHeartbeat = client.startPresenceHeartbeat("ws-1");
     await new Promise((r) => setTimeout(r, 0));
     expect(hbSpy).toHaveBeenCalledTimes(3); // initial tick synced Bob at t0 + 10m
 
@@ -820,7 +809,6 @@ describe("lanyard/client unit tests", () => {
       emailVerified: true,
       displayName: "Alice",
       photoUrl: null,
-      isAnonymous: false,
       isAdmin: false,
       providerIds: []
     });
@@ -834,7 +822,6 @@ describe("lanyard/client unit tests", () => {
       emailVerified: true,
       displayName: "Bob",
       photoUrl: null,
-      isAnonymous: false,
       isAdmin: false,
       providerIds: []
     });
@@ -971,7 +958,6 @@ describe("lanyard/client unit tests", () => {
       emailVerified: true,
       displayName: "Retry User",
       photoUrl: "https://example.com/retry.png",
-      isAnonymous: false,
       isAdmin: true,
       providerIds: ["google.com"]
     });
@@ -985,7 +971,6 @@ describe("lanyard/client unit tests", () => {
       emailVerified: true,
       displayName: "Retry User",
       photoUrl: "https://example.com/retry.png",
-      isAnonymous: false,
       isAdmin: true,
       providerIds: ["google.com"]
     });
@@ -1004,26 +989,25 @@ describe("lanyard/client unit tests", () => {
       emailVerified: true,
       displayName: "Retry User",
       photoUrl: "https://example.com/retry.png",
-      isAnonymous: false,
       isAdmin: false,
       providerIds: ["google.com"]
     });
 
-    // Without a policy, non-admin without scopeId or in non-member scopeId does not track presence
-    clientNoPolicy.recordActivity();
-    await clientNoPolicy.syncPresence();
+    // Without a policy, non-admin in GLOBAL_SCOPE or in non-member scopeId does not track presence
+    clientNoPolicy.recordActivity(GLOBAL_SCOPE);
+    await clientNoPolicy.syncPresence(GLOBAL_SCOPE);
     clientNoPolicy.recordActivity("ws-not-member");
-    await clientNoPolicy.syncPresence({ scopeId: "ws-not-member" });
+    await clientNoPolicy.syncPresence("ws-not-member");
     expect(clientNoPolicy.getPresenceStatus("ws-1").lastSynced).toBe(0);
 
     // Reject first heartbeat write -> lastSynced rolls back to 0 so immediate retry succeeds!
     const hbSpy = vi.spyOn(store, "recordPresenceHeartbeat").mockRejectedValueOnce(new Error("Offline"));
     clientNoPolicy.recordActivity("ws-1");
-    await clientNoPolicy.syncPresence({ scopeId: "ws-1" });
+    await clientNoPolicy.syncPresence("ws-1");
     expect(hbSpy).toHaveBeenCalledTimes(1);
     expect(clientNoPolicy.getPresenceStatus("ws-1").lastSynced).toBe(0); // rolled back!
 
-    await clientNoPolicy.syncPresence({ scopeId: "ws-1" });
+    await clientNoPolicy.syncPresence("ws-1");
     expect(hbSpy).toHaveBeenCalledTimes(2);
     expect(clientNoPolicy.getPresenceStatus("ws-1").lastSynced).toBe(t0);
 
@@ -1242,7 +1226,7 @@ describe("lanyard/client unit tests", () => {
     });
 
     // Calling updateProfile before sign-in throws
-    await expect(client.updateProfile({ firstName: "Anon" })).rejects.toThrow(/No authenticated user/);
+    await expect(client.updateProfile(GLOBAL_SCOPE, { firstName: "Anon" })).rejects.toThrow(/No authenticated user/);
 
     client.setActiveUser({
       uid: "u-single",
@@ -1250,7 +1234,6 @@ describe("lanyard/client unit tests", () => {
       emailVerified: true,
       displayName: "Testy McTest",
       photoUrl: "https://example.com/oauth-single.png",
-      isAnonymous: false,
       isAdmin: false,
       providerIds: ["google.com"]
     });
@@ -1262,7 +1245,7 @@ describe("lanyard/client unit tests", () => {
     expect(client.userRecordStore.get()?.photoUrl).toBe("https://example.com/oauth-single.png");
 
     // 2. Self-service updateProfile updates firstName/lastName on users/{uid}, auto-computes displayName, and syncs to authStore & Firebase Auth
-    await client.updateProfile({ firstName: "Formy", lastName: "McFormerson" });
+    await client.updateProfile(GLOBAL_SCOPE, { firstName: "Formy", lastName: "McFormerson" });
     expect(client.userRecordStore.get()?.firstName).toBe("Formy");
     expect(client.userRecordStore.get()?.lastName).toBe("McFormerson");
     expect(client.userRecordStore.get()?.displayName).toBe("Formy McFormerson");
@@ -1278,7 +1261,6 @@ describe("lanyard/client unit tests", () => {
       emailVerified: true,
       displayName: "Formy McFormerson",
       photoUrl: "https://example.com/oauth-single.png",
-      isAnonymous: false,
       isAdmin: false,
       providerIds: ["google.com"]
     });
@@ -1304,16 +1286,16 @@ describe("lanyard/client unit tests", () => {
     // Attributes and preferences remain intact after admin demotion!
     expect(client.attributesStore.get().pointsAllTime).toBe(170);
 
-    // 5. Single-tenant presence tracking without scopeId: 'manager' role on users/{uid} has trackPresence: true
+    // 5. Single-tenant presence tracking with GLOBAL_SCOPE: 'manager' role on users/{uid} has trackPresence: true
     const t0 = 1_700_000_000_000;
     vi.spyOn(Date, "now").mockReturnValue(t0);
-    client.recordActivity();
-    await client.syncPresence();
+    client.recordActivity(GLOBAL_SCOPE);
+    await client.syncPresence(GLOBAL_SCOPE);
     expect((await store.getUser("u-single"))?.lastSeen).toBe(new Date(t0).toISOString());
 
-    // 6. Unscoped subscribeToUsers directory subscription on client & store
+    // 6. Unscoped subscribeToUsers(GLOBAL_SCOPE, cb) directory subscription on client & store
     const observedDirectory: string[][] = [];
-    const unsubDir = client.subscribeToUsers((users) => {
+    const unsubDir = client.subscribeToUsers(GLOBAL_SCOPE, (users) => {
       observedDirectory.push(users.map((u) => u.uid));
     });
     expect(observedDirectory.at(-1)).toEqual(["u-single"]);
@@ -1397,14 +1379,14 @@ describe("lanyard/client unit tests", () => {
     });
 
     // Before sign-in, all role/capability checks return false/empty
-    expect(client.getRoles()).toEqual([]);
+    expect(client.getRoles(GLOBAL_SCOPE)).toEqual([]);
     expect(client.getRoles("ws-alpha")).toEqual([]);
-    expect(client.hasRole("member")).toBe(false);
-    expect(client.hasAnyRole(["member", "editor"])).toBe(false);
-    expect(client.hasAllRoles(["member"])).toBe(false);
-    expect(client.hasCapability("edit_content")).toBe(false);
-    expect(client.getCapabilities()).toEqual([]);
-    expect(client.canAssignRoles()).toBe(false);
+    expect(client.hasRole("member", GLOBAL_SCOPE)).toBe(false);
+    expect(client.hasAnyRole(["member", "editor"], GLOBAL_SCOPE)).toBe(false);
+    expect(client.hasAllRoles(["member"], GLOBAL_SCOPE)).toBe(false);
+    expect(client.hasCapability("edit_content", GLOBAL_SCOPE)).toBe(false);
+    expect(client.getCapabilities(GLOBAL_SCOPE)).toEqual([]);
+    expect(client.canAssignRoles(GLOBAL_SCOPE)).toBe(false);
 
     client.setActiveUser({
       uid: "u-dual",
@@ -1412,28 +1394,27 @@ describe("lanyard/client unit tests", () => {
       emailVerified: true,
       displayName: "Dualy McDual",
       photoUrl: null,
-      isAnonymous: false,
       isAdmin: false,
       providerIds: ["google.com"]
     });
 
-    // 1. Unscoped (single-tenant) role, capability, preference, and attribute checks:
+    // 1. Unscoped (GLOBAL_SCOPE) role, capability, preference, and attribute checks:
     expect(client.getAssignableRoles()).toEqual(["owner", "manager", "editor", "member"]);
-    expect(client.getRoles()).toEqual(["editor"]);
-    expect(client.hasRole("editor")).toBe(true);
-    expect(client.hasRole("member")).toBe(true); // inherited via editor -> member!
-    expect(client.hasRole("manager")).toBe(false);
-    expect(client.hasAnyRole(["manager", "editor"])).toBe(true);
-    expect(client.hasAllRoles(["editor", "member"])).toBe(true);
-    expect(client.hasAllRoles(["editor", "manager"])).toBe(false);
-    expect(client.hasCapability("edit_content")).toBe(true);
-    expect(client.hasCapability("invite_members")).toBe(false);
-    expect(client.hasAnyCapability(["invite_members", "edit_content"])).toBe(true);
-    expect(client.hasAllCapabilities(["edit_content"])).toBe(true);
-    expect(client.hasAllCapabilities(["edit_content", "invite_members"])).toBe(false);
-    expect(client.getCapabilities()).toEqual(["edit_content"]);
-    expect(client.getAttributes()).toEqual({ points: 42, tier: "silver" });
-    expect(client.getPreferences()).toEqual({ theme: "dark", use12h: true });
+    expect(client.getRoles(GLOBAL_SCOPE)).toEqual(["editor"]);
+    expect(client.hasRole("editor", GLOBAL_SCOPE)).toBe(true);
+    expect(client.hasRole("member", GLOBAL_SCOPE)).toBe(true); // inherited via editor -> member!
+    expect(client.hasRole("manager", GLOBAL_SCOPE)).toBe(false);
+    expect(client.hasAnyRole(["manager", "editor"], GLOBAL_SCOPE)).toBe(true);
+    expect(client.hasAllRoles(["editor", "member"], GLOBAL_SCOPE)).toBe(true);
+    expect(client.hasAllRoles(["editor", "manager"], GLOBAL_SCOPE)).toBe(false);
+    expect(client.hasCapability("edit_content", GLOBAL_SCOPE)).toBe(true);
+    expect(client.hasCapability("invite_members", GLOBAL_SCOPE)).toBe(false);
+    expect(client.hasAnyCapability(["invite_members", "edit_content"], GLOBAL_SCOPE)).toBe(true);
+    expect(client.hasAllCapabilities(["edit_content"], GLOBAL_SCOPE)).toBe(true);
+    expect(client.hasAllCapabilities(["edit_content", "invite_members"], GLOBAL_SCOPE)).toBe(false);
+    expect(client.getCapabilities(GLOBAL_SCOPE)).toEqual(["edit_content"]);
+    expect(client.getAttributes(GLOBAL_SCOPE)).toEqual({ points: 42, tier: "silver" });
+    expect(client.getPreferences(GLOBAL_SCOPE)).toEqual({ theme: "dark", use12h: true });
 
     // 2. Scoped ('ws-alpha' and 'ws-beta') role, capability, preference, and attribute checks:
     expect(client.getRoles("ws-alpha")).toEqual(["manager"]);
@@ -1458,25 +1439,28 @@ describe("lanyard/client unit tests", () => {
     expect(client.getAttributes("ws-unknown")).toEqual({});
     expect(client.getPreferences("ws-unknown")).toEqual(DEFAULT_PREFS);
 
-    // 3. Updating scoped preferences via both `updateScopePreferences` and `updatePreferences(patch, { scopeId })`:
-    await client.updateScopePreferences("ws-alpha", { theme: "dark" });
+    // 3. Updating scoped preferences and profile via `updatePreferences("ws-alpha", patch)` and `updateProfile("ws-alpha", patch)`:
+    await client.updatePreferences("ws-alpha", { theme: "dark" });
     expect(client.getPreferences("ws-alpha")).toEqual({ theme: "dark", use12h: false });
     expect((await store.getScopeMember("ws-alpha", "u-dual"))?.preferences).toEqual({
       theme: "dark",
       use12h: false
     });
 
-    await client.updatePreferences({ use12h: true }, { scopeId: "ws-alpha" });
+    await client.updatePreferences("ws-alpha", { use12h: true });
     expect(client.getPreferences("ws-alpha")).toEqual({ theme: "dark", use12h: true });
+
+    await client.updateProfile("ws-alpha", { firstName: "Alpha", lastName: "Member" });
+    expect((await store.getScopeMember("ws-alpha", "u-dual"))?.displayName).toBe("Alpha Member");
 
     // Global preferences remain independent of scoped preferences
-    expect(client.getPreferences()).toEqual({ theme: "dark", use12h: true });
-    await client.updatePreferences({ theme: "light" });
-    expect(client.getPreferences()).toEqual({ theme: "light", use12h: true });
+    expect(client.getPreferences(GLOBAL_SCOPE)).toEqual({ theme: "dark", use12h: true });
+    await client.updatePreferences(GLOBAL_SCOPE, { theme: "light" });
+    expect(client.getPreferences(GLOBAL_SCOPE)).toEqual({ theme: "light", use12h: true });
     expect(client.getPreferences("ws-alpha")).toEqual({ theme: "dark", use12h: true });
 
-    // Calling updateScopePreferences on a non-member scope throws and never creates a phantom member
-    await expect(client.updateScopePreferences("ws-nonmember", { theme: "dark" })).rejects.toThrow(
+    // Calling updatePreferences on a non-member scope throws and never creates a phantom member
+    await expect(client.updatePreferences("ws-nonmember", { theme: "dark" })).rejects.toThrow(
       /does not exist in scope/
     );
     expect(await store.getScopeMember("ws-nonmember", "u-dual")).toBeNull();
@@ -1490,14 +1474,14 @@ describe("lanyard/client unit tests", () => {
     });
 
     // Before sign-in, all permission checks return false
-    expect(clientFourTier.canReadUser()).toBe(false);
-    expect(clientFourTier.canWriteUser()).toBe(false);
-    expect(clientFourTier.canAssignRoles()).toBe(false);
-    expect(clientFourTier.canReadAttribute("points")).toBe(false);
-    expect(clientFourTier.canWriteAttribute("points")).toBe(false);
-    expect(clientFourTier.canReadHiddenAttribute("moderatorNotes")).toBe(false);
-    expect(clientFourTier.canWriteHiddenAttribute("moderatorNotes")).toBe(false);
-    expect(clientFourTier.canWriteSecret("personalGeminiKey")).toBe(false);
+    expect(clientFourTier.canReadUser(GLOBAL_SCOPE)).toBe(false);
+    expect(clientFourTier.canWriteUser(GLOBAL_SCOPE)).toBe(false);
+    expect(clientFourTier.canAssignRoles(GLOBAL_SCOPE)).toBe(false);
+    expect(clientFourTier.canReadAttribute(GLOBAL_SCOPE, "points")).toBe(false);
+    expect(clientFourTier.canWriteAttribute(GLOBAL_SCOPE, "points")).toBe(false);
+    expect(clientFourTier.canReadHiddenAttribute(GLOBAL_SCOPE, "moderatorNotes")).toBe(false);
+    expect(clientFourTier.canWriteHiddenAttribute(GLOBAL_SCOPE, "moderatorNotes")).toBe(false);
+    expect(clientFourTier.canWriteSecret(GLOBAL_SCOPE, "personalGeminiKey")).toBe(false);
 
     clientFourTier.setActiveUser({
       uid: "u-dual",
@@ -1505,44 +1489,43 @@ describe("lanyard/client unit tests", () => {
       emailVerified: true,
       displayName: "Dualy McDual",
       photoUrl: null,
-      isAnonymous: false,
       isAdmin: false,
       providerIds: ["google.com"]
     });
 
     // Unscoped ('u-dual' has roles: ['editor'] -> has 'edit_content', lacks 'invite_members'):
-    expect(clientFourTier.canReadUser()).toBe(true);
-    expect(clientFourTier.canReadUser({ isSelf: false })).toBe(true);
-    expect(clientFourTier.canWriteUser()).toBe(false);
-    expect(clientFourTier.canAssignRoles()).toBe(false);
+    expect(clientFourTier.canReadUser(GLOBAL_SCOPE)).toBe(true);
+    expect(clientFourTier.canReadUser(GLOBAL_SCOPE, { isSelf: false })).toBe(true);
+    expect(clientFourTier.canWriteUser(GLOBAL_SCOPE)).toBe(false);
+    expect(clientFourTier.canAssignRoles(GLOBAL_SCOPE)).toBe(false);
     expect(clientFourTier.canAssignRoles("ws-alpha")).toBe(true);
     // - Attributes: self can read own 'tier' (isSelf defaults to true), cannot read another user's 'tier' ({ isSelf: false }), can write 'points' (has 'edit_content'), cannot write 'tier' (lacks 'invite_members')
-    expect(clientFourTier.canReadAttribute("tier")).toBe(true);
-    expect(clientFourTier.canReadAttribute("tier", { isSelf: false })).toBe(false);
-    expect(clientFourTier.canWriteAttribute("points")).toBe(true);
-    expect(clientFourTier.canWriteAttribute("tier")).toBe(false);
+    expect(clientFourTier.canReadAttribute(GLOBAL_SCOPE, "tier")).toBe(true);
+    expect(clientFourTier.canReadAttribute(GLOBAL_SCOPE, "tier", { isSelf: false })).toBe(false);
+    expect(clientFourTier.canWriteAttribute(GLOBAL_SCOPE, "points")).toBe(true);
+    expect(clientFourTier.canWriteAttribute(GLOBAL_SCOPE, "tier")).toBe(false);
     // - HiddenAttributes: lacks 'invite_members' so cannot read 'moderatorNotes', but has 'edit_content' so CAN write 'moderatorNotes'
-    expect(clientFourTier.canReadHiddenAttribute("moderatorNotes")).toBe(false);
-    expect(clientFourTier.canWriteHiddenAttribute("moderatorNotes")).toBe(true);
+    expect(clientFourTier.canReadHiddenAttribute(GLOBAL_SCOPE, "moderatorNotes")).toBe(false);
+    expect(clientFourTier.canWriteHiddenAttribute(GLOBAL_SCOPE, "moderatorNotes")).toBe(true);
     // - Secrets: can write own 'personalGeminiKey' (allowSelfWrite: true), cannot write 'workspaceOpenaiKey' (allowSelfWrite: false, lacks 'invite_members')
-    expect(clientFourTier.canWriteSecret("personalGeminiKey")).toBe(true);
-    expect(clientFourTier.canWriteSecret("workspaceOpenaiKey")).toBe(false);
+    expect(clientFourTier.canWriteSecret(GLOBAL_SCOPE, "personalGeminiKey")).toBe(true);
+    expect(clientFourTier.canWriteSecret(GLOBAL_SCOPE, "workspaceOpenaiKey")).toBe(false);
 
     // Scoped in 'ws-alpha' ('u-dual' is 'manager' -> has 'edit_content' + 'invite_members'):
-    expect(clientFourTier.canReadAttribute("tier", { scopeId: "ws-alpha", isSelf: false })).toBe(true);
-    expect(clientFourTier.canWriteAttribute("tier", "ws-alpha")).toBe(true);
-    expect(clientFourTier.canReadHiddenAttribute("moderatorNotes", "ws-alpha")).toBe(true);
-    expect(clientFourTier.canWriteHiddenAttribute("moderatorNotes", "ws-alpha")).toBe(true);
-    expect(clientFourTier.canWriteSecret("workspaceOpenaiKey", { scopeId: "ws-alpha", isSelf: false })).toBe(true);
+    expect(clientFourTier.canReadAttribute("ws-alpha", "tier", { isSelf: false })).toBe(true);
+    expect(clientFourTier.canWriteAttribute("ws-alpha", "tier")).toBe(true);
+    expect(clientFourTier.canReadHiddenAttribute("ws-alpha", "moderatorNotes")).toBe(true);
+    expect(clientFourTier.canWriteHiddenAttribute("ws-alpha", "moderatorNotes")).toBe(true);
+    expect(clientFourTier.canWriteSecret("ws-alpha", "workspaceOpenaiKey", { isSelf: false })).toBe(true);
 
     // Scoped in 'ws-beta' ('u-dual' is 'owner' -> capabilities: '*'):
-    expect(clientFourTier.canWriteAttribute("tier", "ws-beta")).toBe(true);
-    expect(clientFourTier.canWriteSecret("workspaceOpenaiKey", { scopeId: "ws-beta", isSelf: false })).toBe(true);
+    expect(clientFourTier.canWriteAttribute("ws-beta", "tier")).toBe(true);
+    expect(clientFourTier.canWriteSecret("ws-beta", "workspaceOpenaiKey", { isSelf: false })).toBe(true);
 
     // Non-member scope ('ws-unknown') or invalid scopeId ('../bad') returns false
-    expect(clientFourTier.canReadAttribute("points", "ws-unknown")).toBe(false);
-    expect(clientFourTier.canWriteSecret("personalGeminiKey", "ws-unknown")).toBe(false);
-    expect(clientFourTier.canWriteSecret("personalGeminiKey", "../bad")).toBe(false);
+    expect(clientFourTier.canReadAttribute("ws-unknown", "points")).toBe(false);
+    expect(clientFourTier.canWriteSecret("ws-unknown", "personalGeminiKey")).toBe(false);
+    expect(clientFourTier.canWriteSecret("../bad", "personalGeminiKey")).toBe(false);
 
     // Policy-less client fallback behavior (when policy is omitted from createLanyardClient):
     const clientNoPolicy = createLanyardClient<DualRole, TestCap, TestPrefs, CustomAttrs>({
@@ -1551,14 +1534,14 @@ describe("lanyard/client unit tests", () => {
     });
 
     // While signed out, all permission checks return false
-    expect(clientNoPolicy.canReadUser()).toBe(false);
-    expect(clientNoPolicy.canWriteUser()).toBe(false);
-    expect(clientNoPolicy.canAssignRoles()).toBe(false);
-    expect(clientNoPolicy.canReadAttribute("points")).toBe(false);
-    expect(clientNoPolicy.canWriteAttribute("points")).toBe(false);
-    expect(clientNoPolicy.canReadHiddenAttribute("staffNotes")).toBe(false);
-    expect(clientNoPolicy.canWriteHiddenAttribute("staffNotes")).toBe(false);
-    expect(clientNoPolicy.canWriteSecret("personalGeminiKey")).toBe(false);
+    expect(clientNoPolicy.canReadUser(GLOBAL_SCOPE)).toBe(false);
+    expect(clientNoPolicy.canWriteUser(GLOBAL_SCOPE)).toBe(false);
+    expect(clientNoPolicy.canAssignRoles(GLOBAL_SCOPE)).toBe(false);
+    expect(clientNoPolicy.canReadAttribute(GLOBAL_SCOPE, "points")).toBe(false);
+    expect(clientNoPolicy.canWriteAttribute(GLOBAL_SCOPE, "points")).toBe(false);
+    expect(clientNoPolicy.canReadHiddenAttribute(GLOBAL_SCOPE, "staffNotes")).toBe(false);
+    expect(clientNoPolicy.canWriteHiddenAttribute(GLOBAL_SCOPE, "staffNotes")).toBe(false);
+    expect(clientNoPolicy.canWriteSecret(GLOBAL_SCOPE, "personalGeminiKey")).toBe(false);
 
     // Non-admin user without a policy: can read own user/attributes and write own secrets (isSelf: true),
     // but cannot read others' user/attributes, write users/attributes/hiddenAttributes, or write non-self secrets
@@ -1568,26 +1551,25 @@ describe("lanyard/client unit tests", () => {
       emailVerified: true,
       displayName: "Dual User",
       photoUrl: null,
-      isAnonymous: false,
       isAdmin: false,
       providerIds: ["google.com"]
     });
-    expect(clientNoPolicy.canReadUser({ isSelf: true })).toBe(true);
-    expect(clientNoPolicy.canReadUser()).toBe(false);
-    expect(clientNoPolicy.canReadUser({ isSelf: false })).toBe(false);
-    expect(clientNoPolicy.canWriteUser()).toBe(false);
-    expect(clientNoPolicy.canAssignRoles()).toBe(false);
-    expect(clientNoPolicy.canReadAttribute("points")).toBe(true);
-    expect(clientNoPolicy.canReadAttribute("points", { isSelf: false })).toBe(false);
-    expect(clientNoPolicy.canReadAttribute("points", "ws-alpha")).toBe(true);
-    expect(clientNoPolicy.canReadAttribute("points", "ws-unknown")).toBe(false);
-    expect(clientNoPolicy.canWriteAttribute("points")).toBe(false);
-    expect(clientNoPolicy.canReadHiddenAttribute("staffNotes")).toBe(false);
-    expect(clientNoPolicy.canWriteHiddenAttribute("staffNotes")).toBe(false);
-    expect(clientNoPolicy.canWriteSecret("personalGeminiKey")).toBe(true);
-    expect(clientNoPolicy.canWriteSecret("personalGeminiKey", { isSelf: false })).toBe(false);
-    expect(clientNoPolicy.canWriteSecret("personalGeminiKey", "ws-alpha")).toBe(true);
-    expect(clientNoPolicy.canWriteSecret("personalGeminiKey", "ws-unknown")).toBe(false);
+    expect(clientNoPolicy.canReadUser(GLOBAL_SCOPE, { isSelf: true })).toBe(true);
+    expect(clientNoPolicy.canReadUser(GLOBAL_SCOPE)).toBe(false);
+    expect(clientNoPolicy.canReadUser(GLOBAL_SCOPE, { isSelf: false })).toBe(false);
+    expect(clientNoPolicy.canWriteUser(GLOBAL_SCOPE)).toBe(false);
+    expect(clientNoPolicy.canAssignRoles(GLOBAL_SCOPE)).toBe(false);
+    expect(clientNoPolicy.canReadAttribute(GLOBAL_SCOPE, "points")).toBe(true);
+    expect(clientNoPolicy.canReadAttribute(GLOBAL_SCOPE, "points", { isSelf: false })).toBe(false);
+    expect(clientNoPolicy.canReadAttribute("ws-alpha", "points")).toBe(true);
+    expect(clientNoPolicy.canReadAttribute("ws-unknown", "points")).toBe(false);
+    expect(clientNoPolicy.canWriteAttribute(GLOBAL_SCOPE, "points")).toBe(false);
+    expect(clientNoPolicy.canReadHiddenAttribute(GLOBAL_SCOPE, "staffNotes")).toBe(false);
+    expect(clientNoPolicy.canWriteHiddenAttribute(GLOBAL_SCOPE, "staffNotes")).toBe(false);
+    expect(clientNoPolicy.canWriteSecret(GLOBAL_SCOPE, "personalGeminiKey")).toBe(true);
+    expect(clientNoPolicy.canWriteSecret(GLOBAL_SCOPE, "personalGeminiKey", { isSelf: false })).toBe(false);
+    expect(clientNoPolicy.canWriteSecret("ws-alpha", "personalGeminiKey")).toBe(true);
+    expect(clientNoPolicy.canWriteSecret("ws-unknown", "personalGeminiKey")).toBe(false);
 
     // System admin without a policy: allowed for all attribute/hiddenAttribute/secret operations
     clientNoPolicy.setActiveUser({
@@ -1596,18 +1578,17 @@ describe("lanyard/client unit tests", () => {
       emailVerified: true,
       displayName: "Admin User",
       photoUrl: null,
-      isAnonymous: false,
       isAdmin: true,
       providerIds: ["google.com"]
     });
-    expect(clientNoPolicy.canReadUser({ isSelf: false })).toBe(true);
-    expect(clientNoPolicy.canWriteUser()).toBe(true);
-    expect(clientNoPolicy.canAssignRoles()).toBe(true);
-    expect(clientNoPolicy.canReadAttribute("points", { isSelf: false })).toBe(true);
-    expect(clientNoPolicy.canWriteAttribute("points")).toBe(true);
-    expect(clientNoPolicy.canReadHiddenAttribute("staffNotes")).toBe(true);
-    expect(clientNoPolicy.canWriteHiddenAttribute("staffNotes")).toBe(true);
-    expect(clientNoPolicy.canWriteSecret("workspaceOpenaiKey", { scopeId: "ws-unknown", isSelf: false })).toBe(true);
+    expect(clientNoPolicy.canReadUser(GLOBAL_SCOPE, { isSelf: false })).toBe(true);
+    expect(clientNoPolicy.canWriteUser(GLOBAL_SCOPE)).toBe(true);
+    expect(clientNoPolicy.canAssignRoles(GLOBAL_SCOPE)).toBe(true);
+    expect(clientNoPolicy.canReadAttribute(GLOBAL_SCOPE, "points", { isSelf: false })).toBe(true);
+    expect(clientNoPolicy.canWriteAttribute(GLOBAL_SCOPE, "points")).toBe(true);
+    expect(clientNoPolicy.canReadHiddenAttribute(GLOBAL_SCOPE, "staffNotes")).toBe(true);
+    expect(clientNoPolicy.canWriteHiddenAttribute(GLOBAL_SCOPE, "staffNotes")).toBe(true);
+    expect(clientNoPolicy.canWriteSecret("ws-unknown", "workspaceOpenaiKey", { isSelf: false })).toBe(true);
 
     clientNoPolicy.destroy();
     clientFourTier.destroy();

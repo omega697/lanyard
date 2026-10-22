@@ -149,11 +149,6 @@ export class FirestoreServerStore<
     );
   }
 
-  private scopeSecretsDocRef(scopeId: string) {
-    const cleanScopeId = assertValidFirestoreDocId(scopeId, "scopeId");
-    return this.db.doc(`${this.scopeCollection}/${cleanScopeId}/private/secrets`);
-  }
-
   private parseSecretsStatusFromDocData(data: Record<string, any>): Partial<Record<keyof TSecrets & string, boolean>> {
     const status: Record<string, boolean> = {};
     for (const [k, v] of Object.entries(data)) {
@@ -552,26 +547,6 @@ export class FirestoreServerStore<
     patch: Partial<Record<keyof TSecrets & string, string | null>>
   ): Promise<Partial<Record<keyof TSecrets & string, boolean>>> {
     const ref = this.memberSecretsDocRef(scopeId, uid);
-    return this.writeEncryptedSecretsToRef(ref, patch);
-  }
-
-  async getScopeSecrets(scopeId: string): Promise<Partial<Record<keyof TSecrets & string, string>>> {
-    const snap = await this.scopeSecretsDocRef(scopeId).get();
-    if (!snap.exists) return {};
-    return this.decryptSecretsFromDocData(snap.data() || {});
-  }
-
-  async getScopeSecretsStatus(scopeId: string): Promise<Partial<Record<keyof TSecrets & string, boolean>>> {
-    const snap = await this.scopeSecretsDocRef(scopeId).get();
-    if (!snap.exists) return {};
-    return this.parseSecretsStatusFromDocData(snap.data() || {});
-  }
-
-  async updateScopeSecrets(
-    scopeId: string,
-    patch: Partial<Record<keyof TSecrets & string, string | null>>
-  ): Promise<Partial<Record<keyof TSecrets & string, boolean>>> {
-    const ref = this.scopeSecretsDocRef(scopeId);
     return this.writeEncryptedSecretsToRef(ref, patch);
   }
 

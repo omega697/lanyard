@@ -33,7 +33,7 @@ import {
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { FirestoreClientStore } from "./client/firestore.js";
 import { createLanyardClient } from "./client/index.js";
-import { createPermissionPolicy, type LanyardReadable } from "./core/index.js";
+import { createPermissionPolicy, GLOBAL_SCOPE, type LanyardReadable } from "./core/index.js";
 import { FirestoreServerStore } from "./server/firestore.js";
 import { createLanyardServer, isEncryptedSecretData } from "./server/index.js";
 
@@ -328,6 +328,7 @@ describe.skipIf(!existsSync(EMULATOR_JAR) || !existsSync(AUTH_EMULATOR_SERVER_JS
 
       // 1. Provision single-tenant users in real Firebase Auth Emulator + real Firestore (including omitting optional firstName/lastName to verify no undefined field errors!)
       const attendee = await server.upsertUserByEmail({
+        scopeId: GLOBAL_SCOPE,
         email: "attendee@example.com",
         firstName: "Testy",
         lastName: "McTest",
@@ -341,18 +342,22 @@ describe.skipIf(!existsSync(EMULATOR_JAR) || !existsSync(AUTH_EMULATOR_SERVER_JS
         }
       });
       const scanner = await server.upsertUserByEmail({
+        scopeId: GLOBAL_SCOPE,
         email: "scanner@example.com",
         roles: ["scanner"] // firstName & lastName intentionally omitted!
       });
       const merchSeller = await server.upsertUserByEmail({
+        scopeId: GLOBAL_SCOPE,
         email: "merch@example.com",
         roles: ["merch_seller"]
       });
       const auditor = await server.upsertUserByEmail({
+        scopeId: GLOBAL_SCOPE,
         email: "auditor@example.com",
         roles: ["auditor"]
       });
       const moderator = await server.upsertUserByEmail({
+        scopeId: GLOBAL_SCOPE,
         email: "moderator@example.com",
         firstName: "Moddy",
         lastName: "McModerator",
@@ -403,12 +408,14 @@ describe.skipIf(!existsSync(EMULATOR_JAR) || !existsSync(AUTH_EMULATOR_SERVER_JS
       // 3. Sibling role isolation on real Firestore:
       // Scanner updates pointsAllTime (10 -> 35) and scannerAuditLog, but is blocked from merchCreditBalance & merchPosPin
       await server.updateUserAttributes({
-        actorUid: scanner.uid,
+        scopeId: GLOBAL_SCOPE,
+        actor: scanner,
         targetUid: attendee.uid,
         patch: { pointsAllTime: 35 }
       });
       await server.updateUserHiddenAttributes({
-        actorUid: scanner.uid,
+        scopeId: GLOBAL_SCOPE,
+        actor: scanner,
         targetUid: attendee.uid,
         patch: { scannerAuditLog: "Checked in at Main Hall" }
       });
@@ -424,18 +431,21 @@ describe.skipIf(!existsSync(EMULATOR_JAR) || !existsSync(AUTH_EMULATOR_SERVER_JS
 
       // Merch seller updates merchCreditBalance (100 -> 80) and merchPosPin, but is blocked from pointsAllTime
       await server.updateUserAttributes({
-        actorUid: merchSeller.uid,
+        scopeId: GLOBAL_SCOPE,
+        actor: merchSeller,
         targetUid: attendee.uid,
         patch: { merchCreditBalance: 80 }
       });
       await server.updateUserHiddenAttributes({
-        actorUid: merchSeller.uid,
+        scopeId: GLOBAL_SCOPE,
+        actor: merchSeller,
         targetUid: attendee.uid,
         patch: { merchPosPin: "7744" }
       });
       await expect(
         server.updateUserAttributes({
-          actorUid: merchSeller.uid,
+          scopeId: GLOBAL_SCOPE,
+          actor: merchSeller,
           targetUid: attendee.uid,
           patch: { pointsAllTime: 999 }
         })
@@ -444,7 +454,8 @@ describe.skipIf(!existsSync(EMULATOR_JAR) || !existsSync(AUTH_EMULATOR_SERVER_JS
       // Sibling attribute & hiddenAttribute read redaction from real Firestore:
       expect(
         await server.readUserAttributes({
-          actorUid: scanner.uid,
+          scopeId: GLOBAL_SCOPE,
+          actor: scanner,
           targetUid: attendee.uid
         })
       ).toEqual({
@@ -453,7 +464,8 @@ describe.skipIf(!existsSync(EMULATOR_JAR) || !existsSync(AUTH_EMULATOR_SERVER_JS
       });
       expect(
         await server.readUserHiddenAttributes({
-          actorUid: scanner.uid,
+          scopeId: GLOBAL_SCOPE,
+          actor: scanner,
           targetUid: attendee.uid
         })
       ).toEqual({
@@ -461,7 +473,8 @@ describe.skipIf(!existsSync(EMULATOR_JAR) || !existsSync(AUTH_EMULATOR_SERVER_JS
       });
       expect(
         await server.readUserHiddenAttributes({
-          actorUid: merchSeller.uid,
+          scopeId: GLOBAL_SCOPE,
+          actor: merchSeller,
           targetUid: attendee.uid
         })
       ).toEqual({
@@ -471,7 +484,8 @@ describe.skipIf(!existsSync(EMULATOR_JAR) || !existsSync(AUTH_EMULATOR_SERVER_JS
       // Auditor can read merchCreditBalance, readonlySystemBadge, and scannerAuditLog, but cannot write anything
       expect(
         await server.readUserAttributes({
-          actorUid: auditor.uid,
+          scopeId: GLOBAL_SCOPE,
+          actor: auditor,
           targetUid: attendee.uid
         })
       ).toEqual({
@@ -482,7 +496,8 @@ describe.skipIf(!existsSync(EMULATOR_JAR) || !existsSync(AUTH_EMULATOR_SERVER_JS
       });
       await expect(
         server.updateUserHiddenAttributes({
-          actorUid: auditor.uid,
+          scopeId: GLOBAL_SCOPE,
+          actor: auditor,
           targetUid: attendee.uid,
           patch: { scannerAuditLog: "Auditor tamper" }
         })
@@ -490,13 +505,14 @@ describe.skipIf(!existsSync(EMULATOR_JAR) || !existsSync(AUTH_EMULATOR_SERVER_JS
 
       // 4. Write-only hiddenAttribute (`blindAuditHash`), superAdmin hiddenAttribute, & AES-256-GCM encrypted `secrets` on real Firestore:
       await server.updateUserHiddenAttributes({
-        actorUid: moderator.uid,
+        scopeId: GLOBAL_SCOPE,
+        actor: moderator,
         targetUid: attendee.uid,
         patch: { blindAuditHash: "sha256:998877" }
       });
       await server.updateUserHiddenAttributes({
-        actorUid: "root-admin",
-        isSystemAdmin: true,
+        scopeId: GLOBAL_SCOPE,
+        actor: { uid: "root-admin", isAdmin: true },
         targetUid: attendee.uid,
         patch: { superAdminSecret: "root-eyes-only" }
       });
@@ -504,7 +520,8 @@ describe.skipIf(!existsSync(EMULATOR_JAR) || !existsSync(AUTH_EMULATOR_SERVER_JS
       // Moderator reads both sibling hiddenAttributes via diamond inheritance, while `blindAuditHash` and `superAdminSecret` are redacted
       expect(
         await server.readUserHiddenAttributes({
-          actorUid: moderator.uid,
+          scopeId: GLOBAL_SCOPE,
+          actor: moderator,
           targetUid: attendee.uid
         })
       ).toEqual({
@@ -515,8 +532,8 @@ describe.skipIf(!existsSync(EMULATOR_JAR) || !existsSync(AUTH_EMULATOR_SERVER_JS
       // System admin reads all 4 hiddenAttribute fields from real Firestore
       expect(
         await server.readUserHiddenAttributes({
-          actorUid: "root-admin",
-          isSystemAdmin: true,
+          scopeId: GLOBAL_SCOPE,
+          actor: { uid: "root-admin", isAdmin: true },
           targetUid: attendee.uid
         })
       ).toEqual({
@@ -528,7 +545,8 @@ describe.skipIf(!existsSync(EMULATOR_JAR) || !existsSync(AUTH_EMULATOR_SERVER_JS
 
       // Write-only AES-256-GCM encrypted user secrets on real Firestore (`users_st/{uid}/private/secrets`):
       const secretStatus1 = await server.updateUserSecrets({
-        actorUid: attendee.uid,
+        scopeId: GLOBAL_SCOPE,
+        actor: attendee,
         targetUid: attendee.uid,
         patch: { geminiKey: "AIzaSyRealFirestoreKey123" }
       });
@@ -541,21 +559,22 @@ describe.skipIf(!existsSync(EMULATOR_JAR) || !existsSync(AUTH_EMULATOR_SERVER_JS
       expect(JSON.stringify(rawSecretData)).not.toContain("AIzaSyRealFirestoreKey123");
 
       // Server decrypts it cleanly via getDecryptedUserSecrets, and clearing with "" deletes the field via FieldValue.delete()
-      expect(await server.getDecryptedUserSecrets(attendee.uid)).toEqual({
+      expect(await server.getDecryptedUserSecrets(GLOBAL_SCOPE, attendee.uid)).toEqual({
         geminiKey: "AIzaSyRealFirestoreKey123"
       });
       expect(
         await server.updateUserSecrets({
-          actorUid: attendee.uid,
+          scopeId: GLOBAL_SCOPE,
+          actor: attendee,
           targetUid: attendee.uid,
           patch: { geminiKey: "" }
         })
       ).toEqual({});
-      expect(await server.getDecryptedUserSecrets(attendee.uid)).toEqual({});
+      expect(await server.getDecryptedUserSecrets(GLOBAL_SCOPE, attendee.uid)).toEqual({});
 
       // 5. Client self-service preferences & profile updates on real Firestore preserve roles and attributes
-      await client.updatePreferences({ leaderboardOptIn: true, theme: "dark" });
-      await client.updateProfile({ firstName: "UpdatedTesty" });
+      await client.updatePreferences(GLOBAL_SCOPE, { leaderboardOptIn: true, theme: "dark" });
+      await client.updateProfile(GLOBAL_SCOPE, { firstName: "UpdatedTesty" });
 
       const afterSelfUpdate = await waitForStore(
         client.userRecordStore,
@@ -567,11 +586,13 @@ describe.skipIf(!existsSync(EMULATOR_JAR) || !existsSync(AUTH_EMULATOR_SERVER_JS
 
       // 6. Per-user multi-role grant & revocation on real Firestore:
       await server.upsertUserByEmail({
+        scopeId: GLOBAL_SCOPE,
         email: "attendee@example.com",
         roles: ["attendee", "scanner"]
       });
       await server.updateUserAttributes({
-        actorUid: attendee.uid,
+        scopeId: GLOBAL_SCOPE,
+        actor: attendee,
         targetUid: attendee.uid,
         patch: { pointsAllTime: 60 }
       });
@@ -579,12 +600,14 @@ describe.skipIf(!existsSync(EMULATOR_JAR) || !existsSync(AUTH_EMULATOR_SERVER_JS
 
       // Revoke scanner role on real Firestore
       await server.upsertUserByEmail({
+        scopeId: GLOBAL_SCOPE,
         email: "attendee@example.com",
         roles: ["attendee"]
       });
       await expect(
         server.updateUserAttributes({
-          actorUid: attendee.uid,
+          scopeId: GLOBAL_SCOPE,
+          actor: attendee,
           targetUid: attendee.uid,
           patch: { pointsAllTime: 99 }
         })
@@ -594,7 +617,7 @@ describe.skipIf(!existsSync(EMULATOR_JAR) || !existsSync(AUTH_EMULATOR_SERVER_JS
       await server.setSystemAdminStatus({
         email: "attendee@example.com",
         isAdmin: true,
-        actorUid: "root-admin"
+        actor: { uid: "root-admin" }
       });
       await waitForStore(client.authStore, (s) => s.user?.isAdmin === true);
 
@@ -606,7 +629,7 @@ describe.skipIf(!existsSync(EMULATOR_JAR) || !existsSync(AUTH_EMULATOR_SERVER_JS
       await server.setSystemAdminStatus({
         email: "attendee@example.com",
         isAdmin: false,
-        actorUid: "root-admin"
+        actor: { uid: "root-admin" }
       });
       await waitForStore(client.authStore, (s) => s.user?.isAdmin === false);
 
@@ -614,7 +637,7 @@ describe.skipIf(!existsSync(EMULATOR_JAR) || !existsSync(AUTH_EMULATOR_SERVER_JS
       // `checkAuth` + `requireAdmin` re-checks live Firestore `isSystemAdmin` and rejects with 403!
       const staleReq: any = { headers: { authorization: `Bearer ${staleAdminJwt}` } };
       await server.checkAuth(staleReq, createMockRes(), () => {});
-      expect(staleReq.user?.isAdmin).toBe(true);
+      expect(staleReq.user?.isAdmin).toBe(false);
       const resStaleAdmin = createMockRes();
       await server.requireAdmin(staleReq, resStaleAdmin, () => {});
       expect(resStaleAdmin.statusCode).toBe(403);
@@ -629,12 +652,14 @@ describe.skipIf(!existsSync(EMULATOR_JAR) || !existsSync(AUTH_EMULATOR_SERVER_JS
       // verify Firestore native `{ merge: true }` map merging without lost updates:
       await Promise.all([
         server.updateUserAttributes({
-          actorUid: scanner.uid,
+          scopeId: GLOBAL_SCOPE,
+          actor: scanner,
           targetUid: attendee.uid,
           patch: { pointsAllTime: 75 }
         }),
         server.updateUserAttributes({
-          actorUid: merchSeller.uid,
+          scopeId: GLOBAL_SCOPE,
+          actor: merchSeller,
           targetUid: attendee.uid,
           patch: { merchCreditBalance: 65 }
         })
@@ -654,7 +679,8 @@ describe.skipIf(!existsSync(EMULATOR_JAR) || !existsSync(AUTH_EMULATOR_SERVER_JS
       // Scanner attempts to update allowed `pointsAllTime` + forbidden `awardedBadges` -> 403 and no partial write!
       await expect(
         server.updateUserAttributes({
-          actorUid: scanner.uid,
+          scopeId: GLOBAL_SCOPE,
+          actor: scanner,
           targetUid: attendee.uid,
           patch: { pointsAllTime: 9999, awardedBadges: ["forged"] }
         })
@@ -663,12 +689,14 @@ describe.skipIf(!existsSync(EMULATOR_JAR) || !existsSync(AUTH_EMULATOR_SERVER_JS
 
       // 10. Role demotion (`moderator` -> `scanner`) persisted in real Firestore:
       await server.upsertUserByEmail({
+        scopeId: GLOBAL_SCOPE,
         email: "moderator@example.com",
         roles: ["scanner"]
       });
       await expect(
         server.updateUserAttributes({
-          actorUid: moderator.uid,
+          scopeId: GLOBAL_SCOPE,
+          actor: moderator,
           targetUid: attendee.uid,
           patch: { awardedBadges: ["after-demotion"] }
         })
@@ -680,7 +708,7 @@ describe.skipIf(!existsSync(EMULATOR_JAR) || !existsSync(AUTH_EMULATOR_SERVER_JS
       expect(stubUser?.roles).toEqual(["attendee"]);
 
       let stubAllowedAsAttendee = false;
-      await server.requireUserCapability("view:schedule")(
+      await server.requireCapability("view:schedule", GLOBAL_SCOPE)(
         { user: { uid: "prefs-only-uid", email: "stub@example.com", isAdmin: false } } as any,
         createMockRes(),
         () => {
@@ -689,9 +717,9 @@ describe.skipIf(!existsSync(EMULATOR_JAR) || !existsSync(AUTH_EMULATOR_SERVER_JS
       );
       expect(stubAllowedAsAttendee).toBe(true);
 
-      // 12. Unscoped directory subscription (`client.subscribeToUsers`) on real Firestore
+      // 12. Unscoped directory subscription (`client.subscribeToUsers(GLOBAL_SCOPE, cb)`) on real Firestore
       const directoryUsers = await new Promise<any[]>((resolve) => {
-        const unsub = client.subscribeToUsers((users) => {
+        const unsub = client.subscribeToUsers(GLOBAL_SCOPE, (users) => {
           if (users.length >= 6) {
             unsub();
             resolve(users);
@@ -711,6 +739,7 @@ describe.skipIf(!existsSync(EMULATOR_JAR) || !existsSync(AUTH_EMULATOR_SERVER_JS
 
       // 13. Non-admin user management & safe user deletion on real Firestore + Auth Emulator (including recursive cleanup of subcollections like `history`):
       const modPromoted = await server.upsertUserByEmail({
+        scopeId: GLOBAL_SCOPE,
         email: "moderator@example.com",
         roles: ["moderator"]
       });
@@ -719,7 +748,8 @@ describe.skipIf(!existsSync(EMULATOR_JAR) || !existsSync(AUTH_EMULATOR_SERVER_JS
       // Swapped UID safeguard on real Firestore:
       await expect(
         server.deleteUser({
-          actorUid: modPromoted.uid,
+          scopeId: GLOBAL_SCOPE,
+          actor: modPromoted,
           targetUid: scanner.uid, // Swapped UID!
           confirmTargetEmail: "merch@example.com"
         })
@@ -728,7 +758,8 @@ describe.skipIf(!existsSync(EMULATOR_JAR) || !existsSync(AUTH_EMULATOR_SERVER_JS
 
       // Moderator deletes `merchSeller` with matching `confirmTargetEmail` -> deletes `users_st/{uid}`, `history/tx-1` subcollection, and Auth user!
       await server.deleteUser({
-        actorUid: modPromoted.uid,
+        scopeId: GLOBAL_SCOPE,
+        actor: modPromoted,
         targetUid: merchSeller.uid,
         confirmTargetEmail: "merch@example.com"
       });
@@ -797,23 +828,23 @@ describe.skipIf(!existsSync(EMULATOR_JAR) || !existsSync(AUTH_EMULATOR_SERVER_JS
       });
 
       // 1. Grant additive roles via FieldValue.arrayUnion and revoke via FieldValue.arrayRemove on real Firestore
-      const m1 = await server.grantScopeRolesByEmail({
+      const m1 = await server.grantRolesByEmail({
         scopeId: "org-1",
         email: "worker@example.com",
         roles: ["member"]
       });
-      await server.grantScopeRolesByEmail({
+      await server.grantRolesByEmail({
         scopeId: "org-1",
         email: "worker@example.com",
         roles: ["manager"]
       });
       expect((await serverStore.getScopeMember("org-1", m1.uid))?.roles).toEqual(["member", "manager"]);
 
-      await server.revokeScopeRoles("org-1", m1.uid, ["manager"]);
+      await server.revokeRoles("org-1", m1.uid, ["manager"]);
       expect((await serverStore.getScopeMember("org-1", m1.uid))?.roles).toEqual(["member"]);
 
       // 2. Add worker to org-2 as owner and verify real Firestore collectionGroup query in subscribeToUserMemberships
-      await server.upsertScopeMemberByEmail({
+      await server.upsertUserByEmail({
         scopeId: "org-2",
         email: "worker@example.com",
         roles: ["owner"]
@@ -844,59 +875,47 @@ describe.skipIf(!existsSync(EMULATOR_JAR) || !existsSync(AUTH_EMULATOR_SERVER_JS
       expect(membershipsState.memberships.map((m) => m.scopeId).sort()).toEqual(["org-1", "org-2"]);
 
       // 3. Cross-tenant isolation on real Firestore:
-      // Worker is `owner` in `org-2` (can write hiddenAttributes and scope secrets in `org-2`),
-      // but only `member` with `["manage:billing"]` in `org-1`
-      await server.updateScopeMemberHiddenAttributes({
+      // Worker is `owner` in `org-2` (can write hiddenAttributes and user secrets in `org-2`),
+      // but only `member` in `org-1`
+      await server.updateUserHiddenAttributes({
         scopeId: "org-2",
-        actorUid: m1.uid,
+        actor: m1,
         targetUid: m1.uid,
         patch: { internalNotes: "Org 2 note" }
       });
-      await server.updateScopeMemberSecrets({
+      await server.updateUserSecrets({
         scopeId: "org-2",
-        actorUid: m1.uid,
+        actor: m1,
         targetUid: m1.uid,
         patch: { geminiKey: "AIzaSyMemberKeyOrg2" }
       });
       expect(
-        await server.getScopeMemberSecretsStatus({
+        await server.getUserSecretsStatus({
           scopeId: "org-2",
-          actorUid: m1.uid,
+          actor: m1,
           targetUid: m1.uid
         })
       ).toEqual({ geminiKey: true });
-      expect(await server.getDecryptedScopeMemberSecrets("org-2", m1.uid)).toEqual({
+      expect(await server.getDecryptedUserSecrets("org-2", m1.uid)).toEqual({
         geminiKey: "AIzaSyMemberKeyOrg2"
       });
       const rawScopedMemberSecretSnap = await adminDb.doc(`orgs_mt/org-2/members_mt/${m1.uid}/private/secrets`).get();
       expect(isEncryptedSecretData(rawScopedMemberSecretSnap.data()?.geminiKey)).toBe(true);
       expect(JSON.stringify(rawScopedMemberSecretSnap.data())).not.toContain("AIzaSyMemberKeyOrg2");
 
-      await server.updateScopeSecrets({
-        scopeId: "org-2",
-        actorUid: m1.uid,
-        patch: { geminiKey: "AIzaSySharedOrg2" }
-      });
-      expect(
-        await server.getScopeSecretsStatus({
-          scopeId: "org-2",
-          actorUid: m1.uid
-        })
-      ).toEqual({ geminiKey: true });
-      expect(await server.getDecryptedScopeSecrets("org-2")).toEqual({ geminiKey: "AIzaSySharedOrg2" });
-
       await expect(
-        server.updateScopeMemberHiddenAttributes({
+        server.updateUserHiddenAttributes({
           scopeId: "org-1",
-          actorUid: m1.uid,
+          actor: m1,
           targetUid: m1.uid,
           patch: { internalNotes: "Unauthorized Org 1 note" }
         })
       ).rejects.toThrow(/Forbidden/);
       await expect(
-        server.updateScopeSecrets({
+        server.updateUserSecrets({
           scopeId: "org-1",
-          actorUid: m1.uid,
+          actor: m1,
+          targetUid: m1.uid,
           patch: { geminiKey: "AIzaSyUnauthorizedOrg1" }
         })
       ).rejects.toThrow(/Forbidden/);
@@ -985,7 +1004,7 @@ service cloud.firestore {
       allow create, delete: if hasScopeCapability(scopeId, ['owner', 'manager']);
       allow update: if hasScopeCapability(scopeId, ['owner', 'manager']) || (
         isOwner(memberUid) &&
-        request.resource.data.diff(resource.data).affectedKeys().hasOnly(['lastSeen', 'photoUrl', 'preferences'])
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly(['firstName', 'lastName', 'displayName', 'lastSeen', 'photoUrl', 'preferences', 'updatedAt'])
       );
 
       match /private/hiddenAttributes {
@@ -1158,11 +1177,16 @@ service cloud.firestore {
             .sort()
         ).toEqual(["u-member", "u-mgr"]);
 
-        // 4. Scoped `syncAvatar`, `recordPresenceHeartbeat`, and `saveScopePreferences` update existing scoped member doc without creating phantom docs
+        // 4. Scoped `syncAvatar`, `updateScopeMemberProfile`, `recordPresenceHeartbeat`, and `saveScopePreferences` update existing scoped member doc without creating phantom docs
         await memberStore.syncAvatar({
           uid: "u-member",
           scopeId: "org-A",
           photoUrl: "https://example.com/scoped-avatar.png"
+        });
+        await memberStore.updateScopeMemberProfile("org-A", "u-member", {
+          firstName: "Scoped",
+          lastName: "Member",
+          displayName: "Scoped Member"
         });
         await memberStore.recordPresenceHeartbeat({
           uid: "u-member",
@@ -1175,6 +1199,7 @@ service cloud.firestore {
 
         const updatedOrgAMember = rosterList.at(-1)?.find((m: any) => m.uid === "u-member");
         expect(updatedOrgAMember?.photoUrl).toBe("https://example.com/scoped-avatar.png");
+        expect(updatedOrgAMember?.displayName).toBe("Scoped Member");
         expect(updatedOrgAMember?.lastSeen).toBe("2026-10-21T12:05:00.000Z");
         expect(updatedOrgAMember?.preferences).toEqual({ theme: "dark", compactMode: true });
 

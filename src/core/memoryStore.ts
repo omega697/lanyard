@@ -55,8 +55,6 @@ export class InMemoryLanyardStore<
   private scopeMemberHiddenAttributes = new Map<string, Map<string, Partial<THiddenAttributes>>>();
   // scopeId -> (uid -> Record<string, string | EncryptedSecretData>)
   private scopeMemberSecrets = new Map<string, Map<string, Record<string, string | EncryptedSecretData>>>();
-  // scopeId -> Record<string, string | EncryptedSecretData>
-  private scopeSecrets = new Map<string, Record<string, string | EncryptedSecretData>>();
 
   constructor(options?: { cipher?: SecretCipher }) {
     this.cipher = options?.cipher;
@@ -212,6 +210,27 @@ export class InMemoryLanyardStore<
     next.updatedAt = new Date().toISOString();
     this.users.set(uid, next);
     this.notifyUserAndPrefListeners(uid);
+  }
+
+  async updateScopeMemberProfile(scopeId: string, uid: string, patch: UserProfilePatch): Promise<void> {
+    assertValidResourceId(scopeId, "scopeId");
+    assertValidResourceId(uid, "uid");
+    if (!patch || typeof patch !== "object" || Array.isArray(patch)) return;
+    const existing = await this.getScopeMember(scopeId, uid);
+    if (!existing) {
+      throw new Error(`Member '${uid}' does not exist in scope '${scopeId}'.`);
+    }
+    const next: ScopedMember<TRole, TCapability, TPreferences, TAttributes> = {
+      ...existing,
+      uid,
+      scopeId
+    };
+    if (typeof patch.email === "string" && patch.email.trim()) next.email = patch.email.toLowerCase().trim();
+    if (typeof patch.firstName === "string") next.firstName = patch.firstName.trim();
+    if (typeof patch.lastName === "string") next.lastName = patch.lastName.trim();
+    if (typeof patch.displayName === "string") next.displayName = patch.displayName.trim();
+    if (patch.photoUrl !== undefined) next.photoUrl = sanitizeAvatarUrl(patch.photoUrl);
+    await this.upsertScopeMember(scopeId, next);
   }
 
   subscribeToUserMemberships(
@@ -625,27 +644,6 @@ export class InMemoryLanyardStore<
     const current = this.scopeMemberSecrets.get(scopeId)!.get(uid) || {};
     const updated = this.encryptSecretMapPatch(current, patch);
     this.scopeMemberSecrets.get(scopeId)!.set(uid, updated);
-    return this.toSecretStatusMap(updated);
-  }
-
-  async getScopeSecrets(scopeId: string): Promise<Partial<Record<keyof TSecrets & string, string>>> {
-    assertValidResourceId(scopeId, "scopeId");
-    return this.decryptSecretMap(this.scopeSecrets.get(scopeId));
-  }
-
-  async getScopeSecretsStatus(scopeId: string): Promise<Partial<Record<keyof TSecrets & string, boolean>>> {
-    assertValidResourceId(scopeId, "scopeId");
-    return this.toSecretStatusMap(this.scopeSecrets.get(scopeId));
-  }
-
-  async updateScopeSecrets(
-    scopeId: string,
-    patch: Partial<Record<keyof TSecrets & string, string | null>>
-  ): Promise<Partial<Record<keyof TSecrets & string, boolean>>> {
-    assertValidResourceId(scopeId, "scopeId");
-    const current = this.scopeSecrets.get(scopeId) || {};
-    const updated = this.encryptSecretMapPatch(current, patch);
-    this.scopeSecrets.set(scopeId, updated);
     return this.toSecretStatusMap(updated);
   }
 

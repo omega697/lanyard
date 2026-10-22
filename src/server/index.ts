@@ -1,17 +1,22 @@
 import type { NextFunction, Request, Response } from "express";
 import {
+  GLOBAL_SCOPE,
   assertValidResourceId,
   isValidEmail,
   isValidResourceId,
   sanitizeAvatarUrl,
+  type GlobalScope,
+  type LanyardActor,
   type LanyardServerStore,
   type PermissionPolicy,
+  type ScopeId,
   type ScopedMember,
   type SystemAdminProfile,
   type UserProfilePatch,
   type UserRecord
 } from "../core/index.js";
 
+export { GLOBAL_SCOPE, type GlobalScope, type LanyardActor, type ScopeId };
 export * from "./encryption.js";
 
 export interface AuthenticatedUser {
@@ -138,9 +143,9 @@ export interface LanyardServerConfig<
 
 /**
  * Creates a storage-agnostic Lanyard server instance providing Express authentication/authorization
- * middleware (`checkAuth`, `requireAdmin`, `requireUserRole`, `requireUserCapability`,
- * `requireScopeRole`, `requireScopeCapability`), deterministic UID & role provisioning helpers,
- * and capability-gated `attributes`, `hiddenAttributes`, and encrypted `secrets` accessors.
+ * middleware (`checkAuth`, `requireAdmin`, `requireRole`, `requireCapability`),
+ * deterministic UID & role provisioning helpers, and capability-gated `attributes`, `hiddenAttributes`,
+ * and encrypted `secrets` accessors unified around explicit `scopeId: ScopeId` (`GLOBAL_SCOPE` or tenant `string`).
  */
 export function createLanyardServer<
   TRole extends string = string,
@@ -162,20 +167,55 @@ export function createLanyardServer<
    * Resolves whether an actor is an active system admin, guarding against stale 1-hour JWT custom claims
    * when the user has been explicitly demoted (`isSystemAdmin === false` on their `users/{uid}` record).
    */
-  async function resolveEffectiveAdminStatus(
-    uid: string,
-    tokenClaimIsAdmin: boolean
-  ): Promise<{
+  async function resolveEffectiveAdminStatus(actor: LanyardActor): Promise<{
     isAdmin: boolean;
     userRecord: UserRecord<TRole, TCapability, TPreferences, TAttributes> | null;
   }> {
-    const userRecord = typeof store.getUser === "function" ? await store.getUser(uid) : null;
+    if (!actor || typeof actor !== "object") {
+      throw new Error("Invalid actor: actor object with uid is required");
+    }
+    assertValidResourceId(actor.uid, "actor.uid");
+
+    const userRecord = typeof store.getUser === "function" ? await store.getUser(actor.uid) : null;
     if (userRecord && userRecord.isSystemAdmin === false) {
       // Explicitly demoted in the backing store: immediately revoke admin privileges even if JWT hasn't expired
       return { isAdmin: false, userRecord };
     }
-    const isAdmin = Boolean(tokenClaimIsAdmin || userRecord?.isSystemAdmin === true);
-    return { isAdmin, userRecord };
+    if (userRecord?.isSystemAdmin === true) {
+      return { isAdmin: true, userRecord };
+    }
+    const sysAdmin = await store.getSystemAdmin(actor.uid);
+    if (sysAdmin?.isSystemAdmin !== false && sysAdmin !== null) {
+      return { isAdmin: true, userRecord };
+    }
+    return { isAdmin: Boolean(actor.isAdmin), userRecord };
+  }
+
+  async function syncAdminProfileIfNeeded(user: AuthenticatedUser): Promise<void> {
+    const existing = await store.getSystemAdmin(user.uid);
+    if (!existing) {
+      await store.upsertSystemAdmin({
+        uid: user.uid,
+        email: user.email.toLowerCase().trim(),
+        displayName: user.name || user.email,
+        photoUrl: user.photoUrl || null,
+        isSystemAdmin: true,
+        addedBy: "auto-provision",
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString()
+      });
+    } else if (user.photoUrl && existing.photoUrl !== user.photoUrl) {
+      await store.upsertSystemAdmin({
+        ...existing,
+        photoUrl: user.photoUrl,
+        updatedAt: new Date().toISOString()
+      });
+    }
+  }
+
+  function assertValidScopeId(scopeId: ScopeId): void {
+    if (scopeId === GLOBAL_SCOPE) return;
+    assertValidResourceId(scopeId, "scopeId");
   }
 
   // --- Express Middleware ---
@@ -189,6 +229,16 @@ export function createLanyardServer<
       const user = await authService.verifyToken(req.headers.authorization, req.headers);
       if (!user) {
         return res.status(401).json({ error: "Unauthorized: Missing or invalid authentication credentials" });
+      }
+      try {
+        const { isAdmin, userRecord } = await resolveEffectiveAdminStatus(user);
+        user.isAdmin = isAdmin;
+        req.userRecord = userRecord;
+        if (isAdmin) {
+          await syncAdminProfileIfNeeded(user);
+        }
+      } catch {
+        // If backing store is unreachable during checkAuth, preserve verified token claim
       }
       req.user = user;
       next();
@@ -207,34 +257,14 @@ export function createLanyardServer<
     }
 
     try {
-      const { isAdmin, userRecord } = await resolveEffectiveAdminStatus(req.user.uid, Boolean(req.user.isAdmin));
+      const { isAdmin, userRecord } = await resolveEffectiveAdminStatus(req.user);
       if (!isAdmin) {
         req.user.isAdmin = false;
         return res.status(403).json({ error: "Forbidden: Administrative access required" });
       }
       req.user.isAdmin = true;
       req.userRecord = userRecord;
-
-      // Auto-seed logged-in admin or sync updated photoUrl to the backing store
-      const existing = await store.getSystemAdmin(req.user.uid);
-      if (!existing) {
-        await store.upsertSystemAdmin({
-          uid: req.user.uid,
-          email: req.user.email.toLowerCase().trim(),
-          displayName: req.user.name || req.user.email,
-          photoUrl: req.user.photoUrl || null,
-          isSystemAdmin: true,
-          addedBy: "auto-provision",
-          createdAt: new Date().toISOString(),
-          updatedAt: new Date().toISOString()
-        });
-      } else if (req.user.photoUrl && existing.photoUrl !== req.user.photoUrl) {
-        await store.upsertSystemAdmin({
-          ...existing,
-          photoUrl: req.user.photoUrl,
-          updatedAt: new Date().toISOString()
-        });
-      }
+      await syncAdminProfileIfNeeded(req.user);
     } catch {
       // If store check fails when verifying explicit demotion, continue only if token claim was verified
       if (!req.user.isAdmin) {
@@ -264,10 +294,13 @@ export function createLanyardServer<
   }
 
   /**
-   * Single-tenant role middleware: verifies the authenticated user's global `users/{uid}` record
-   * holds `requiredRole` (or at least one from an array, directly or via `inherits`), or is an active system admin.
+   * Role authorization middleware:
+   * - When `scopeParamOrGlobal` is `GLOBAL_SCOPE`, verifies the authenticated user's global `users/{uid}` record
+   *   holds `requiredRole` (or at least one from an array, directly or via `inherits`), or is an active system admin.
+   * - When `scopeParamOrGlobal` is a route parameter name string (defaults to `defaultScopeParam`, e.g. `"scopeId"`),
+   *   reads `req.params[scopeParamOrGlobal]` and verifies the user holds the role within that scope (or is an active system admin).
    */
-  function requireUserRole(requiredRoleOrRoles: TRole | readonly TRole[]) {
+  function requireRole(requiredRoleOrRoles: TRole | readonly TRole[], scopeParamOrGlobal: ScopeId = defaultScopeParam) {
     const requiredList = Array.isArray(requiredRoleOrRoles) ? requiredRoleOrRoles : [requiredRoleOrRoles as TRole];
 
     return async (
@@ -279,101 +312,44 @@ export function createLanyardServer<
         return res.status(401).json({ error: "Unauthorized: Authentication required" });
       }
 
-      try {
-        const { isAdmin, userRecord } = await resolveEffectiveAdminStatus(req.user.uid, Boolean(req.user.isAdmin));
-        req.user.isAdmin = isAdmin;
-        req.userRecord = userRecord;
+      if (scopeParamOrGlobal === GLOBAL_SCOPE) {
+        try {
+          const { isAdmin, userRecord } = await resolveEffectiveAdminStatus(req.user);
+          req.user.isAdmin = isAdmin;
+          req.userRecord = userRecord;
 
-        const isAllowed =
-          requiredList.length === 1
-            ? policy.hasRole(userRecord, requiredList[0], isAdmin)
-            : policy.hasAnyRole(userRecord, requiredList, isAdmin);
+          const isAllowed =
+            requiredList.length === 1
+              ? policy.hasRole(userRecord, requiredList[0], isAdmin)
+              : policy.hasAnyRole(userRecord, requiredList, isAdmin);
 
-        if (!isAllowed) {
-          return res.status(403).json({
-            error: `Forbidden: Requires '${requiredList.join(" or ")}' role`
-          });
+          if (!isAllowed) {
+            return res.status(403).json({
+              error: `Forbidden: Requires '${requiredList.join(" or ")}' role`
+            });
+          }
+
+          if (userRecord && req.user.photoUrl && userRecord.photoUrl !== req.user.photoUrl && store.upsertUser) {
+            const updated = { ...userRecord, photoUrl: req.user.photoUrl };
+            req.userRecord = updated;
+            await store.upsertUser(updated);
+          }
+
+          next();
+        } catch {
+          return res.status(500).json({ error: "Internal server error during authorization check" });
         }
-
-        if (userRecord && req.user.photoUrl && userRecord.photoUrl !== req.user.photoUrl && store.upsertUser) {
-          const updated = { ...userRecord, photoUrl: req.user.photoUrl };
-          req.userRecord = updated;
-          await store.upsertUser(updated);
-        }
-
-        next();
-      } catch {
-        return res.status(500).json({ error: "Internal server error during authorization check" });
-      }
-    };
-  }
-
-  /**
-   * Single-tenant capability middleware: verifies the authenticated user's global `users/{uid}` record
-   * holds the required capability (or at least one from an array), or is an active system admin.
-   */
-  function requireUserCapability(capabilityOrCapabilities: TCapability | readonly TCapability[]) {
-    const requiredList = Array.isArray(capabilityOrCapabilities)
-      ? capabilityOrCapabilities
-      : [capabilityOrCapabilities as TCapability];
-
-    return async (
-      req: AuthenticatedRequest<TRole, TCapability, TPreferences, TAttributes>,
-      res: Response,
-      next: NextFunction
-    ) => {
-      if (!req.user) {
-        return res.status(401).json({ error: "Unauthorized: Authentication required" });
+        return;
       }
 
-      try {
-        const { isAdmin, userRecord } = await resolveEffectiveAdminStatus(req.user.uid, Boolean(req.user.isAdmin));
-        req.user.isAdmin = isAdmin;
-        req.userRecord = userRecord;
-
-        const isAllowed =
-          requiredList.length === 1
-            ? policy.hasCapability(userRecord, requiredList[0], isAdmin)
-            : policy.hasAnyCapability(userRecord, requiredList, isAdmin);
-
-        if (!isAllowed) {
-          return res.status(403).json({
-            error: `Forbidden: Missing required capability (${requiredList.join(" or ")})`
-          });
-        }
-
-        if (userRecord && req.user.photoUrl && userRecord.photoUrl !== req.user.photoUrl && store.upsertUser) {
-          const updated = { ...userRecord, photoUrl: req.user.photoUrl };
-          req.userRecord = updated;
-          await store.upsertUser(updated);
-        }
-
-        next();
-      } catch {
-        return res.status(500).json({ error: "Internal server error during capability check" });
-      }
-    };
-  }
-
-  function requireScopeRole(requiredRoleOrRoles: TRole | readonly TRole[], scopeParamName = defaultScopeParam) {
-    const requiredList = Array.isArray(requiredRoleOrRoles) ? requiredRoleOrRoles : [requiredRoleOrRoles as TRole];
-
-    return async (
-      req: AuthenticatedRequest<TRole, TCapability, TPreferences, TAttributes>,
-      res: Response,
-      next: NextFunction
-    ) => {
-      if (!req.user) {
-        return res.status(401).json({ error: "Unauthorized: Authentication required" });
-      }
-
+      const scopeParamName = scopeParamOrGlobal;
       const scopeId = req.params[scopeParamName];
       if (!scopeId || !isValidResourceId(scopeId)) {
         return res.status(400).json({ error: `Missing or invalid scope parameter '${scopeParamName}'` });
       }
 
       try {
-        const { isAdmin } = await resolveEffectiveAdminStatus(req.user.uid, Boolean(req.user.isAdmin));
+        const { isAdmin } = await resolveEffectiveAdminStatus(req.user);
         req.user.isAdmin = isAdmin;
 
         const member = await store.getScopeMember(scopeId, req.user.uid);
@@ -390,7 +366,6 @@ export function createLanyardServer<
           });
         }
 
-        // Sync updated photoUrl if changed
         if (member && req.user.photoUrl && member.photoUrl !== req.user.photoUrl) {
           const updated = { ...member, photoUrl: req.user.photoUrl };
           req.scopeMember = updated;
@@ -404,9 +379,16 @@ export function createLanyardServer<
     };
   }
 
-  function requireScopeCapability(
+  /**
+   * Capability authorization middleware:
+   * - When `scopeParamOrGlobal` is `GLOBAL_SCOPE`, verifies the authenticated user's global `users/{uid}` record
+   *   holds the required capability (or at least one from an array), or is an active system admin.
+   * - When `scopeParamOrGlobal` is a route parameter name string (defaults to `defaultScopeParam`, e.g. `"scopeId"`),
+   *   reads `req.params[scopeParamOrGlobal]` and verifies the user holds the capability within that scope (or is an active system admin).
+   */
+  function requireCapability(
     capabilityOrCapabilities: TCapability | readonly TCapability[],
-    scopeParamName = defaultScopeParam
+    scopeParamOrGlobal: ScopeId = defaultScopeParam
   ) {
     const requiredList = Array.isArray(capabilityOrCapabilities)
       ? capabilityOrCapabilities
@@ -421,13 +403,44 @@ export function createLanyardServer<
         return res.status(401).json({ error: "Unauthorized: Authentication required" });
       }
 
+      if (scopeParamOrGlobal === GLOBAL_SCOPE) {
+        try {
+          const { isAdmin, userRecord } = await resolveEffectiveAdminStatus(req.user);
+          req.user.isAdmin = isAdmin;
+          req.userRecord = userRecord;
+
+          const isAllowed =
+            requiredList.length === 1
+              ? policy.hasCapability(userRecord, requiredList[0], isAdmin)
+              : policy.hasAnyCapability(userRecord, requiredList, isAdmin);
+
+          if (!isAllowed) {
+            return res.status(403).json({
+              error: `Forbidden: Missing required capability (${requiredList.join(" or ")})`
+            });
+          }
+
+          if (userRecord && req.user.photoUrl && userRecord.photoUrl !== req.user.photoUrl && store.upsertUser) {
+            const updated = { ...userRecord, photoUrl: req.user.photoUrl };
+            req.userRecord = updated;
+            await store.upsertUser(updated);
+          }
+
+          next();
+        } catch {
+          return res.status(500).json({ error: "Internal server error during capability check" });
+        }
+        return;
+      }
+
+      const scopeParamName = scopeParamOrGlobal;
       const scopeId = req.params[scopeParamName];
       if (!scopeId || !isValidResourceId(scopeId)) {
         return res.status(400).json({ error: `Missing or invalid scope parameter '${scopeParamName}'` });
       }
 
       try {
-        const { isAdmin } = await resolveEffectiveAdminStatus(req.user.uid, Boolean(req.user.isAdmin));
+        const { isAdmin } = await resolveEffectiveAdminStatus(req.user);
         req.user.isAdmin = isAdmin;
 
         const member = await store.getScopeMember(scopeId, req.user.uid);
@@ -444,7 +457,6 @@ export function createLanyardServer<
           });
         }
 
-        // Sync updated photoUrl if changed (e.g. pre-provisioned member signing in with OAuth)
         if (member && req.user.photoUrl && member.photoUrl !== req.user.photoUrl) {
           const updated = { ...member, photoUrl: req.user.photoUrl };
           req.scopeMember = updated;
@@ -498,14 +510,17 @@ export function createLanyardServer<
     isAdmin: boolean;
     firstName?: string;
     lastName?: string;
-    actorUid: string;
+    actor: LanyardActor;
   }): Promise<SystemAdminProfile | null> {
-    const { email, isAdmin, firstName = "", lastName = "", actorUid } = params;
-    assertValidResourceId(actorUid, "actorUid");
+    const { email, isAdmin, firstName = "", lastName = "", actor } = params;
+    if (!actor || typeof actor !== "object") {
+      throw new Error("Invalid actor: actor object with uid is required");
+    }
+    assertValidResourceId(actor.uid, "actor.uid");
     const displayName = [firstName.trim(), lastName.trim()].filter(Boolean).join(" ") || email.trim();
     const { uid, email: cleanEmail } = await getOrProvisionUidByEmail({ email, displayName });
 
-    if (!isAdmin && uid === actorUid) {
+    if (!isAdmin && uid === actor.uid) {
       throw new Error("Cannot remove yourself from system administrators");
     }
 
@@ -534,7 +549,7 @@ export function createLanyardServer<
         photoUrl: existing?.photoUrl,
         lastSeen: existing?.lastSeen,
         isSystemAdmin: true,
-        addedBy: existing?.addedBy || actorUid,
+        addedBy: existing?.addedBy || actor.uid,
         createdAt: existing?.createdAt || now,
         updatedAt: now
       };
@@ -547,22 +562,59 @@ export function createLanyardServer<
   }
 
   /**
-   * Provisions or updates a single-tenant user record (`users/{uid}`) by email.
+   * Provisions or updates a user record by email in either `GLOBAL_SCOPE` (`users/{uid}`)
+   * or a specific tenant `scopeId` (`{scopeCollection}/{scopeId}/{membersSubcollection}/{uid}`).
    */
   async function upsertUserByEmail(params: {
+    scopeId: GlobalScope;
     email: string;
     firstName?: string;
     lastName?: string;
     roles?: readonly TRole[];
     preferences?: Partial<TPreferences>;
     attributes?: Partial<TAttributes>;
-  }): Promise<UserRecord<TRole, TCapability, TPreferences, TAttributes>> {
+  }): Promise<UserRecord<TRole, TCapability, TPreferences, TAttributes>>;
+  async function upsertUserByEmail(params: {
+    scopeId: string;
+    email: string;
+    firstName?: string;
+    lastName?: string;
+    roles?: readonly TRole[];
+    scopeName?: string;
+    preferences?: Partial<TPreferences>;
+    attributes?: Partial<TAttributes>;
+  }): Promise<ScopedMember<TRole, TCapability, TPreferences, TAttributes>>;
+  async function upsertUserByEmail(params: {
+    scopeId: ScopeId;
+    email: string;
+    firstName?: string;
+    lastName?: string;
+    roles?: readonly TRole[];
+    scopeName?: string;
+    preferences?: Partial<TPreferences>;
+    attributes?: Partial<TAttributes>;
+  }): Promise<
+    | UserRecord<TRole, TCapability, TPreferences, TAttributes>
+    | ScopedMember<TRole, TCapability, TPreferences, TAttributes>
+  >;
+  async function upsertUserByEmail(params: {
+    scopeId: ScopeId;
+    email: string;
+    firstName?: string;
+    lastName?: string;
+    roles?: readonly TRole[];
+    scopeName?: string;
+    preferences?: Partial<TPreferences>;
+    attributes?: Partial<TAttributes>;
+  }): Promise<
+    | UserRecord<TRole, TCapability, TPreferences, TAttributes>
+    | ScopedMember<TRole, TCapability, TPreferences, TAttributes>
+  > {
+    assertValidScopeId(params.scopeId);
     if (params.roles !== undefined) {
       assertAssignableRoles(params.roles);
     }
-    if (typeof store.upsertUser !== "function" || typeof store.getUser !== "function") {
-      throw new Error("Backing store does not implement getUser / upsertUser");
-    }
+
     const displayName =
       [params.firstName?.trim(), params.lastName?.trim()].filter(Boolean).join(" ") || params.email.trim();
     const { uid, email: cleanEmail } = await getOrProvisionUidByEmail({
@@ -570,11 +622,37 @@ export function createLanyardServer<
       displayName
     });
 
-    const existing = await store.getUser(uid);
-    const now = new Date().toISOString();
-    const resolvedRoles = params.roles ? Array.from(new Set(params.roles)) : (existing?.roles ?? [policy.defaultRole]);
+    if (params.scopeId === GLOBAL_SCOPE) {
+      if (typeof store.upsertUser !== "function" || typeof store.getUser !== "function") {
+        throw new Error("Backing store does not implement getUser / upsertUser");
+      }
+      const existing = await store.getUser(uid);
+      const now = new Date().toISOString();
+      const resolvedRoles = params.roles
+        ? Array.from(new Set(params.roles))
+        : (existing?.roles ?? [policy.defaultRole]);
 
-    const record: UserRecord<TRole, TCapability, TPreferences, TAttributes> = {
+      const record: UserRecord<TRole, TCapability, TPreferences, TAttributes> = {
+        ...(existing || {}),
+        uid,
+        email: cleanEmail,
+        firstName: params.firstName?.trim() ?? existing?.firstName,
+        lastName: params.lastName?.trim() ?? existing?.lastName,
+        displayName: params.firstName || params.lastName ? displayName : existing?.displayName || displayName,
+        roles: resolvedRoles,
+        ...(params.preferences ? { preferences: { ...(existing?.preferences || {}), ...params.preferences } } : {}),
+        ...(params.attributes ? { attributes: { ...(existing?.attributes || {}), ...params.attributes } } : {}),
+        createdAt: existing?.createdAt || now,
+        updatedAt: now
+      };
+
+      await store.upsertUser(record);
+      return (await store.getUser(uid))!;
+    }
+
+    const existing = await store.getScopeMember(params.scopeId, uid);
+    const resolvedRoles = params.roles ? Array.from(new Set(params.roles)) : (existing?.roles ?? [policy.defaultRole]);
+    const member: ScopedMember<TRole, TCapability, TPreferences, TAttributes> = {
       ...(existing || {}),
       uid,
       email: cleanEmail,
@@ -582,26 +660,59 @@ export function createLanyardServer<
       lastName: params.lastName?.trim() ?? existing?.lastName,
       displayName: params.firstName || params.lastName ? displayName : existing?.displayName || displayName,
       roles: resolvedRoles,
+      scopeId: params.scopeId,
+      scopeName: params.scopeName ?? existing?.scopeName,
       ...(params.preferences ? { preferences: { ...(existing?.preferences || {}), ...params.preferences } } : {}),
-      ...(params.attributes ? { attributes: { ...(existing?.attributes || {}), ...params.attributes } } : {}),
-      createdAt: existing?.createdAt || now,
-      updatedAt: now
+      ...(params.attributes ? { attributes: { ...(existing?.attributes || {}), ...params.attributes } } : {})
     };
 
-    await store.upsertUser(record);
-    return (await store.getUser(uid))!;
+    await store.upsertScopeMember(params.scopeId, member);
+    return (await store.getScopeMember(params.scopeId, uid)) || member;
   }
 
-  async function grantUserRolesByEmail(params: {
+  /**
+   * Additively grants `roles` to a user (identifying or provisioning by email) in either
+   * `GLOBAL_SCOPE` (`users/{uid}`) or a specific tenant `scopeId`.
+   */
+  async function grantRolesByEmail(params: {
+    scopeId: GlobalScope;
     email: string;
     roles: readonly TRole[];
     firstName?: string;
     lastName?: string;
-  }): Promise<UserRecord<TRole, TCapability, TPreferences, TAttributes>> {
+  }): Promise<UserRecord<TRole, TCapability, TPreferences, TAttributes>>;
+  async function grantRolesByEmail(params: {
+    scopeId: string;
+    email: string;
+    roles: readonly TRole[];
+    firstName?: string;
+    lastName?: string;
+    scopeName?: string;
+  }): Promise<ScopedMember<TRole, TCapability, TPreferences, TAttributes>>;
+  async function grantRolesByEmail(params: {
+    scopeId: ScopeId;
+    email: string;
+    roles: readonly TRole[];
+    firstName?: string;
+    lastName?: string;
+    scopeName?: string;
+  }): Promise<
+    | UserRecord<TRole, TCapability, TPreferences, TAttributes>
+    | ScopedMember<TRole, TCapability, TPreferences, TAttributes>
+  >;
+  async function grantRolesByEmail(params: {
+    scopeId: ScopeId;
+    email: string;
+    roles: readonly TRole[];
+    firstName?: string;
+    lastName?: string;
+    scopeName?: string;
+  }): Promise<
+    | UserRecord<TRole, TCapability, TPreferences, TAttributes>
+    | ScopedMember<TRole, TCapability, TPreferences, TAttributes>
+  > {
+    assertValidScopeId(params.scopeId);
     assertAssignableRoles(params.roles);
-    if (typeof store.grantUserRoles !== "function") {
-      throw new Error("Backing store does not implement grantUserRoles");
-    }
     const displayName =
       [params.firstName?.trim(), params.lastName?.trim()].filter(Boolean).join(" ") || params.email.trim();
     const { uid, email: cleanEmail } = await getOrProvisionUidByEmail({
@@ -609,122 +720,305 @@ export function createLanyardServer<
       displayName
     });
 
-    return store.grantUserRoles(uid, params.roles, {
+    if (params.scopeId === GLOBAL_SCOPE) {
+      if (typeof store.grantUserRoles !== "function") {
+        throw new Error("Backing store does not implement grantUserRoles");
+      }
+      return store.grantUserRoles(uid, params.roles, {
+        uid,
+        email: cleanEmail,
+        firstName: params.firstName?.trim(),
+        lastName: params.lastName?.trim(),
+        displayName
+      });
+    }
+
+    return store.grantScopeRoles(params.scopeId, uid, params.roles, {
       uid,
       email: cleanEmail,
       firstName: params.firstName?.trim(),
       lastName: params.lastName?.trim(),
-      displayName
+      displayName,
+      scopeId: params.scopeId,
+      scopeName: params.scopeName
     });
   }
 
-  async function revokeUserRoles(uid: string, roles: readonly TRole[]): Promise<void> {
+  /**
+   * Removes the specified `roles` from `uid` in `GLOBAL_SCOPE` or a specific tenant `scopeId`.
+   */
+  async function revokeRoles(scopeId: ScopeId, uid: string, roles: readonly TRole[]): Promise<void> {
+    assertValidScopeId(scopeId);
     assertValidResourceId(uid, "uid");
-    if (typeof store.revokeUserRoles !== "function") {
-      throw new Error("Backing store does not implement revokeUserRoles");
+    if (scopeId === GLOBAL_SCOPE) {
+      if (typeof store.revokeUserRoles !== "function") {
+        throw new Error("Backing store does not implement revokeUserRoles");
+      }
+      await store.revokeUserRoles(uid, roles);
+      return;
     }
-    await store.revokeUserRoles(uid, roles);
+    await store.revokeScopeRoles(scopeId, uid, roles);
   }
 
   /**
-   * Reads a user's `UserRecord` (`users/{targetUid}`) after verifying the caller (`actorUid`)
-   * is the user themselves, holds the `read` capability in `userCapabilities`, or is an active system admin.
-   * Automatically filters `attributes` to only keys readable by `actorUid`.
+   * Reads a user's record in `GLOBAL_SCOPE` (`users/{targetUid}`) or a specific tenant `scopeId`
+   * after verifying the caller (`actor`) is the user themselves, holds the `read` capability
+   * in `userCapabilities` within that scope, or is an active system admin.
+   * Automatically filters `attributes` to only keys readable by `actor`.
    */
   async function getUser(params: {
-    actorUid: string;
-    isSystemAdmin?: boolean;
+    scopeId: GlobalScope;
+    actor: LanyardActor;
     targetUid: string;
-  }): Promise<UserRecord<TRole, TCapability, TPreferences, TAttributes> | null> {
-    assertValidResourceId(params.actorUid, "actorUid");
+  }): Promise<UserRecord<TRole, TCapability, TPreferences, TAttributes> | null>;
+  async function getUser(params: {
+    scopeId: string;
+    actor: LanyardActor;
+    targetUid: string;
+  }): Promise<ScopedMember<TRole, TCapability, TPreferences, TAttributes> | null>;
+  async function getUser(params: {
+    scopeId: ScopeId;
+    actor: LanyardActor;
+    targetUid: string;
+  }): Promise<
+    | UserRecord<TRole, TCapability, TPreferences, TAttributes>
+    | ScopedMember<TRole, TCapability, TPreferences, TAttributes>
+    | null
+  >;
+  async function getUser(params: {
+    scopeId: ScopeId;
+    actor: LanyardActor;
+    targetUid: string;
+  }): Promise<
+    | UserRecord<TRole, TCapability, TPreferences, TAttributes>
+    | ScopedMember<TRole, TCapability, TPreferences, TAttributes>
+    | null
+  > {
+    assertValidScopeId(params.scopeId);
     assertValidResourceId(params.targetUid, "targetUid");
-    if (typeof store.getUser !== "function") {
-      throw new Error("Backing store does not implement getUser");
+
+    const { isAdmin, userRecord: actorGlobalRecord } = await resolveEffectiveAdminStatus(params.actor);
+    const actorUid = params.actor.uid;
+
+    if (params.scopeId === GLOBAL_SCOPE) {
+      if (typeof store.getUser !== "function") {
+        throw new Error("Backing store does not implement getUser");
+      }
+      const isSelf = actorUid === params.targetUid;
+      if (!policy.canReadUser(actorGlobalRecord, { isSystemAdmin: isAdmin, isSelf })) {
+        throw new Error("Forbidden: Insufficient permissions to read user profile");
+      }
+      const targetUser = await store.getUser(params.targetUid);
+      if (!targetUser) return null;
+      const filteredAttributes = policy.filterReadableAttributes<TAttributes>(
+        actorGlobalRecord,
+        targetUser.attributes,
+        {
+          isSystemAdmin: isAdmin,
+          isSelf
+        }
+      );
+      return {
+        ...targetUser,
+        ...(targetUser.attributes !== undefined ? { attributes: filteredAttributes } : {})
+      };
     }
-    const { isAdmin, userRecord: actorRecord } = await resolveEffectiveAdminStatus(
-      params.actorUid,
-      Boolean(params.isSystemAdmin)
-    );
-    const isSelf = params.actorUid === params.targetUid;
-    if (!policy.canReadUser(actorRecord, { isSystemAdmin: isAdmin, isSelf })) {
-      throw new Error("Forbidden: Insufficient permissions to read user profile");
+
+    const actorMember = await store.getScopeMember(params.scopeId, actorUid);
+    if (!isAdmin && !actorMember) {
+      throw new Error(`Forbidden: Caller is not a member of scope '${params.scopeId}'`);
     }
-    const targetUser = await store.getUser(params.targetUid);
-    if (!targetUser) return null;
-    const filteredAttributes = policy.filterReadableAttributes<TAttributes>(actorRecord, targetUser.attributes, {
+    const isSelf = Boolean(actorMember && actorUid === params.targetUid);
+    if (!policy.canReadUser(actorMember, { isSystemAdmin: isAdmin, isSelf })) {
+      throw new Error(`Forbidden: Insufficient permissions to read member profile in scope '${params.scopeId}'`);
+    }
+    const targetMember = await store.getScopeMember(params.scopeId, params.targetUid);
+    if (!targetMember) return null;
+    const filteredAttributes = policy.filterReadableAttributes<TAttributes>(actorMember, targetMember.attributes, {
       isSystemAdmin: isAdmin,
       isSelf
     });
     return {
-      ...targetUser,
-      ...(targetUser.attributes !== undefined ? { attributes: filteredAttributes } : {})
+      ...targetMember,
+      ...(targetMember.attributes !== undefined ? { attributes: filteredAttributes } : {})
     };
   }
 
   /**
-   * Lists all global `UserRecord` documents (`usersCollection`) after verifying the caller (`actorUid`)
-   * holds the `read` capability in `userCapabilities` or is an active system admin.
-   * Automatically filters each user's `attributes` to only keys readable by `actorUid`.
+   * Lists all users in `GLOBAL_SCOPE` (`usersCollection`) or all members in a tenant `scopeId`
+   * after verifying the caller (`actor`) holds the `read` capability in `userCapabilities`
+   * within that scope or is an active system admin.
+   * Automatically filters each user's `attributes` to only keys readable by `actor`.
    */
   async function listUsers(params: {
-    actorUid: string;
-    isSystemAdmin?: boolean;
-  }): Promise<UserRecord<TRole, TCapability, TPreferences, TAttributes>[]> {
-    assertValidResourceId(params.actorUid, "actorUid");
-    if (typeof store.listUsers !== "function") {
-      throw new Error("Backing store does not implement listUsers");
+    scopeId: GlobalScope;
+    actor: LanyardActor;
+  }): Promise<UserRecord<TRole, TCapability, TPreferences, TAttributes>[]>;
+  async function listUsers(params: {
+    scopeId: string;
+    actor: LanyardActor;
+  }): Promise<ScopedMember<TRole, TCapability, TPreferences, TAttributes>[]>;
+  async function listUsers(params: {
+    scopeId: ScopeId;
+    actor: LanyardActor;
+  }): Promise<
+    | UserRecord<TRole, TCapability, TPreferences, TAttributes>[]
+    | ScopedMember<TRole, TCapability, TPreferences, TAttributes>[]
+  >;
+  async function listUsers(params: {
+    scopeId: ScopeId;
+    actor: LanyardActor;
+  }): Promise<
+    | UserRecord<TRole, TCapability, TPreferences, TAttributes>[]
+    | ScopedMember<TRole, TCapability, TPreferences, TAttributes>[]
+  > {
+    assertValidScopeId(params.scopeId);
+    const { isAdmin, userRecord: actorGlobalRecord } = await resolveEffectiveAdminStatus(params.actor);
+    const actorUid = params.actor.uid;
+
+    if (params.scopeId === GLOBAL_SCOPE) {
+      if (typeof store.listUsers !== "function") {
+        throw new Error("Backing store does not implement listUsers");
+      }
+      if (!policy.canReadUser(actorGlobalRecord, { isSystemAdmin: isAdmin, isSelf: false })) {
+        throw new Error("Forbidden: Insufficient permissions to list users");
+      }
+      const allUsers = await store.listUsers();
+      return allUsers.map((u) => {
+        const isSelf = u.uid === actorUid;
+        const filteredAttributes = policy.filterReadableAttributes<TAttributes>(actorGlobalRecord, u.attributes, {
+          isSystemAdmin: isAdmin,
+          isSelf
+        });
+        return {
+          ...u,
+          ...(u.attributes !== undefined ? { attributes: filteredAttributes } : {})
+        };
+      });
     }
-    const { isAdmin, userRecord: actorRecord } = await resolveEffectiveAdminStatus(
-      params.actorUid,
-      Boolean(params.isSystemAdmin)
-    );
-    if (!policy.canReadUser(actorRecord, { isSystemAdmin: isAdmin, isSelf: false })) {
-      throw new Error("Forbidden: Insufficient permissions to list users");
+
+    const actorMember = await store.getScopeMember(params.scopeId, actorUid);
+    if (!isAdmin && !actorMember) {
+      throw new Error(`Forbidden: Caller is not a member of scope '${params.scopeId}'`);
     }
-    const allUsers = await store.listUsers();
-    return allUsers.map((u) => {
-      const isSelf = u.uid === params.actorUid;
-      const filteredAttributes = policy.filterReadableAttributes<TAttributes>(actorRecord, u.attributes, {
+    if (!policy.canReadUser(actorMember, { isSystemAdmin: isAdmin, isSelf: false })) {
+      throw new Error(`Forbidden: Insufficient permissions to list members in scope '${params.scopeId}'`);
+    }
+    const allMembers = await store.listScopeMembers(params.scopeId);
+    return allMembers.map((m) => {
+      const isSelf = Boolean(actorMember && m.uid === actorUid);
+      const filteredAttributes = policy.filterReadableAttributes<TAttributes>(actorMember, m.attributes, {
         isSystemAdmin: isAdmin,
         isSelf
       });
       return {
-        ...u,
-        ...(u.attributes !== undefined ? { attributes: filteredAttributes } : {})
+        ...m,
+        ...(m.attributes !== undefined ? { attributes: filteredAttributes } : {})
       };
     });
   }
 
   /**
-   * Updates a user's profile fields (`firstName`, `lastName`, `displayName`, `photoUrl`, `email`) on `users/{targetUid}`
-   * after verifying the caller (`actorUid`) is the user themselves, holds the `write` capability in `userCapabilities`,
-   * or is an active system admin. Also syncs `displayName` to Firebase Auth when `adminAuth.updateUser` is available.
+   * Updates a user's profile fields (`firstName`, `lastName`, `displayName`, `photoUrl`, `email`) in
+   * `GLOBAL_SCOPE` (`users/{targetUid}`) or a specific tenant `scopeId` after verifying the caller (`actor`)
+   * is the user themselves, holds the `write` capability in `userCapabilities` within that scope,
+   * or is an active system admin. When `scopeId === GLOBAL_SCOPE`, also syncs `displayName` to Firebase Auth.
    */
   async function updateUserProfile(params: {
-    actorUid: string;
-    isSystemAdmin?: boolean;
+    scopeId: GlobalScope;
+    actor: LanyardActor;
     targetUid: string;
     patch: UserProfilePatch;
-  }): Promise<UserRecord<TRole, TCapability, TPreferences, TAttributes>> {
-    assertValidResourceId(params.actorUid, "actorUid");
+  }): Promise<UserRecord<TRole, TCapability, TPreferences, TAttributes>>;
+  async function updateUserProfile(params: {
+    scopeId: string;
+    actor: LanyardActor;
+    targetUid: string;
+    patch: UserProfilePatch;
+  }): Promise<ScopedMember<TRole, TCapability, TPreferences, TAttributes>>;
+  async function updateUserProfile(params: {
+    scopeId: ScopeId;
+    actor: LanyardActor;
+    targetUid: string;
+    patch: UserProfilePatch;
+  }): Promise<
+    | UserRecord<TRole, TCapability, TPreferences, TAttributes>
+    | ScopedMember<TRole, TCapability, TPreferences, TAttributes>
+  >;
+  async function updateUserProfile(params: {
+    scopeId: ScopeId;
+    actor: LanyardActor;
+    targetUid: string;
+    patch: UserProfilePatch;
+  }): Promise<
+    | UserRecord<TRole, TCapability, TPreferences, TAttributes>
+    | ScopedMember<TRole, TCapability, TPreferences, TAttributes>
+  > {
+    assertValidScopeId(params.scopeId);
     assertValidResourceId(params.targetUid, "targetUid");
-    if (typeof store.getUser !== "function" || typeof store.upsertUser !== "function") {
-      throw new Error("Backing store does not implement getUser / upsertUser");
+
+    const { isAdmin, userRecord: actorGlobalRecord } = await resolveEffectiveAdminStatus(params.actor);
+    const actorUid = params.actor.uid;
+
+    if (params.scopeId === GLOBAL_SCOPE) {
+      if (typeof store.getUser !== "function" || typeof store.upsertUser !== "function") {
+        throw new Error("Backing store does not implement getUser / upsertUser");
+      }
+      const isSelf = actorUid === params.targetUid;
+      if (!isSelf && !policy.canWriteUser(actorGlobalRecord, isAdmin)) {
+        throw new Error("Forbidden: Insufficient permissions to update user profile");
+      }
+      const existing = await store.getUser(params.targetUid);
+      if (!existing) {
+        throw new Error(`Target user '${params.targetUid}' not found`);
+      }
+      if (!isAdmin && !isSelf && existing.isSystemAdmin === true) {
+        throw new Error("Forbidden: Non-system administrators cannot modify a system administrator");
+      }
+
+      const patch = params.patch || {};
+      const firstName = typeof patch.firstName === "string" ? patch.firstName.trim() : existing.firstName;
+      const lastName = typeof patch.lastName === "string" ? patch.lastName.trim() : existing.lastName;
+      const computedDisplayName = [firstName, lastName].filter(Boolean).join(" ").trim();
+      const displayName =
+        typeof patch.displayName === "string"
+          ? patch.displayName.trim()
+          : typeof patch.firstName === "string" || typeof patch.lastName === "string"
+            ? computedDisplayName || existing.displayName
+            : existing.displayName;
+      const email =
+        typeof patch.email === "string" && patch.email.trim() ? patch.email.toLowerCase().trim() : existing.email;
+      const photoUrl = patch.photoUrl !== undefined ? sanitizeAvatarUrl(patch.photoUrl) : existing.photoUrl;
+
+      const updated: UserRecord<TRole, TCapability, TPreferences, TAttributes> = {
+        ...existing,
+        uid: params.targetUid,
+        email,
+        ...(firstName !== undefined ? { firstName } : {}),
+        ...(lastName !== undefined ? { lastName } : {}),
+        ...(displayName !== undefined ? { displayName } : {}),
+        ...(photoUrl !== undefined ? { photoUrl } : {}),
+        updatedAt: new Date().toISOString()
+      };
+
+      await store.upsertUser(updated);
+      if (displayName && displayName !== existing.displayName && typeof adminAuth.updateUser === "function") {
+        await adminAuth.updateUser(params.targetUid, { displayName }).catch(() => {});
+      }
+      return (await store.getUser(params.targetUid))!;
     }
-    const { isAdmin, userRecord: actorRecord } = await resolveEffectiveAdminStatus(
-      params.actorUid,
-      Boolean(params.isSystemAdmin)
-    );
-    const isSelf = params.actorUid === params.targetUid;
-    if (!isSelf && !policy.canWriteUser(actorRecord, isAdmin)) {
-      throw new Error("Forbidden: Insufficient permissions to update user profile");
+
+    const actorMember = await store.getScopeMember(params.scopeId, actorUid);
+    if (!isAdmin && !actorMember) {
+      throw new Error(`Forbidden: Caller is not a member of scope '${params.scopeId}'`);
     }
-    const existing = await store.getUser(params.targetUid);
+    const isSelf = Boolean(actorMember && actorUid === params.targetUid);
+    if (!isSelf && !policy.canWriteUser(actorMember, isAdmin)) {
+      throw new Error(`Forbidden: Insufficient permissions to update member profile in scope '${params.scopeId}'`);
+    }
+    const existing = await store.getScopeMember(params.scopeId, params.targetUid);
     if (!existing) {
-      throw new Error(`Target user '${params.targetUid}' not found`);
-    }
-    if (!isAdmin && !isSelf && existing.isSystemAdmin === true) {
-      throw new Error("Forbidden: Non-system administrators cannot modify a system administrator");
+      throw new Error(`Target member '${params.targetUid}' not found in scope '${params.scopeId}'`);
     }
 
     const patch = params.patch || {};
@@ -741,350 +1035,297 @@ export function createLanyardServer<
       typeof patch.email === "string" && patch.email.trim() ? patch.email.toLowerCase().trim() : existing.email;
     const photoUrl = patch.photoUrl !== undefined ? sanitizeAvatarUrl(patch.photoUrl) : existing.photoUrl;
 
-    const updated: UserRecord<TRole, TCapability, TPreferences, TAttributes> = {
+    const updated: ScopedMember<TRole, TCapability, TPreferences, TAttributes> = {
       ...existing,
       uid: params.targetUid,
       email,
       ...(firstName !== undefined ? { firstName } : {}),
       ...(lastName !== undefined ? { lastName } : {}),
       ...(displayName !== undefined ? { displayName } : {}),
-      ...(photoUrl !== undefined ? { photoUrl } : {}),
-      updatedAt: new Date().toISOString()
+      ...(photoUrl !== undefined ? { photoUrl } : {})
     };
 
-    await store.upsertUser(updated);
-    if (displayName && displayName !== existing.displayName && typeof adminAuth.updateUser === "function") {
-      await adminAuth.updateUser(params.targetUid, { displayName }).catch(() => {});
-    }
-    return (await store.getUser(params.targetUid))!;
+    await store.upsertScopeMember(params.scopeId, updated);
+    return (await store.getScopeMember(params.scopeId, params.targetUid))!;
   }
 
   /**
-   * Replaces a user's `roles` on `users/{targetUid}` after verifying the caller (`actorUid`)
-   * holds the `assignRoles` capability in `userCapabilities` or is an active system admin,
-   * and that every role in `roles` is a concrete (`!abstract`) role defined in `policy.roles`.
+   * Replaces a user's `roles` in `GLOBAL_SCOPE` (`users/{targetUid}`) or a specific tenant `scopeId`
+   * after verifying the caller (`actor`) holds the `assignRoles` capability in `userCapabilities`
+   * within that scope (or is an active system admin), and that every role in `roles` is concrete (`!abstract`).
    */
   async function updateUserRoles(params: {
-    actorUid: string;
-    isSystemAdmin?: boolean;
+    scopeId: GlobalScope;
+    actor: LanyardActor;
     targetUid: string;
     roles: readonly TRole[];
-  }): Promise<UserRecord<TRole, TCapability, TPreferences, TAttributes>> {
-    assertValidResourceId(params.actorUid, "actorUid");
+  }): Promise<UserRecord<TRole, TCapability, TPreferences, TAttributes>>;
+  async function updateUserRoles(params: {
+    scopeId: string;
+    actor: LanyardActor;
+    targetUid: string;
+    roles: readonly TRole[];
+  }): Promise<ScopedMember<TRole, TCapability, TPreferences, TAttributes>>;
+  async function updateUserRoles(params: {
+    scopeId: ScopeId;
+    actor: LanyardActor;
+    targetUid: string;
+    roles: readonly TRole[];
+  }): Promise<
+    | UserRecord<TRole, TCapability, TPreferences, TAttributes>
+    | ScopedMember<TRole, TCapability, TPreferences, TAttributes>
+  >;
+  async function updateUserRoles(params: {
+    scopeId: ScopeId;
+    actor: LanyardActor;
+    targetUid: string;
+    roles: readonly TRole[];
+  }): Promise<
+    | UserRecord<TRole, TCapability, TPreferences, TAttributes>
+    | ScopedMember<TRole, TCapability, TPreferences, TAttributes>
+  > {
+    assertValidScopeId(params.scopeId);
     assertValidResourceId(params.targetUid, "targetUid");
     assertAssignableRoles(params.roles);
-    if (typeof store.getUser !== "function" || typeof store.upsertUser !== "function") {
-      throw new Error("Backing store does not implement getUser / upsertUser");
-    }
-    const { isAdmin, userRecord: actorRecord } = await resolveEffectiveAdminStatus(
-      params.actorUid,
-      Boolean(params.isSystemAdmin)
-    );
-    if (!policy.canAssignRoles(actorRecord, isAdmin)) {
-      throw new Error("Forbidden: Insufficient permissions to assign user roles");
-    }
-    const existing = await store.getUser(params.targetUid);
-    if (!existing) {
-      throw new Error(`Target user '${params.targetUid}' not found`);
-    }
-    if (!isAdmin && existing.isSystemAdmin === true) {
-      throw new Error("Forbidden: Non-system administrators cannot modify a system administrator");
+
+    const { isAdmin, userRecord: actorGlobalRecord } = await resolveEffectiveAdminStatus(params.actor);
+    const actorUid = params.actor.uid;
+
+    if (params.scopeId === GLOBAL_SCOPE) {
+      if (typeof store.getUser !== "function" || typeof store.upsertUser !== "function") {
+        throw new Error("Backing store does not implement getUser / upsertUser");
+      }
+      if (!policy.canAssignRoles(actorGlobalRecord, isAdmin)) {
+        throw new Error("Forbidden: Insufficient permissions to assign user roles");
+      }
+      const existing = await store.getUser(params.targetUid);
+      if (!existing) {
+        throw new Error(`Target user '${params.targetUid}' not found`);
+      }
+      if (!isAdmin && existing.isSystemAdmin === true) {
+        throw new Error("Forbidden: Non-system administrators cannot modify a system administrator");
+      }
+
+      const updated: UserRecord<TRole, TCapability, TPreferences, TAttributes> = {
+        ...existing,
+        uid: params.targetUid,
+        roles: Array.from(new Set(params.roles)),
+        updatedAt: new Date().toISOString()
+      };
+      await store.upsertUser(updated);
+      return (await store.getUser(params.targetUid))!;
     }
 
-    const updated: UserRecord<TRole, TCapability, TPreferences, TAttributes> = {
+    const actorMember = await store.getScopeMember(params.scopeId, actorUid);
+    if (!isAdmin && !actorMember) {
+      throw new Error(`Forbidden: Caller is not a member of scope '${params.scopeId}'`);
+    }
+    if (!policy.canAssignRoles(actorMember, isAdmin)) {
+      throw new Error(`Forbidden: Insufficient permissions to assign member roles in scope '${params.scopeId}'`);
+    }
+    const existing = await store.getScopeMember(params.scopeId, params.targetUid);
+    if (!existing) {
+      throw new Error(`Target member '${params.targetUid}' not found in scope '${params.scopeId}'`);
+    }
+
+    const updated: ScopedMember<TRole, TCapability, TPreferences, TAttributes> = {
       ...existing,
       uid: params.targetUid,
-      roles: Array.from(new Set(params.roles)),
-      updatedAt: new Date().toISOString()
+      roles: Array.from(new Set(params.roles))
     };
-    await store.upsertUser(updated);
-    return (await store.getUser(params.targetUid))!;
+    await store.upsertScopeMember(params.scopeId, updated);
+    return (await store.getScopeMember(params.scopeId, params.targetUid))!;
   }
 
   /**
-   * Deletes a user's account (`users/{targetUid}`, private subdocuments, and Firebase Auth account)
-   * with email-confirmation protection against accidental or swapped-UID deletion:
-   * - If `actorUid === targetUid` (self-deletion), no `userCapabilities.write` capability is required.
-   * - If `actorUid !== targetUid` (deleting another user), `actorUid` must hold the `write` capability in
-   *   `userCapabilities` (or be `isSystemAdmin`), and non-system administrators cannot delete a `systemAdmin`.
-   * - In all cases, `confirmTargetEmail` must match `targetUid`'s stored email address case-insensitively,
-   *   preventing accidental deletion if `actorUid` and `targetUid` are ever swapped.
+   * Deletes a user record with email-confirmation protection against accidental or swapped-UID deletion:
+   * - When `scopeId === GLOBAL_SCOPE`: deletes `users/{targetUid}`, its private subdocuments, and the Firebase Auth user.
+   * - When `scopeId` is a tenant string: removes `{scopeCollection}/{scopeId}/{membersSubcollection}/{targetUid}`
+   *   and its private subdocuments without deleting the global user or Firebase Auth account.
+   * - If `actor.uid === targetUid` (self-deletion / leaving a scope), no `userCapabilities.write` capability is required.
+   * - If `actor.uid !== targetUid` (deleting another user/member), `actor` must hold `userCapabilities.write`
+   *   in `scopeId` (or be `isSystemAdmin`), and in `GLOBAL_SCOPE` non-system admins cannot delete a `systemAdmin`.
+   * - In all cases, `confirmTargetEmail` must match `targetUid`'s stored email address case-insensitively.
    */
   async function deleteUser(params: {
-    actorUid: string;
-    isSystemAdmin?: boolean;
+    scopeId: ScopeId;
+    actor: LanyardActor;
     targetUid: string;
     confirmTargetEmail: string;
   }): Promise<void> {
-    assertValidResourceId(params.actorUid, "actorUid");
-    assertValidResourceId(params.targetUid, "targetUid");
-    if (typeof store.getUser !== "function" || typeof store.deleteUser !== "function") {
-      throw new Error("Backing store does not implement getUser / deleteUser");
+    assertValidScopeId(params.scopeId);
+    if (!params.actor || typeof params.actor !== "object") {
+      throw new Error("Invalid actor: actor object with uid is required");
     }
+    assertValidResourceId(params.actor.uid, "actor.uid");
+    assertValidResourceId(params.targetUid, "targetUid");
+    const actorUid = params.actor.uid;
     const cleanConfirmEmail = (params.confirmTargetEmail || "").toLowerCase().trim();
     if (!cleanConfirmEmail) {
       throw new Error("confirmTargetEmail is required to delete user");
     }
 
-    const isSelf = params.actorUid === params.targetUid;
-    let isAdmin = false;
-    if (!isSelf) {
-      const resolved = await resolveEffectiveAdminStatus(params.actorUid, Boolean(params.isSystemAdmin));
-      isAdmin = resolved.isAdmin;
-      if (!policy.canWriteUser(resolved.userRecord, isAdmin)) {
-        throw new Error("Forbidden: Insufficient permissions to delete user");
+    if (params.scopeId === GLOBAL_SCOPE) {
+      if (typeof store.getUser !== "function" || typeof store.deleteUser !== "function") {
+        throw new Error("Backing store does not implement getUser / deleteUser");
       }
+
+      const isSelf = actorUid === params.targetUid;
+      let isAdmin = false;
+      if (!isSelf) {
+        const resolved = await resolveEffectiveAdminStatus(params.actor);
+        isAdmin = resolved.isAdmin;
+        if (!policy.canWriteUser(resolved.userRecord, isAdmin)) {
+          throw new Error("Forbidden: Insufficient permissions to delete user");
+        }
+      }
+
+      const targetUser = await store.getUser(params.targetUid);
+      if (!targetUser) {
+        if (!isSelf) {
+          throw new Error(`Target user '${params.targetUid}' not found`);
+        }
+      } else {
+        if (!isSelf && !isAdmin && targetUser.isSystemAdmin === true) {
+          throw new Error("Forbidden: Non-system administrators cannot delete a system administrator");
+        }
+        const targetEmail = (targetUser.email || "").toLowerCase().trim();
+        if (!targetEmail || targetEmail !== cleanConfirmEmail) {
+          throw new Error(
+            `Refusing to delete user '${params.targetUid}': confirmTargetEmail '${cleanConfirmEmail}' does not match target user's email`
+          );
+        }
+      }
+
+      await store.deleteUser(params.targetUid);
+      if (typeof adminAuth.deleteUser === "function") {
+        await adminAuth.deleteUser(params.targetUid);
+      }
+      return;
     }
 
-    const targetUser = await store.getUser(params.targetUid);
-    if (!targetUser) {
+    const { isAdmin } = await resolveEffectiveAdminStatus(params.actor);
+    const actorMember = await store.getScopeMember(params.scopeId, actorUid);
+    if (!isAdmin && !actorMember) {
+      throw new Error(`Forbidden: Caller is not a member of scope '${params.scopeId}'`);
+    }
+    const isSelf = Boolean(actorMember && actorUid === params.targetUid);
+    if (!isSelf && !policy.canWriteUser(actorMember, isAdmin)) {
+      throw new Error(`Forbidden: Insufficient permissions to delete member in scope '${params.scopeId}'`);
+    }
+
+    const targetMember = await store.getScopeMember(params.scopeId, params.targetUid);
+    if (!targetMember) {
       if (!isSelf) {
-        throw new Error(`Target user '${params.targetUid}' not found`);
+        throw new Error(`Target member '${params.targetUid}' not found in scope '${params.scopeId}'`);
       }
     } else {
-      if (!isSelf && !isAdmin && targetUser.isSystemAdmin === true) {
-        throw new Error("Forbidden: Non-system administrators cannot delete a system administrator");
-      }
-      const targetEmail = (targetUser.email || "").toLowerCase().trim();
+      const targetEmail = (targetMember.email || "").toLowerCase().trim();
       if (!targetEmail || targetEmail !== cleanConfirmEmail) {
         throw new Error(
-          `Refusing to delete user '${params.targetUid}': confirmTargetEmail '${cleanConfirmEmail}' does not match target user's email`
+          `Refusing to delete member '${params.targetUid}' in scope '${params.scopeId}': confirmTargetEmail '${cleanConfirmEmail}' does not match target member's email`
         );
       }
     }
 
-    await store.deleteUser(params.targetUid);
-    if (typeof adminAuth.deleteUser === "function") {
-      await adminAuth.deleteUser(params.targetUid);
-    }
-  }
-
-  async function upsertScopeMemberByEmail(params: {
-    scopeId: string;
-    email: string;
-    firstName?: string;
-    lastName?: string;
-    roles: readonly TRole[];
-    scopeName?: string;
-    preferences?: Partial<TPreferences>;
-    attributes?: Partial<TAttributes>;
-  }): Promise<ScopedMember<TRole, TCapability, TPreferences, TAttributes>> {
-    assertValidResourceId(params.scopeId, "scopeId");
-    assertAssignableRoles(params.roles);
-    const displayName =
-      [params.firstName?.trim(), params.lastName?.trim()].filter(Boolean).join(" ") || params.email.trim();
-    const { uid, email: cleanEmail } = await getOrProvisionUidByEmail({
-      email: params.email,
-      displayName
-    });
-
-    const existing = await store.getScopeMember(params.scopeId, uid);
-    const member: ScopedMember<TRole, TCapability, TPreferences, TAttributes> = {
-      ...(existing || {}),
-      uid,
-      email: cleanEmail,
-      firstName: params.firstName?.trim() ?? existing?.firstName,
-      lastName: params.lastName?.trim() ?? existing?.lastName,
-      roles: Array.from(new Set(params.roles)),
-      scopeId: params.scopeId,
-      scopeName: params.scopeName ?? existing?.scopeName,
-      ...(params.preferences ? { preferences: { ...(existing?.preferences || {}), ...params.preferences } } : {}),
-      ...(params.attributes ? { attributes: { ...(existing?.attributes || {}), ...params.attributes } } : {})
-    };
-
-    await store.upsertScopeMember(params.scopeId, member);
-    return member;
-  }
-
-  async function grantScopeRolesByEmail(params: {
-    scopeId: string;
-    email: string;
-    roles: readonly TRole[];
-    firstName?: string;
-    lastName?: string;
-    scopeName?: string;
-  }): Promise<ScopedMember<TRole, TCapability, TPreferences, TAttributes>> {
-    assertValidResourceId(params.scopeId, "scopeId");
-    assertAssignableRoles(params.roles);
-    const displayName =
-      [params.firstName?.trim(), params.lastName?.trim()].filter(Boolean).join(" ") || params.email.trim();
-    const { uid, email: cleanEmail } = await getOrProvisionUidByEmail({
-      email: params.email,
-      displayName
-    });
-
-    return store.grantScopeRoles(params.scopeId, uid, params.roles, {
-      uid,
-      email: cleanEmail,
-      firstName: params.firstName?.trim(),
-      lastName: params.lastName?.trim(),
-      scopeId: params.scopeId,
-      scopeName: params.scopeName
-    });
-  }
-
-  async function revokeScopeRoles(scopeId: string, uid: string, roles: readonly TRole[]): Promise<void> {
-    assertValidResourceId(scopeId, "scopeId");
-    assertValidResourceId(uid, "uid");
-    await store.revokeScopeRoles(scopeId, uid, roles);
+    await store.deleteScopeMember(params.scopeId, params.targetUid);
   }
 
   // --- Capability-Gated Attributes & Secrets Operations ---
 
   /**
-   * Reads a user's global `attributes`, filtering out any keys the caller (`actorUid`) is not permitted to read.
-   * Global user operations NEVER consult tenant-scoped roles—only the caller's global `users/{actorUid}` record
-   * or `isSystemAdmin` status is evaluated.
+   * Reads a user's `attributes` in `GLOBAL_SCOPE` (`users/{targetUid}`) or a specific tenant `scopeId`,
+   * filtering out any keys the caller (`actor`) is not permitted to read in that exact `scopeId`.
    */
   async function readUserAttributes(params: {
-    actorUid: string;
-    isSystemAdmin?: boolean;
+    scopeId: ScopeId;
+    actor: LanyardActor;
     targetUid: string;
   }): Promise<Partial<TAttributes>> {
-    assertValidResourceId(params.actorUid, "actorUid");
+    assertValidScopeId(params.scopeId);
     assertValidResourceId(params.targetUid, "targetUid");
-    if (typeof store.getUser !== "function") {
-      throw new Error("Backing store does not implement getUser");
-    }
-    const { isAdmin, userRecord: actorRecord } = await resolveEffectiveAdminStatus(
-      params.actorUid,
-      Boolean(params.isSystemAdmin)
-    );
-    const targetUser = await store.getUser(params.targetUid);
-    return policy.filterReadableAttributes<TAttributes>(actorRecord, targetUser?.attributes, {
-      isSystemAdmin: isAdmin,
-      isSelf: params.actorUid === params.targetUid
-    });
-  }
 
-  /**
-   * Updates a user's global `attributes` on `users/{targetUid}` after verifying the caller (`actorUid`)
-   * holds the required write capability for every key in `patch` (or is an active system admin).
-   * Self-ownership (`actorUid === targetUid`) and tenant-scoped roles NEVER grant write access to global `attributes`.
-   */
-  async function updateUserAttributes(params: {
-    actorUid: string;
-    isSystemAdmin?: boolean;
-    targetUid: string;
-    patch: Partial<TAttributes>;
-  }): Promise<UserRecord<TRole, TCapability, TPreferences, TAttributes>> {
-    assertValidResourceId(params.actorUid, "actorUid");
-    assertValidResourceId(params.targetUid, "targetUid");
-    if (typeof store.updateUserAttributes !== "function") {
-      throw new Error("Backing store does not implement updateUserAttributes");
-    }
-    const { isAdmin, userRecord: actorRecord } = await resolveEffectiveAdminStatus(
-      params.actorUid,
-      Boolean(params.isSystemAdmin)
-    );
-    if (!policy.canWriteAttributesPatch(actorRecord, params.patch as Record<string, any>, isAdmin)) {
-      throw new Error("Forbidden: Insufficient permissions to update the requested user attributes");
-    }
-    return store.updateUserAttributes(params.targetUid, params.patch);
-  }
+    const { isAdmin, userRecord: actorGlobalRecord } = await resolveEffectiveAdminStatus(params.actor);
+    const actorUid = params.actor.uid;
 
-  /**
-   * Reads a user's global `hiddenAttributes` (`users/{targetUid}/private/hiddenAttributes`), returning only keys
-   * the caller (`actorUid`) holds the required `read` capability for (or all keys if `isSystemAdmin`).
-   * Self-ownership (`actorUid === targetUid`) never grants read access to `hiddenAttributes`.
-   * Throws `Forbidden` if a non-admin caller has no readable hiddenAttribute keys and no read capability.
-   */
-  async function readUserHiddenAttributes(params: {
-    actorUid: string;
-    isSystemAdmin?: boolean;
-    targetUid: string;
-  }): Promise<Partial<THiddenAttributes>> {
-    assertValidResourceId(params.actorUid, "actorUid");
-    assertValidResourceId(params.targetUid, "targetUid");
-    if (typeof store.getUserHiddenAttributes !== "function") {
-      throw new Error("Backing store does not implement getUserHiddenAttributes");
+    if (params.scopeId === GLOBAL_SCOPE) {
+      if (typeof store.getUser !== "function") {
+        throw new Error("Backing store does not implement getUser");
+      }
+      const targetUser = await store.getUser(params.targetUid);
+      return policy.filterReadableAttributes<TAttributes>(actorGlobalRecord, targetUser?.attributes, {
+        isSystemAdmin: isAdmin,
+        isSelf: actorUid === params.targetUid
+      });
     }
-    const { isAdmin, userRecord: actorRecord } = await resolveEffectiveAdminStatus(
-      params.actorUid,
-      Boolean(params.isSystemAdmin)
-    );
-    const rawHiddenAttributes = await store.getUserHiddenAttributes(params.targetUid);
-    const filtered = policy.filterReadableHiddenAttributes<THiddenAttributes>(
-      actorRecord,
-      rawHiddenAttributes,
-      isAdmin
-    );
-    if (!isAdmin && Object.keys(rawHiddenAttributes).length > 0 && Object.keys(filtered).length === 0) {
-      throw new Error("Forbidden: Insufficient permissions to read user hiddenAttributes");
-    }
-    return filtered;
-  }
 
-  /**
-   * Updates a user's global `hiddenAttributes` (`users/{targetUid}/private/hiddenAttributes`) after verifying
-   * the caller (`actorUid`) holds the required `write` capability for every key in `patch` (or is an active system admin).
-   */
-  async function updateUserHiddenAttributes(params: {
-    actorUid: string;
-    isSystemAdmin?: boolean;
-    targetUid: string;
-    patch: Partial<THiddenAttributes>;
-  }): Promise<Partial<THiddenAttributes>> {
-    assertValidResourceId(params.actorUid, "actorUid");
-    assertValidResourceId(params.targetUid, "targetUid");
-    if (typeof store.updateUserHiddenAttributes !== "function") {
-      throw new Error("Backing store does not implement updateUserHiddenAttributes");
-    }
-    const { isAdmin, userRecord: actorRecord } = await resolveEffectiveAdminStatus(
-      params.actorUid,
-      Boolean(params.isSystemAdmin)
-    );
-    if (!policy.canWriteHiddenAttributesPatch(actorRecord, params.patch as Record<string, any>, isAdmin)) {
-      throw new Error("Forbidden: Insufficient permissions to update the requested user hiddenAttributes");
-    }
-    return store.updateUserHiddenAttributes(params.targetUid, params.patch);
-  }
-
-  /**
-   * Reads a scoped member's `attributes` within `scopeId`, filtering out any keys the caller (`actorUid`)
-   * is not permitted to read in that exact `scopeId` (or returning all keys if `isSystemAdmin`).
-   */
-  async function readScopeMemberAttributes(params: {
-    scopeId: string;
-    actorUid: string;
-    isSystemAdmin?: boolean;
-    targetUid: string;
-  }): Promise<Partial<TAttributes>> {
-    assertValidResourceId(params.scopeId, "scopeId");
-    assertValidResourceId(params.actorUid, "actorUid");
-    assertValidResourceId(params.targetUid, "targetUid");
-    const { isAdmin } = await resolveEffectiveAdminStatus(params.actorUid, Boolean(params.isSystemAdmin));
-    const actorMember = await store.getScopeMember(params.scopeId, params.actorUid);
+    const actorMember = await store.getScopeMember(params.scopeId, actorUid);
     if (!isAdmin && !actorMember) {
       throw new Error(`Forbidden: Caller is not a member of scope '${params.scopeId}'`);
     }
     const targetMember = await store.getScopeMember(params.scopeId, params.targetUid);
     return policy.filterReadableAttributes<TAttributes>(actorMember, targetMember?.attributes, {
       isSystemAdmin: isAdmin,
-      isSelf: Boolean(actorMember && params.actorUid === params.targetUid)
+      isSelf: Boolean(actorMember && actorUid === params.targetUid)
     });
   }
 
   /**
-   * Updates a scoped member's `attributes` within `scopeId` after verifying the caller (`actorUid`)
-   * holds the required write capability **within that exact `scopeId`** (or is an active system admin).
-   * Roles in other scopes grant zero privileges in `scopeId`.
+   * Updates a user's `attributes` in `GLOBAL_SCOPE` (`users/{targetUid}`) or a specific tenant `scopeId`
+   * after verifying the caller (`actor`) holds the required write capability for every key in `patch`
+   * within that exact `scopeId` (or is an active system admin).
+   * Self-ownership (`actor.uid === targetUid`) and roles in other scopes NEVER grant write access to `attributes`.
    */
-  async function updateScopeMemberAttributes(params: {
-    scopeId: string;
-    actorUid: string;
-    isSystemAdmin?: boolean;
+  async function updateUserAttributes(params: {
+    scopeId: GlobalScope;
+    actor: LanyardActor;
     targetUid: string;
     patch: Partial<TAttributes>;
-  }): Promise<ScopedMember<TRole, TCapability, TPreferences, TAttributes>> {
-    assertValidResourceId(params.scopeId, "scopeId");
-    assertValidResourceId(params.actorUid, "actorUid");
+  }): Promise<UserRecord<TRole, TCapability, TPreferences, TAttributes>>;
+  async function updateUserAttributes(params: {
+    scopeId: string;
+    actor: LanyardActor;
+    targetUid: string;
+    patch: Partial<TAttributes>;
+  }): Promise<ScopedMember<TRole, TCapability, TPreferences, TAttributes>>;
+  async function updateUserAttributes(params: {
+    scopeId: ScopeId;
+    actor: LanyardActor;
+    targetUid: string;
+    patch: Partial<TAttributes>;
+  }): Promise<
+    | UserRecord<TRole, TCapability, TPreferences, TAttributes>
+    | ScopedMember<TRole, TCapability, TPreferences, TAttributes>
+  >;
+  async function updateUserAttributes(params: {
+    scopeId: ScopeId;
+    actor: LanyardActor;
+    targetUid: string;
+    patch: Partial<TAttributes>;
+  }): Promise<
+    | UserRecord<TRole, TCapability, TPreferences, TAttributes>
+    | ScopedMember<TRole, TCapability, TPreferences, TAttributes>
+  > {
+    assertValidScopeId(params.scopeId);
     assertValidResourceId(params.targetUid, "targetUid");
+
+    const { isAdmin, userRecord: actorGlobalRecord } = await resolveEffectiveAdminStatus(params.actor);
+    const actorUid = params.actor.uid;
+
+    if (params.scopeId === GLOBAL_SCOPE) {
+      if (typeof store.updateUserAttributes !== "function") {
+        throw new Error("Backing store does not implement updateUserAttributes");
+      }
+      if (!policy.canWriteAttributesPatch(actorGlobalRecord, params.patch as Record<string, any>, isAdmin)) {
+        throw new Error("Forbidden: Insufficient permissions to update the requested user attributes");
+      }
+      return store.updateUserAttributes(params.targetUid, params.patch);
+    }
+
     if (typeof store.updateScopeMemberAttributes !== "function") {
       throw new Error("Backing store does not implement updateScopeMemberAttributes");
     }
-    const { isAdmin } = await resolveEffectiveAdminStatus(params.actorUid, Boolean(params.isSystemAdmin));
-    const actorMember = await store.getScopeMember(params.scopeId, params.actorUid);
+    const actorMember = await store.getScopeMember(params.scopeId, actorUid);
     if (!policy.canWriteAttributesPatch(actorMember, params.patch as Record<string, any>, isAdmin)) {
       throw new Error(`Forbidden: Insufficient permissions to update member attributes in scope '${params.scopeId}'`);
     }
@@ -1092,23 +1333,42 @@ export function createLanyardServer<
   }
 
   /**
-   * Reads a scoped member's `hiddenAttributes` within `scopeId`, strictly checking the caller's membership
-   * in `scopeId` (or active system admin status). Self-ownership (`actorUid === targetUid`) never grants read access.
+   * Reads a user's `hiddenAttributes` in `GLOBAL_SCOPE` (`users/{targetUid}/private/hiddenAttributes`)
+   * or a specific tenant `scopeId`, returning only keys the caller (`actor`) holds the required `read`
+   * capability for in that scope (or all keys if `isSystemAdmin`).
+   * Self-ownership (`actor.uid === targetUid`) never grants read access to `hiddenAttributes`.
    */
-  async function readScopeMemberHiddenAttributes(params: {
-    scopeId: string;
-    actorUid: string;
-    isSystemAdmin?: boolean;
+  async function readUserHiddenAttributes(params: {
+    scopeId: ScopeId;
+    actor: LanyardActor;
     targetUid: string;
   }): Promise<Partial<THiddenAttributes>> {
-    assertValidResourceId(params.scopeId, "scopeId");
-    assertValidResourceId(params.actorUid, "actorUid");
+    assertValidScopeId(params.scopeId);
     assertValidResourceId(params.targetUid, "targetUid");
+
+    const { isAdmin, userRecord: actorGlobalRecord } = await resolveEffectiveAdminStatus(params.actor);
+    const actorUid = params.actor.uid;
+
+    if (params.scopeId === GLOBAL_SCOPE) {
+      if (typeof store.getUserHiddenAttributes !== "function") {
+        throw new Error("Backing store does not implement getUserHiddenAttributes");
+      }
+      const rawHiddenAttributes = await store.getUserHiddenAttributes(params.targetUid);
+      const filtered = policy.filterReadableHiddenAttributes<THiddenAttributes>(
+        actorGlobalRecord,
+        rawHiddenAttributes,
+        isAdmin
+      );
+      if (!isAdmin && Object.keys(rawHiddenAttributes).length > 0 && Object.keys(filtered).length === 0) {
+        throw new Error("Forbidden: Insufficient permissions to read user hiddenAttributes");
+      }
+      return filtered;
+    }
+
     if (typeof store.getScopeMemberHiddenAttributes !== "function") {
       throw new Error("Backing store does not implement getScopeMemberHiddenAttributes");
     }
-    const { isAdmin } = await resolveEffectiveAdminStatus(params.actorUid, Boolean(params.isSystemAdmin));
-    const actorMember = await store.getScopeMember(params.scopeId, params.actorUid);
+    const actorMember = await store.getScopeMember(params.scopeId, actorUid);
     if (!isAdmin && !actorMember) {
       throw new Error(`Forbidden: Caller is not a member of scope '${params.scopeId}'`);
     }
@@ -1127,24 +1387,36 @@ export function createLanyardServer<
   }
 
   /**
-   * Updates a scoped member's `hiddenAttributes` within `scopeId`, strictly checking the caller's membership
-   * and capabilities in `scopeId` (or active system admin status).
+   * Updates a user's `hiddenAttributes` in `GLOBAL_SCOPE` (`users/{targetUid}/private/hiddenAttributes`)
+   * or a specific tenant `scopeId` after verifying the caller (`actor`) holds the required `write`
+   * capability for every key in `patch` within that scope (or is an active system admin).
    */
-  async function updateScopeMemberHiddenAttributes(params: {
-    scopeId: string;
-    actorUid: string;
-    isSystemAdmin?: boolean;
+  async function updateUserHiddenAttributes(params: {
+    scopeId: ScopeId;
+    actor: LanyardActor;
     targetUid: string;
     patch: Partial<THiddenAttributes>;
   }): Promise<Partial<THiddenAttributes>> {
-    assertValidResourceId(params.scopeId, "scopeId");
-    assertValidResourceId(params.actorUid, "actorUid");
+    assertValidScopeId(params.scopeId);
     assertValidResourceId(params.targetUid, "targetUid");
+
+    const { isAdmin, userRecord: actorGlobalRecord } = await resolveEffectiveAdminStatus(params.actor);
+    const actorUid = params.actor.uid;
+
+    if (params.scopeId === GLOBAL_SCOPE) {
+      if (typeof store.updateUserHiddenAttributes !== "function") {
+        throw new Error("Backing store does not implement updateUserHiddenAttributes");
+      }
+      if (!policy.canWriteHiddenAttributesPatch(actorGlobalRecord, params.patch as Record<string, any>, isAdmin)) {
+        throw new Error("Forbidden: Insufficient permissions to update the requested user hiddenAttributes");
+      }
+      return store.updateUserHiddenAttributes(params.targetUid, params.patch);
+    }
+
     if (typeof store.updateScopeMemberHiddenAttributes !== "function") {
       throw new Error("Backing store does not implement updateScopeMemberHiddenAttributes");
     }
-    const { isAdmin } = await resolveEffectiveAdminStatus(params.actorUid, Boolean(params.isSystemAdmin));
-    const actorMember = await store.getScopeMember(params.scopeId, params.actorUid);
+    const actorMember = await store.getScopeMember(params.scopeId, actorUid);
     if (!policy.canWriteHiddenAttributesPatch(actorMember, params.patch as Record<string, any>, isAdmin)) {
       throw new Error(
         `Forbidden: Insufficient permissions to update member hiddenAttributes in scope '${params.scopeId}'`
@@ -1153,109 +1425,54 @@ export function createLanyardServer<
     return store.updateScopeMemberHiddenAttributes(params.scopeId, params.targetUid, params.patch);
   }
 
-  // --- Write-Only Encrypted Secrets Operations ---
+  // --- Write-Only Encrypted User Secrets Operations ---
 
   /**
    * Returns a boolean status map (`{ [key]: boolean }`) indicating which secrets are configured
-   * on `users/{targetUid}/private/secrets` without ever exposing or decrypting secret values.
-   * Allowed for the user themselves (`actorUid === targetUid`), any actor who can write at least one
-   * secret key in the status map, or an active system admin.
+   * for `targetUid` in `GLOBAL_SCOPE` (`users/{targetUid}/private/secrets`) or a specific tenant `scopeId`
+   * (`{scopeCollection}/{scopeId}/{membersSubcollection}/{targetUid}/private/secrets`),
+   * without ever exposing or decrypting secret values.
    */
   async function getUserSecretsStatus(params: {
-    actorUid: string;
-    isSystemAdmin?: boolean;
+    scopeId: ScopeId;
+    actor: LanyardActor;
     targetUid: string;
   }): Promise<Partial<Record<keyof TSecrets & string, boolean>>> {
-    assertValidResourceId(params.actorUid, "actorUid");
+    assertValidScopeId(params.scopeId);
     assertValidResourceId(params.targetUid, "targetUid");
-    if (typeof store.getUserSecretsStatus !== "function") {
-      throw new Error("Backing store does not implement getUserSecretsStatus");
-    }
-    const { isAdmin, userRecord: actorRecord } = await resolveEffectiveAdminStatus(
-      params.actorUid,
-      Boolean(params.isSystemAdmin)
-    );
-    const isSelf = params.actorUid === params.targetUid;
-    const rawStatus = await store.getUserSecretsStatus(params.targetUid);
-    if (isAdmin || isSelf) {
-      return rawStatus;
-    }
-    const filtered: Partial<Record<keyof TSecrets & string, boolean>> = {};
-    for (const [key, isConfigured] of Object.entries(rawStatus)) {
-      if (policy.canWriteSecret(actorRecord, key, { isSystemAdmin: isAdmin, isSelf })) {
-        filtered[key as keyof TSecrets & string] = Boolean(isConfigured);
+
+    const { isAdmin, userRecord: actorGlobalRecord } = await resolveEffectiveAdminStatus(params.actor);
+    const actorUid = params.actor.uid;
+
+    if (params.scopeId === GLOBAL_SCOPE) {
+      if (typeof store.getUserSecretsStatus !== "function") {
+        throw new Error("Backing store does not implement getUserSecretsStatus");
       }
+      const isSelf = actorUid === params.targetUid;
+      const rawStatus = await store.getUserSecretsStatus(params.targetUid);
+      if (isAdmin || isSelf) {
+        return rawStatus;
+      }
+      const filtered: Partial<Record<keyof TSecrets & string, boolean>> = {};
+      for (const [key, isConfigured] of Object.entries(rawStatus)) {
+        if (policy.canWriteSecret(actorGlobalRecord, key, { isSystemAdmin: isAdmin, isSelf })) {
+          filtered[key as keyof TSecrets & string] = Boolean(isConfigured);
+        }
+      }
+      if (Object.keys(rawStatus).length > 0 && Object.keys(filtered).length === 0) {
+        throw new Error("Forbidden: Insufficient permissions to inspect user secrets status");
+      }
+      return filtered;
     }
-    if (Object.keys(rawStatus).length > 0 && Object.keys(filtered).length === 0) {
-      throw new Error("Forbidden: Insufficient permissions to inspect user secrets status");
-    }
-    return filtered;
-  }
 
-  /**
-   * Encrypts and writes (or clears when `""` or `null` is passed) user secrets on
-   * `users/{targetUid}/private/secrets`. Returns the updated boolean status map (`{ [key]: boolean }`)
-   * and NEVER returns plaintext or ciphertext values.
-   */
-  async function updateUserSecrets(params: {
-    actorUid: string;
-    isSystemAdmin?: boolean;
-    targetUid: string;
-    patch: Partial<Record<keyof TSecrets & string, string | null | undefined>>;
-  }): Promise<Partial<Record<keyof TSecrets & string, boolean>>> {
-    assertValidResourceId(params.actorUid, "actorUid");
-    assertValidResourceId(params.targetUid, "targetUid");
-    if (typeof store.updateUserSecrets !== "function") {
-      throw new Error("Backing store does not implement updateUserSecrets");
-    }
-    const { isAdmin, userRecord: actorRecord } = await resolveEffectiveAdminStatus(
-      params.actorUid,
-      Boolean(params.isSystemAdmin)
-    );
-    const isSelf = params.actorUid === params.targetUid;
-    if (
-      !policy.canWriteSecretsPatch(actorRecord, params.patch as Record<string, any>, { isSystemAdmin: isAdmin, isSelf })
-    ) {
-      throw new Error("Forbidden: Insufficient permissions to update the requested user secrets");
-    }
-    return store.updateUserSecrets(params.targetUid, params.patch);
-  }
-
-  /**
-   * Server-only helper that decrypts and returns plaintext secrets from `users/{uid}/private/secrets`
-   * for backend services making external API calls (e.g. BYOK AI keys or OAuth tokens).
-   * Never expose the return value of this method in client HTTP responses.
-   */
-  async function getDecryptedUserSecrets(uid: string): Promise<Partial<Record<keyof TSecrets & string, string>>> {
-    assertValidResourceId(uid, "uid");
-    if (typeof store.getUserSecrets !== "function") {
-      throw new Error("Backing store does not implement getUserSecrets");
-    }
-    return store.getUserSecrets(uid);
-  }
-
-  /**
-   * Returns a boolean status map (`{ [key]: boolean }`) indicating which secrets are configured
-   * on `{scopeCollection}/{scopeId}/{membersSubcollection}/{targetUid}/private/secrets`.
-   */
-  async function getScopeMemberSecretsStatus(params: {
-    scopeId: string;
-    actorUid: string;
-    isSystemAdmin?: boolean;
-    targetUid: string;
-  }): Promise<Partial<Record<keyof TSecrets & string, boolean>>> {
-    assertValidResourceId(params.scopeId, "scopeId");
-    assertValidResourceId(params.actorUid, "actorUid");
-    assertValidResourceId(params.targetUid, "targetUid");
     if (typeof store.getScopeMemberSecretsStatus !== "function") {
       throw new Error("Backing store does not implement getScopeMemberSecretsStatus");
     }
-    const { isAdmin } = await resolveEffectiveAdminStatus(params.actorUid, Boolean(params.isSystemAdmin));
-    const actorMember = await store.getScopeMember(params.scopeId, params.actorUid);
+    const actorMember = await store.getScopeMember(params.scopeId, actorUid);
     if (!isAdmin && !actorMember) {
       throw new Error(`Forbidden: Caller is not a member of scope '${params.scopeId}'`);
     }
-    const isSelf = Boolean(actorMember && params.actorUid === params.targetUid);
+    const isSelf = Boolean(actorMember && actorUid === params.targetUid);
     const rawStatus = await store.getScopeMemberSecretsStatus(params.scopeId, params.targetUid);
     if (isAdmin || isSelf) {
       return rawStatus;
@@ -1275,26 +1492,43 @@ export function createLanyardServer<
   }
 
   /**
-   * Encrypts and writes (or clears when `""` or `null` is passed) scoped member secrets on
-   * `{scopeCollection}/{scopeId}/{membersSubcollection}/{targetUid}/private/secrets`.
-   * Returns the updated boolean status map (`{ [key]: boolean }`).
+   * Encrypts and writes (or clears when `""` or `null` is passed) user secrets for `targetUid`
+   * in `GLOBAL_SCOPE` (`users/{targetUid}/private/secrets`) or a specific tenant `scopeId`.
+   * Returns the updated boolean status map (`{ [key]: boolean }`) and NEVER returns plaintext or ciphertext values.
    */
-  async function updateScopeMemberSecrets(params: {
-    scopeId: string;
-    actorUid: string;
-    isSystemAdmin?: boolean;
+  async function updateUserSecrets(params: {
+    scopeId: ScopeId;
+    actor: LanyardActor;
     targetUid: string;
     patch: Partial<Record<keyof TSecrets & string, string | null | undefined>>;
   }): Promise<Partial<Record<keyof TSecrets & string, boolean>>> {
-    assertValidResourceId(params.scopeId, "scopeId");
-    assertValidResourceId(params.actorUid, "actorUid");
+    assertValidScopeId(params.scopeId);
     assertValidResourceId(params.targetUid, "targetUid");
+
+    const { isAdmin, userRecord: actorGlobalRecord } = await resolveEffectiveAdminStatus(params.actor);
+    const actorUid = params.actor.uid;
+
+    if (params.scopeId === GLOBAL_SCOPE) {
+      if (typeof store.updateUserSecrets !== "function") {
+        throw new Error("Backing store does not implement updateUserSecrets");
+      }
+      const isSelf = actorUid === params.targetUid;
+      if (
+        !policy.canWriteSecretsPatch(actorGlobalRecord, params.patch as Record<string, any>, {
+          isSystemAdmin: isAdmin,
+          isSelf
+        })
+      ) {
+        throw new Error("Forbidden: Insufficient permissions to update the requested user secrets");
+      }
+      return store.updateUserSecrets(params.targetUid, params.patch);
+    }
+
     if (typeof store.updateScopeMemberSecrets !== "function") {
       throw new Error("Backing store does not implement updateScopeMemberSecrets");
     }
-    const { isAdmin } = await resolveEffectiveAdminStatus(params.actorUid, Boolean(params.isSystemAdmin));
-    const actorMember = await store.getScopeMember(params.scopeId, params.actorUid);
-    const isSelf = Boolean(actorMember && params.actorUid === params.targetUid);
+    const actorMember = await store.getScopeMember(params.scopeId, actorUid);
+    const isSelf = Boolean(actorMember && actorUid === params.targetUid);
     if (
       !policy.canWriteSecretsPatch(actorMember, params.patch as Record<string, any>, { isSystemAdmin: isAdmin, isSelf })
     ) {
@@ -1304,125 +1538,51 @@ export function createLanyardServer<
   }
 
   /**
-   * Server-only helper that decrypts and returns plaintext secrets from
-   * `{scopeCollection}/{scopeId}/{membersSubcollection}/{uid}/private/secrets`.
+   * Server-only helper that decrypts and returns plaintext secrets for `uid` in `GLOBAL_SCOPE`
+   * (`users/{uid}/private/secrets`) or a specific tenant `scopeId`
+   * (`{scopeCollection}/{scopeId}/{membersSubcollection}/{uid}/private/secrets`).
    * Never expose the return value of this method in client HTTP responses.
    */
-  async function getDecryptedScopeMemberSecrets(
-    scopeId: string,
+  async function getDecryptedUserSecrets(
+    scopeId: ScopeId,
     uid: string
   ): Promise<Partial<Record<keyof TSecrets & string, string>>> {
-    assertValidResourceId(scopeId, "scopeId");
+    assertValidScopeId(scopeId);
     assertValidResourceId(uid, "uid");
+    if (scopeId === GLOBAL_SCOPE) {
+      if (typeof store.getUserSecrets !== "function") {
+        throw new Error("Backing store does not implement getUserSecrets");
+      }
+      return store.getUserSecrets(uid);
+    }
     if (typeof store.getScopeMemberSecrets !== "function") {
       throw new Error("Backing store does not implement getScopeMemberSecrets");
     }
     return store.getScopeMemberSecrets(scopeId, uid);
   }
 
-  /**
-   * Returns a boolean status map (`{ [key]: boolean }`) indicating which scope-level secrets are configured
-   * on `{scopeCollection}/{scopeId}/private/secrets` (e.g. BYOK workspace API keys).
-   * Allowed for any member of `scopeId` or an active system admin.
-   */
-  async function getScopeSecretsStatus(params: {
-    scopeId: string;
-    actorUid: string;
-    isSystemAdmin?: boolean;
-  }): Promise<Partial<Record<keyof TSecrets & string, boolean>>> {
-    assertValidResourceId(params.scopeId, "scopeId");
-    assertValidResourceId(params.actorUid, "actorUid");
-    if (typeof store.getScopeSecretsStatus !== "function") {
-      throw new Error("Backing store does not implement getScopeSecretsStatus");
-    }
-    const { isAdmin } = await resolveEffectiveAdminStatus(params.actorUid, Boolean(params.isSystemAdmin));
-    const actorMember = await store.getScopeMember(params.scopeId, params.actorUid);
-    if (!isAdmin && !actorMember) {
-      throw new Error(`Forbidden: Caller is not a member of scope '${params.scopeId}'`);
-    }
-    return store.getScopeSecretsStatus(params.scopeId);
-  }
-
-  /**
-   * Encrypts and writes (or clears when `""` or `null` is passed) scope-level secrets on
-   * `{scopeCollection}/{scopeId}/private/secrets` (e.g. BYOK workspace API keys).
-   * Requires the caller to hold the configured `write` capability in `secretCapabilities` within `scopeId`
-   * (or be an active system admin). Note: `isSelf` is always `false` for shared scope-level secrets.
-   */
-  async function updateScopeSecrets(params: {
-    scopeId: string;
-    actorUid: string;
-    isSystemAdmin?: boolean;
-    patch: Partial<Record<keyof TSecrets & string, string | null | undefined>>;
-  }): Promise<Partial<Record<keyof TSecrets & string, boolean>>> {
-    assertValidResourceId(params.scopeId, "scopeId");
-    assertValidResourceId(params.actorUid, "actorUid");
-    if (typeof store.updateScopeSecrets !== "function") {
-      throw new Error("Backing store does not implement updateScopeSecrets");
-    }
-    const { isAdmin } = await resolveEffectiveAdminStatus(params.actorUid, Boolean(params.isSystemAdmin));
-    const actorMember = await store.getScopeMember(params.scopeId, params.actorUid);
-    if (
-      !policy.canWriteSecretsPatch(actorMember, params.patch as Record<string, any>, {
-        isSystemAdmin: isAdmin,
-        isSelf: false
-      })
-    ) {
-      throw new Error(`Forbidden: Insufficient permissions to update secrets in scope '${params.scopeId}'`);
-    }
-    return store.updateScopeSecrets(params.scopeId, params.patch);
-  }
-
-  /**
-   * Server-only helper that decrypts and returns plaintext scope-level secrets from
-   * `{scopeCollection}/{scopeId}/private/secrets`.
-   * Never expose the return value of this method in client HTTP responses.
-   */
-  async function getDecryptedScopeSecrets(scopeId: string): Promise<Partial<Record<keyof TSecrets & string, string>>> {
-    assertValidResourceId(scopeId, "scopeId");
-    if (typeof store.getScopeSecrets !== "function") {
-      throw new Error("Backing store does not implement getScopeSecrets");
-    }
-    return store.getScopeSecrets(scopeId);
-  }
-
   return {
     authService,
     checkAuth,
     requireAdmin,
-    requireUserRole,
-    requireUserCapability,
-    requireScopeRole,
-    requireScopeCapability,
+    requireRole,
+    requireCapability,
     getOrProvisionUidByEmail,
     setSystemAdminStatus,
     upsertUserByEmail,
-    grantUserRolesByEmail,
-    revokeUserRoles,
+    grantRolesByEmail,
+    revokeRoles,
     getUser,
     listUsers,
     updateUserProfile,
     updateUserRoles,
     deleteUser,
-    upsertScopeMemberByEmail,
-    grantScopeRolesByEmail,
-    revokeScopeRoles,
     readUserAttributes,
     updateUserAttributes,
     readUserHiddenAttributes,
     updateUserHiddenAttributes,
-    readScopeMemberAttributes,
-    updateScopeMemberAttributes,
-    readScopeMemberHiddenAttributes,
-    updateScopeMemberHiddenAttributes,
     getUserSecretsStatus,
     updateUserSecrets,
-    getDecryptedUserSecrets,
-    getScopeMemberSecretsStatus,
-    updateScopeMemberSecrets,
-    getDecryptedScopeMemberSecrets,
-    getScopeSecretsStatus,
-    updateScopeSecrets,
-    getDecryptedScopeSecrets
+    getDecryptedUserSecrets
   };
 }

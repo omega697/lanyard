@@ -299,6 +299,23 @@ export class FirestoreClientStore<
     await setDoc(userRef, safePayload, { merge: true });
   }
 
+  async updateScopeMemberProfile(scopeId: string, uid: string, patch: UserProfilePatch): Promise<void> {
+    const cleanScopeId = assertValidFirestoreDocId(scopeId, "scopeId");
+    const cleanUid = assertValidFirestoreDocId(uid, "uid");
+    if (!patch || typeof patch !== "object" || Array.isArray(patch)) return;
+    // Strictly allow ONLY Tier-1 self-editable profile fields on the existing scoped member doc
+    const safePayload: Record<string, any> = {};
+    if (typeof patch.email === "string" && patch.email.trim()) safePayload.email = patch.email.toLowerCase().trim();
+    if (typeof patch.firstName === "string") safePayload.firstName = patch.firstName.trim();
+    if (typeof patch.lastName === "string") safePayload.lastName = patch.lastName.trim();
+    if (typeof patch.displayName === "string") safePayload.displayName = patch.displayName.trim();
+    if (patch.photoUrl !== undefined) safePayload.photoUrl = sanitizeAvatarUrl(patch.photoUrl);
+    if (Object.keys(safePayload).length === 0) return;
+
+    const memberRef = doc(this.db, this.scopeCollection, cleanScopeId, this.membersSubcollection, cleanUid);
+    await updateDoc(memberRef, safePayload);
+  }
+
   subscribeToUserMemberships(
     uid: string,
     onChange: (members: ScopedMember<TRole, TCapability, TPreferences, TAttributes>[]) => void

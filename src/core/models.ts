@@ -4,6 +4,25 @@
 export type SocialProviderType = "google" | "microsoft" | "github";
 
 /**
+ * Unique symbol identifying the explicit global (unscoped / single-tenant) scope.
+ *
+ * Because `GLOBAL_SCOPE` is a `symbol`, an untrusted string from an HTTP route parameter
+ * (`req.params.scopeId`) can never spoof or collide with `GLOBAL_SCOPE`.
+ */
+export const GLOBAL_SCOPE: unique symbol = Symbol.for("lanyard.GLOBAL_SCOPE");
+
+/**
+ * Type of the explicit `GLOBAL_SCOPE` symbol.
+ */
+export type GlobalScope = typeof GLOBAL_SCOPE;
+
+/**
+ * Explicit scope identifier: either `GLOBAL_SCOPE` (for global `users/{uid}` operations)
+ * or a non-empty tenant/workspace scope string (e.g. `"campaign-123"`).
+ */
+export type ScopeId = string | GlobalScope;
+
+/**
  * Defines a single role tier within an application's `PermissionPolicyConfig`.
  *
  * @typeParam TRole - Union of string literal role identifiers.
@@ -346,7 +365,7 @@ export interface PermissionPolicy<TRole extends string = string, TCapability ext
 export interface LanyardUser {
   /** Primary key from Firebase Auth (`user.uid`). Stable across email changes and linked OAuth providers. */
   uid: string;
-  /** Lowercased, trimmed primary email address (or `null` for anonymous accounts). */
+  /** Lowercased, trimmed primary email address. */
   email: string | null;
   /** Whether the user's primary email address has been verified. */
   emailVerified: boolean;
@@ -354,12 +373,21 @@ export interface LanyardUser {
   displayName: string | null;
   /** Avatar URL from their OAuth profile, if available. */
   photoUrl: string | null;
-  /** True if signed in via Firebase Anonymous Auth. */
-  isAnonymous: boolean;
   /** True if the user holds the `{ admin: true }` custom claim (or is an active system admin). */
   isAdmin: boolean;
   /** Connected OAuth provider IDs (e.g. `["google.com", "github.com"]`). */
   providerIds: string[];
+}
+
+/**
+ * Minimal user identity passed into `lanyardServer` operations to authorize the caller.
+ *
+ * Satisfied directly by `req.user` (`LanyardUser`), `UserRecord`, `ScopedMember`,
+ * `SystemAdminProfile`, or `{ uid: string, isAdmin?: boolean }`.
+ */
+export interface LanyardActor {
+  uid: string;
+  isAdmin?: boolean;
 }
 
 /**
@@ -498,7 +526,7 @@ export interface LanyardClientStore<
   /** Optional: Persist a partial update to a user's tenant-scoped preferences within `scopeId`. */
   saveScopePreferences?(scopeId: string, uid: string, patch: Partial<TPreferences>): Promise<void>;
 
-  /** Optional: Subscribe to the full global `UserRecord` (`users/{uid}`) including `attributes`, `preferences`, and `role`. */
+  /** Optional: Subscribe to the full global `UserRecord` (`users/{uid}`) including `attributes`, `preferences`, and `roles`. */
   subscribeToUser?(
     uid: string,
     onChange: (user: UserRecord<TRole, TCapability, TPreferences, TAttributes> | null) => void
@@ -507,8 +535,10 @@ export interface LanyardClientStore<
   /** Optional: Subscribe to all global `UserRecord` documents (`usersCollection`) for single-tenant user directories. */
   subscribeToUsers?(onChange: (users: UserRecord<TRole, TCapability, TPreferences, TAttributes>[]) => void): () => void;
 
-  /** Optional: Self-service update of the user's own profile fields (`firstName`, `lastName`, `displayName`, `photoUrl`). */
+  /** Optional: Self-service update of the user's own global profile fields (`firstName`, `lastName`, `displayName`, `photoUrl`). */
   updateUserProfile?(uid: string, patch: UserProfilePatch): Promise<void>;
+  /** Optional: Self-service update of the user's own tenant-scoped member profile fields within `scopeId`. */
+  updateScopeMemberProfile?(scopeId: string, uid: string, patch: UserProfilePatch): Promise<void>;
 
   /** Subscribe to all scope memberships for the given `uid` across the application. */
   subscribeToUserMemberships(
@@ -643,22 +673,6 @@ export interface LanyardServerStore<
   updateScopeMemberSecrets?(
     scopeId: string,
     uid: string,
-    patch: Partial<Record<keyof TSecrets & string, string | null | undefined>>
-  ): Promise<Partial<Record<keyof TSecrets & string, boolean>>>;
-  /**
-   * Server-only: Retrieves decrypted scope-wide secrets (`{scopeCollection}/{scopeId}/private/secrets`).
-   */
-  getScopeSecrets?(scopeId: string): Promise<Partial<Record<keyof TSecrets & string, string>>>;
-  /**
-   * Returns a client-safe boolean map indicating which scope-wide secret keys are currently configured for `scopeId`.
-   */
-  getScopeSecretsStatus?(scopeId: string): Promise<Partial<Record<keyof TSecrets & string, boolean>>>;
-  /**
-   * Encrypts and saves non-empty scope-wide secret strings for `scopeId`, or deletes keys whose value is `""` or `null`.
-   * Returns the updated client-safe boolean status map.
-   */
-  updateScopeSecrets?(
-    scopeId: string,
     patch: Partial<Record<keyof TSecrets & string, string | null | undefined>>
   ): Promise<Partial<Record<keyof TSecrets & string, boolean>>>;
   /**
