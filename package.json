@@ -73,7 +73,7 @@
   },
   "lint-staged": {
     "package-lock.json": [
-      "node -e \"const fs=require('fs'),f='package-lock.json',s=fs.readFileSync(f,'utf8'),u=s.replace(/https?:\\/\\/airlock-proxy\\.uplink\\.goog:999\\/npm\\/artifact-foundry-prod\\/[^/]+\\//g,'https://registry.npmjs.org/');if(s!==u)fs.writeFileSync(f,u);\"",
+      "node -e \"const fs=require('fs'),f='package-lock.json',s=fs.readFileSync(f,'utf8'),u=s.replace(/https?:\\/\\/airlock-proxy\\.uplink\\.goog:999\\/npm\\/artifact-foundry-prod\\/[^/]+\\//g,'https://registry.npmjs.org/').replace(/https:\\/\\/registry\\.npmjs\\.org\\/(@[^/]+\\/[^/]+)\\/-\\/@[^/]+\\//g,'https://registry.npmjs.org/$1/-/');if(s!==u)fs.writeFileSync(f,u);\"",
       "prettier --write"
     ],
     "*.{ts,js}": [
