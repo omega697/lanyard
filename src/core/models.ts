@@ -402,6 +402,16 @@ export interface UserProfilePatch {
 }
 
 /**
+ * Event payload emitted to `onVerifiedEmailChange` when a user's verified email address
+ * in Firebase Auth differs from the email stored on their `UserRecord` (`users/{uid}`).
+ */
+export interface VerifiedEmailChangeEvent {
+  uid: string;
+  email: string;
+  previousEmail: string;
+}
+
+/**
  * Canonical global user record (`users/{uid}`).
  *
  * Unifies profile, presence (`lastSeen`), system admin status (`isSystemAdmin`),

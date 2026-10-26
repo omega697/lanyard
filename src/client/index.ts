@@ -34,10 +34,11 @@ import {
   type ScopedMember,
   type SocialProviderType,
   type UserProfilePatch,
-  type UserRecord
+  type UserRecord,
+  type VerifiedEmailChangeEvent
 } from "../core/index.js";
 
-export { GLOBAL_SCOPE, formatExistingAccountError, type GlobalScope, type ScopeId };
+export { GLOBAL_SCOPE, formatExistingAccountError, type GlobalScope, type ScopeId, type VerifiedEmailChangeEvent };
 
 export const HEARTBEAT_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
 
@@ -141,6 +142,13 @@ export interface LanyardClientConfig<
   policy?: PermissionPolicy<TRole, TCapability>;
   /** Prefix used for `localStorage` cache keys (preferences, emailForSignIn, and presence timestamps). */
   storageKeyPrefix?: string;
+  /**
+   * Optional callback invoked once per email change when the signed-in user's verified email address
+   * in Firebase Auth differs from `record.email` on `users/{uid}` and is synced to the backing store.
+   * If the callback returns a rejected Promise, Lanyard leaves `record.email` unchanged and clears its
+   * deduplication key so the callback will be retried on the next snapshot/session.
+   */
+  onVerifiedEmailChange?: (event: VerifiedEmailChangeEvent) => void | Promise<void>;
 }
 
 /**
@@ -155,7 +163,14 @@ export function createLanyardClient<
   TPreferences extends Record<string, any> = Record<string, any>,
   TAttributes extends Record<string, any> = Record<string, any>
 >(config: LanyardClientConfig<TRole, TCapability, TPreferences, TAttributes>) {
-  const { auth = null, store, defaultPreferences, policy, storageKeyPrefix = "lanyard" } = config;
+  const {
+    auth = null,
+    store,
+    defaultPreferences,
+    policy,
+    storageKeyPrefix = "lanyard",
+    onVerifiedEmailChange
+  } = config;
 
   const prefStorageKey = `${storageKeyPrefix}_user_preferences`;
   const emailForSignInKey = `${storageKeyPrefix}_emailForSignIn`;
@@ -300,20 +315,35 @@ export function createLanyardClient<
             }
           }
 
-          // If a verified email change occurred on Firebase Auth, sync the new email to users/{uid}
+          // If a verified email change occurred on Firebase Auth, invoke onVerifiedEmailChange and sync the new email to users/{uid}
           const emailSyncKey = `email:${user.uid}`;
           if (
             user.email &&
             user.emailVerified &&
             record.email &&
             record.email.toLowerCase() !== user.email.toLowerCase() &&
-            typeof store.updateUserProfile === "function"
+            (typeof store.updateUserProfile === "function" || typeof onVerifiedEmailChange === "function")
           ) {
             if (syncedAvatars.get(emailSyncKey) !== user.email) {
-              syncedAvatars.set(emailSyncKey, user.email);
-              store.updateUserProfile(user.uid, { email: user.email }).catch(() => {
-                syncedAvatars.delete(emailSyncKey);
-              });
+              const previousEmail = record.email;
+              const nextEmail = user.email;
+              syncedAvatars.set(emailSyncKey, nextEmail);
+              Promise.resolve()
+                .then(async () => {
+                  if (typeof onVerifiedEmailChange === "function") {
+                    await onVerifiedEmailChange({
+                      uid: user.uid,
+                      email: nextEmail,
+                      previousEmail
+                    });
+                  }
+                  if (typeof store.updateUserProfile === "function") {
+                    await store.updateUserProfile(user.uid, { email: nextEmail });
+                  }
+                })
+                .catch(() => {
+                  syncedAvatars.delete(emailSyncKey);
+                });
             }
           }
 

@@ -1217,12 +1217,18 @@ describe("lanyard/client unit tests", () => {
     };
     vi.mocked(firebaseAuth.onAuthStateChanged).mockImplementation(() => () => {});
 
+    const onVerifiedEmailChange = vi
+      .fn()
+      .mockRejectedValueOnce(new Error("Transient webhook failure"))
+      .mockResolvedValue(undefined);
+
     const client = createLanyardClient<TestRole, TestCap, TestPrefs, CheckinAttrs>({
       auth: fakeAuth,
       store,
       policy: TEST_POLICY,
       defaultPreferences: DEFAULT_PREFS,
-      storageKeyPrefix: "singleapp"
+      storageKeyPrefix: "singleapp",
+      onVerifiedEmailChange
     });
 
     // Calling updateProfile before sign-in throws
@@ -1243,6 +1249,7 @@ describe("lanyard/client unit tests", () => {
     expect(client.preferencesStore.get()).toEqual({ theme: "dark", use12h: false });
     expect(client.attributesStore.get()).toEqual({ pointsAllTime: 120, awardedBadges: ["first-checkin"] });
     expect(client.userRecordStore.get()?.photoUrl).toBe("https://example.com/oauth-single.png");
+    expect(onVerifiedEmailChange).not.toHaveBeenCalled();
 
     // 2. Self-service updateProfile updates firstName/lastName on users/{uid}, auto-computes displayName, and syncs to authStore & Firebase Auth
     await client.updateProfile(GLOBAL_SCOPE, { firstName: "Formy", lastName: "McFormerson" });
@@ -1254,7 +1261,8 @@ describe("lanyard/client unit tests", () => {
       displayName: "Formy McFormerson"
     });
 
-    // Verified email change auto-syncs to users/{uid} when user.emailVerified && user.email !== record.email
+    // Verified email change invokes onVerifiedEmailChange({ uid, email, previousEmail }) before updating users/{uid}.email.
+    // First attempt rejects -> users/{uid}.email remains 'single@example.com' so the next emission/session retries!
     client.setActiveUser({
       uid: "u-single",
       email: "updated-single@example.com",
@@ -1265,6 +1273,26 @@ describe("lanyard/client unit tests", () => {
       providerIds: ["google.com"]
     });
     await new Promise((r) => setTimeout(r, 0));
+    expect(onVerifiedEmailChange).toHaveBeenCalledTimes(1);
+    expect(onVerifiedEmailChange).toHaveBeenCalledWith({
+      uid: "u-single",
+      email: "updated-single@example.com",
+      previousEmail: "single@example.com"
+    });
+    expect((await store.getUser("u-single"))?.email).toBe("single@example.com");
+
+    // Second trigger retries onVerifiedEmailChange and persists updated-single@example.com to users/{uid}
+    client.setActiveUser({
+      uid: "u-single",
+      email: "updated-single@example.com",
+      emailVerified: true,
+      displayName: "Formy McFormerson",
+      photoUrl: "https://example.com/oauth-single.png",
+      isAdmin: false,
+      providerIds: ["google.com"]
+    });
+    await new Promise((r) => setTimeout(r, 0));
+    expect(onVerifiedEmailChange).toHaveBeenCalledTimes(2);
     expect((await store.getUser("u-single"))?.email).toBe("updated-single@example.com");
     expect(formatExistingAccountError("test@example.com", ["google.com"])).toContain("Google");
 

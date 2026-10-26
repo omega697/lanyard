@@ -189,6 +189,10 @@ export const lanyard = createLanyardClient<WorkspaceRole, WorkspaceCapability, U
   defaultPreferences: {
     themePreference: "system",
     use12h: true
+  },
+  // Optional: notified once per verified email change ({ uid, email, previousEmail }) before users/{uid}.email is updated
+  onVerifiedEmailChange: async ({ uid, email, previousEmail }) => {
+    console.log(`User ${uid} changed verified email from ${previousEmail} to ${email}`);
   }
 });
 
@@ -284,7 +288,11 @@ export const lanyardServer = createLanyardServer<WorkspaceRole, WorkspaceCapabil
   adminAuth,
   store,
   policy: workspacePolicy,
-  defaultScopeParam: "workspaceId"
+  defaultScopeParam: "workspaceId",
+  // Optional: notified in checkAuth when an authenticated user's verified token email differs from users/{uid}.email
+  onVerifiedEmailChange: async ({ uid, email, previousEmail }) => {
+    console.log(`Server synced verified email change for ${uid}: ${previousEmail} -> ${email}`);
+  }
 });
 
 const router = express.Router();

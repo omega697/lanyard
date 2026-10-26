@@ -13,10 +13,11 @@ import {
   type ScopedMember,
   type SystemAdminProfile,
   type UserProfilePatch,
-  type UserRecord
+  type UserRecord,
+  type VerifiedEmailChangeEvent
 } from "../core/index.js";
 
-export { GLOBAL_SCOPE, type GlobalScope, type LanyardActor, type ScopeId };
+export { GLOBAL_SCOPE, type GlobalScope, type LanyardActor, type ScopeId, type VerifiedEmailChangeEvent };
 export * from "./encryption.js";
 
 export interface AuthenticatedUser {
@@ -139,6 +140,12 @@ export interface LanyardServerConfig<
   authService?: AuthService;
   /** Default Express route parameter name for the tenant/scope ID (defaults to `"scopeId"`). */
   defaultScopeParam?: string;
+  /**
+   * Optional callback invoked in `checkAuth` when an authenticated user's verified token email
+   * differs from `userRecord.email` on `users/{uid}`. Once `onVerifiedEmailChange` resolves,
+   * Lanyard updates `userRecord.email` via `store.upsertUser` so the callback fires only once per email change.
+   */
+  onVerifiedEmailChange?: (event: VerifiedEmailChangeEvent) => void | Promise<void>;
 }
 
 /**
@@ -160,8 +167,12 @@ export function createLanyardServer<
     store,
     policy,
     authService = new GoogleAuthService(adminAuth),
-    defaultScopeParam = "scopeId"
+    defaultScopeParam = "scopeId",
+    onVerifiedEmailChange
   } = config;
+
+  // Tracks in-flight verified email change syncs per (uid -> targetEmail) so concurrent requests don't double-fire
+  const inFlightEmailSyncs = new Map<string, Promise<void>>();
 
   /**
    * Resolves whether an actor is an active system admin, guarding against stale 1-hour JWT custom claims
@@ -236,6 +247,42 @@ export function createLanyardServer<
         req.userRecord = userRecord;
         if (isAdmin) {
           await syncAdminProfileIfNeeded(user);
+        }
+        if (
+          user.email &&
+          user.emailVerified !== false &&
+          userRecord?.email &&
+          userRecord.email.toLowerCase() !== user.email.toLowerCase() &&
+          (typeof onVerifiedEmailChange === "function" || typeof store.upsertUser === "function")
+        ) {
+          const syncKey = `${user.uid}:${user.email.toLowerCase()}`;
+          let syncPromise = inFlightEmailSyncs.get(syncKey);
+          if (!syncPromise) {
+            const previousEmail = userRecord.email;
+            const nextEmail = user.email.toLowerCase().trim();
+            syncPromise = (async () => {
+              if (typeof onVerifiedEmailChange === "function") {
+                await onVerifiedEmailChange({
+                  uid: user.uid,
+                  email: nextEmail,
+                  previousEmail
+                });
+              }
+              if (typeof store.upsertUser === "function") {
+                const updatedRecord = {
+                  ...userRecord,
+                  email: nextEmail,
+                  updatedAt: new Date().toISOString()
+                };
+                await store.upsertUser(updatedRecord);
+                req.userRecord = updatedRecord;
+              }
+            })().finally(() => {
+              inFlightEmailSyncs.delete(syncKey);
+            });
+            inFlightEmailSyncs.set(syncKey, syncPromise);
+          }
+          await syncPromise;
         }
       } catch {
         // If backing store is unreachable during checkAuth, preserve verified token claim

@@ -2959,4 +2959,53 @@ describe("lanyard/server unit tests", () => {
     expect(await store.getUser(scanner.uid)).toBeNull();
     expect(adminAuth.deletedUids.has(scanner.uid)).toBe(true);
   });
+
+  it("invokes onVerifiedEmailChange and updates users/{uid}.email in checkAuth when verified token email changes", async () => {
+    const adminAuth = createFakeAdminAuth();
+    const store = new InMemoryLanyardStore<TestRole, TestCap>();
+    await store.upsertUser({
+      uid: "u-verified",
+      email: "old-verified@example.com",
+      roles: ["member"]
+    });
+
+    const onVerifiedEmailChange = vi
+      .fn()
+      .mockRejectedValueOnce(new Error("Transient Beehiiv outage"))
+      .mockResolvedValue(undefined);
+
+    const server = createLanyardServer<TestRole, TestCap>({
+      adminAuth,
+      store,
+      policy: TEST_POLICY,
+      onVerifiedEmailChange
+    });
+
+    // 1. First checkAuth call: onVerifiedEmailChange rejects -> request still succeeds, and users/{uid}.email stays 'old-verified@example.com' for retry
+    const req1: any = { headers: { authorization: "Bearer valid-token" } };
+    let next1 = false;
+    await server.checkAuth(req1, createMockRes(), () => {
+      next1 = true;
+    });
+    expect(next1).toBe(true);
+    expect(onVerifiedEmailChange).toHaveBeenCalledTimes(1);
+    expect(onVerifiedEmailChange).toHaveBeenCalledWith({
+      uid: "u-verified",
+      email: "verified@example.com",
+      previousEmail: "old-verified@example.com"
+    });
+    expect((await store.getUser("u-verified"))?.email).toBe("old-verified@example.com");
+
+    // 2. Second checkAuth call: onVerifiedEmailChange resolves -> users/{uid}.email is updated to 'verified@example.com'
+    const req2: any = { headers: { authorization: "Bearer valid-token" } };
+    await server.checkAuth(req2, createMockRes(), () => {});
+    expect(onVerifiedEmailChange).toHaveBeenCalledTimes(2);
+    expect((await store.getUser("u-verified"))?.email).toBe("verified@example.com");
+    expect(req2.userRecord?.email).toBe("verified@example.com");
+
+    // 3. Subsequent checkAuth call with already-synced email does not invoke onVerifiedEmailChange again
+    const req3: any = { headers: { authorization: "Bearer valid-token" } };
+    await server.checkAuth(req3, createMockRes(), () => {});
+    expect(onVerifiedEmailChange).toHaveBeenCalledTimes(2);
+  });
 });
