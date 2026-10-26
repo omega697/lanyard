@@ -43,9 +43,11 @@ const TEST_POLICY = createPermissionPolicy<TestRole, TestCapability>({
 
 describe("lanyard/core unit tests", () => {
   describe("Custom PermissionPolicy (Generic TRole & TCapability)", () => {
-    it("throws if roles configuration is empty and respects explicit or root defaultRole", () => {
-      expect(() => createPermissionPolicy({ roles: {} as any })).toThrow(/at least one role/);
-      expect(TEST_POLICY.defaultRole).toBe("member");
+    it("supports empty roles configuration and respects explicit or root defaultRoles", () => {
+      const emptyRolesPolicy = createPermissionPolicy({ roles: {} as any });
+      expect(emptyRolesPolicy.defaultRoles).toEqual([]);
+      expect(emptyRolesPolicy.assignableRoles).toEqual([]);
+      expect(TEST_POLICY.defaultRoles).toEqual(["member"]);
 
       const explicitDefault = createPermissionPolicy<TestRole, TestCapability>({
         roles: {
@@ -53,9 +55,19 @@ describe("lanyard/core unit tests", () => {
           manager: { inherits: ["member"] },
           member: {}
         },
-        defaultRole: "manager"
+        defaultRoles: ["manager"]
       });
-      expect(explicitDefault.defaultRole).toBe("manager");
+      expect(explicitDefault.defaultRoles).toEqual(["manager"]);
+
+      const explicitEmptyDefault = createPermissionPolicy<TestRole, TestCapability>({
+        roles: {
+          owner: { inherits: ["manager"] },
+          manager: { inherits: ["member"] },
+          member: {}
+        },
+        defaultRoles: []
+      });
+      expect(explicitEmptyDefault.defaultRoles).toEqual([]);
     });
 
     it("evaluates custom role hierarchies and edge cases via policy.hasRole, hasAnyRole, and hasAllRoles", () => {
@@ -521,24 +533,24 @@ describe("lanyard/core unit tests", () => {
       expect(rootBarrel.createPermissionPolicy).toBe(createPermissionPolicy);
       expect(rootBarrel.InMemoryLanyardStore).toBe(InMemoryLanyardStore);
 
-      // 2. Explicit defaultRole vs unrecognized defaultRole fallback + omitted capabilities
+      // 2. Explicit defaultRoles vs unrecognized defaultRoles fallback + omitted capabilities
       const customDefaultPolicy = createPermissionPolicy<"lead" | "viewer", "read">({
         roles: {
           lead: { inherits: ["viewer"], capabilities: "*" },
           viewer: {}
         },
-        defaultRole: "lead"
+        defaultRoles: ["lead"]
       });
-      expect(customDefaultPolicy.defaultRole).toBe("lead");
+      expect(customDefaultPolicy.defaultRoles).toEqual(["lead"]);
 
       const fallbackDefaultPolicy = createPermissionPolicy<"lead" | "viewer", "read">({
         roles: {
           lead: { inherits: ["viewer"] },
           viewer: {}
         },
-        defaultRole: "nonexistent" as any
+        defaultRoles: ["nonexistent" as any]
       });
-      expect(fallbackDefaultPolicy.defaultRole).toBe("viewer");
+      expect(fallbackDefaultPolicy.defaultRoles).toEqual(["viewer"]);
 
       // hasAllCapabilities quantifier semantics on empty array vs null member
       const viewerMember: ScopedMember<"lead" | "viewer", "read"> = {
@@ -651,8 +663,8 @@ describe("lanyard/core unit tests", () => {
         }
       });
 
-      // Abstract role `staff_base` is skipped when selecting `defaultRole` and excluded from `assignableRoles`
-      expect(dagPolicy.defaultRole).toBe("attendee");
+      // Abstract role `staff_base` is skipped when selecting `defaultRoles` and excluded from `assignableRoles`
+      expect(dagPolicy.defaultRoles).toEqual(["attendee"]);
       expect(dagPolicy.assignableRoles).toEqual([
         "attendee",
         "scanner",
@@ -732,9 +744,9 @@ describe("lanyard/core unit tests", () => {
             abstractBase: { abstract: true, capabilities: [] },
             concreteRole: { inherits: ["abstractBase"] }
           },
-          defaultRole: "abstractBase"
+          defaultRoles: ["abstractBase"]
         })
-      ).toThrow(/abstract roles cannot be used as defaultRole/);
+      ).toThrow(/abstract roles cannot be used in defaultRoles/);
 
       // Cycle detection & validation errors
       expect(() =>
@@ -1054,6 +1066,61 @@ describe("lanyard/core unit tests", () => {
 
       unsubUser();
       expect(observedUsers.length).toBeGreaterThanOrEqual(5);
+    });
+
+    it("supports role-less PermissionPolicy (empty or omitted roles) and filtered subscribeToUsers({ isSystemAdmin }) in InMemoryLanyardStore", async () => {
+      // 1. Role-less PermissionPolicy (for apps where only isSystemAdmin has special privileges)
+      const adminOnlyPolicy = createPermissionPolicy<never, never>({});
+      expect(adminOnlyPolicy.defaultRoles).toEqual([]);
+      expect(adminOnlyPolicy.assignableRoles).toEqual([]);
+      expect(adminOnlyPolicy.isAssignableRole("any" as never)).toBe(false);
+      expect(adminOnlyPolicy.hasRole({ roles: [] }, "any" as never, false)).toBe(false);
+      expect(adminOnlyPolicy.hasRole({ roles: [] }, "any" as never, true)).toBe(true);
+      expect(adminOnlyPolicy.hasCapability({ roles: [] }, "any" as never, false)).toBe(false);
+      expect(adminOnlyPolicy.hasCapability({ roles: [] }, "any" as never, true)).toBe(true);
+      expect(adminOnlyPolicy.shouldTrackPresence({}, false)).toBe(false);
+      expect(adminOnlyPolicy.shouldTrackPresence({ roles: [] }, false)).toBe(false);
+      expect(adminOnlyPolicy.shouldTrackPresence({ roles: [] }, true)).toBe(true);
+      expect(adminOnlyPolicy.canReadUser({ roles: [] }, { isSelf: true, isSystemAdmin: false })).toBe(true);
+      expect(adminOnlyPolicy.canReadUser({ roles: [] }, { isSelf: false, isSystemAdmin: false })).toBe(false);
+      expect(adminOnlyPolicy.canWriteUser({ roles: [] }, false)).toBe(false);
+      expect(adminOnlyPolicy.canWriteUser({ roles: [] }, true)).toBe(true);
+
+      // 2. Filtered subscribeToUsers({ isSystemAdmin: true }) in InMemoryLanyardStore
+      const store = new InMemoryLanyardStore<never, never>();
+      await store.upsertUser({
+        uid: "u-regular",
+        email: "regular@example.com",
+        roles: []
+      });
+      await store.upsertSystemAdmin({
+        uid: "u-admin",
+        email: "admin@example.com",
+        displayName: "Admin User"
+      });
+
+      const allSnapshots: any[][] = [];
+      const adminSnapshots: any[][] = [];
+      const nonAdminSnapshots: any[][] = [];
+
+      const unsubAll = store.subscribeToUsers((users) => allSnapshots.push(users));
+      const unsubAdmins = store.subscribeToUsers((users) => adminSnapshots.push(users), { isSystemAdmin: true });
+      const unsubNonAdmins = store.subscribeToUsers((users) => nonAdminSnapshots.push(users), { isSystemAdmin: false });
+
+      expect(allSnapshots[0].map((u) => u.uid)).toEqual(["u-regular", "u-admin"]);
+      expect(adminSnapshots[0].map((u) => u.uid)).toEqual(["u-admin"]);
+      expect(nonAdminSnapshots[0].map((u) => u.uid)).toEqual(["u-regular"]);
+
+      // Promote another admin -> adminSnapshots receives both admins
+      await store.upsertSystemAdmin({
+        uid: "u-admin-2",
+        email: "admin2@example.com"
+      });
+      expect(adminSnapshots[adminSnapshots.length - 1].map((u) => u.uid)).toEqual(["u-admin", "u-admin-2"]);
+
+      unsubAll();
+      unsubAdmins();
+      unsubNonAdmins();
     });
   });
 });

@@ -2,6 +2,7 @@ import type { NextFunction, Request, Response } from "express";
 import {
   GLOBAL_SCOPE,
   assertValidResourceId,
+  createPermissionPolicy,
   isValidEmail,
   isValidResourceId,
   sanitizeAvatarUrl,
@@ -134,8 +135,8 @@ export interface LanyardServerConfig<
   adminAuth: AdminAuthAdapter;
   /** Backing storage adapter implementing `LanyardServerStore` (e.g. `FirestoreServerStore` or `InMemoryLanyardStore`). */
   store: LanyardServerStore<TRole, TCapability, TPreferences, TAttributes, THiddenAttributes, TSecrets>;
-  /** Application permission policy defining role hierarchy, inheritance, capabilities, and attribute/hiddenAttribute/secret rules. */
-  policy: PermissionPolicy<TRole, TCapability>;
+  /** Optional application permission policy defining role hierarchy, inheritance, capabilities, and attribute/hiddenAttribute/secret rules. */
+  policy?: PermissionPolicy<TRole, TCapability>;
   /** Optional override for token verification (defaults to `new GoogleAuthService(adminAuth)`). */
   authService?: AuthService;
   /** Default Express route parameter name for the tenant/scope ID (defaults to `"scopeId"`). */
@@ -165,7 +166,7 @@ export function createLanyardServer<
   const {
     adminAuth,
     store,
-    policy,
+    policy = createPermissionPolicy<TRole, TCapability>({}),
     authService = new GoogleAuthService(adminAuth),
     defaultScopeParam = "scopeId",
     onVerifiedEmailChange
@@ -677,7 +678,7 @@ export function createLanyardServer<
       const now = new Date().toISOString();
       const resolvedRoles = params.roles
         ? Array.from(new Set(params.roles))
-        : (existing?.roles ?? [policy.defaultRole]);
+        : (existing?.roles ?? [...policy.defaultRoles]);
 
       const record: UserRecord<TRole, TCapability, TPreferences, TAttributes> = {
         ...(existing || {}),
@@ -698,7 +699,9 @@ export function createLanyardServer<
     }
 
     const existing = await store.getScopeMember(params.scopeId, uid);
-    const resolvedRoles = params.roles ? Array.from(new Set(params.roles)) : (existing?.roles ?? [policy.defaultRole]);
+    const resolvedRoles = params.roles
+      ? Array.from(new Set(params.roles))
+      : (existing?.roles ?? [...policy.defaultRoles]);
     const member: ScopedMember<TRole, TCapability, TPreferences, TAttributes> = {
       ...(existing || {}),
       uid,

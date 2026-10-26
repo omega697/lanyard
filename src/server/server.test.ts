@@ -477,7 +477,7 @@ describe("lanyard/server unit tests", () => {
 
     const store = new FirestoreServerStore<TestRole, TestCap>({
       db: fakeDb,
-      defaultRole: "member"
+      defaultRoles: ["member"]
     });
 
     // 1. System Admin CRUD
@@ -515,7 +515,7 @@ describe("lanyard/server unit tests", () => {
     await store.revokeScopeRoles("ws-1", "u-1", []);
     await store.revokeScopeRoles("ws-1", "non-existent", ["manager"]);
 
-    // Doc without roles field resolves to [defaultRole]
+    // Doc without roles field resolves to defaultRoles
     docs.set("workspaces/ws-1/members/u-default", {
       uid: "u-default",
       email: "default@example.com"
@@ -838,7 +838,7 @@ describe("lanyard/server unit tests", () => {
     // 5. FirestoreServerStore rejects path traversal and reserved __.*__ document IDs
     const fsServerStore = new FirestoreServerStore<TestRole, TestCap>({
       db: {} as any,
-      defaultRole: "member"
+      defaultRoles: ["member"]
     });
     await expect(fsServerStore.getScopeMember("ws-1/../../system_admins", "u-1")).rejects.toThrow(/Invalid scopeId/);
     await expect(fsServerStore.getScopeMember("ws-1", "__reserved__")).rejects.toThrow(
@@ -955,7 +955,7 @@ describe("lanyard/server unit tests", () => {
 
     const fsStore = new FirestoreServerStore<TestRole, TestCap>({
       db: fakeDb,
-      defaultRole: "member",
+      defaultRoles: ["member"],
       usersCollection: "custom_users",
       scopeCollection: "custom_orgs",
       membersSubcollection: "custom_members"
@@ -1573,7 +1573,7 @@ describe("lanyard/server unit tests", () => {
       { geminiKey: string; openaiKey: string }
     >({
       db: fakeDb,
-      defaultRole: "member",
+      defaultRoles: ["member"],
       encryptionKey: "test-master-encryption-key-for-lanyard"
     });
 
@@ -1663,7 +1663,7 @@ describe("lanyard/server unit tests", () => {
     // FirestoreServerStore without encryptionKey throws a clear error if encrypted secrets are read/written
     const unconfiguredCipherStore = new FirestoreServerStore({
       db: fakeDb,
-      defaultRole: "member"
+      defaultRoles: ["member"]
     });
     await expect(unconfiguredCipherStore.updateUserSecrets("u-1", { geminiKey: "fail" })).rejects.toThrow(
       /configure 'encryptionKey', 'cipher', or MASTER_ENCRYPTION_KEY/
@@ -2277,7 +2277,7 @@ describe("lanyard/server unit tests", () => {
             set: async () => {}
           })
         } as any,
-        defaultRole: "member"
+        defaultRoles: ["member"]
       });
       await expect(storeWithoutKey.updateUserSecrets("u-1", { apiKey: "secret-val" })).rejects.toThrow(
         /Cannot encrypt or decrypt secrets/
@@ -3007,5 +3007,25 @@ describe("lanyard/server unit tests", () => {
     const req3: any = { headers: { authorization: "Bearer valid-token" } };
     await server.checkAuth(req3, createMockRes(), () => {});
     expect(onVerifiedEmailChange).toHaveBeenCalledTimes(2);
+  });
+
+  it("supports createLanyardServer and FirestoreServerStore without roles or defaultRole (users have roles: [])", async () => {
+    const adminAuth = createFakeAdminAuth();
+    const store = new InMemoryLanyardStore();
+
+    // Instantiate createLanyardServer without policy (or with empty roles policy)
+    const server = createLanyardServer({
+      adminAuth,
+      store
+    });
+
+    const provisioned = await server.upsertUserByEmail({
+      scopeId: GLOBAL_SCOPE,
+      email: "norole@example.com",
+      firstName: "No",
+      lastName: "Role"
+    });
+    expect(provisioned.roles).toEqual([]);
+    expect((await store.getUser(provisioned.uid))?.roles).toEqual([]);
   });
 });

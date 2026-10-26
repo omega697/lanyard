@@ -26,7 +26,7 @@ Like a conference or workplace lanyard, `lanyard` answers two questions everywhe
   - **Explicit Role Inheritance (`inherits`) & Abstract Role Groupings (`abstract?: boolean`)**:
     - Each role in `TRole` defines its optional `inherits: readonly TRole[]` (supporting DAGs and sibling roles with cycle detection), implied `capabilities` (`"*"` or `readonly TCapability[]`), and `trackPresence` (`boolean`) in one place.
     - If a user holds role `A` and `A` transitively `inherits` from `B`, then `policy.hasRole(user, "B")` is `true` (`hasAnyRole` and `hasAllRoles` follow the same transitive inheritance).
-    - Mark logical capability-bundle roles with `abstract: true` so they are excluded from `policy.assignableRoles` (and `client.getAssignableRoles()`), cannot be `defaultRole`, and cannot be directly assigned to users—while concrete roles that inherit from them inherit all of their capabilities and satisfy `hasRole(user, abstractRole)`.
+    - Mark logical capability-bundle roles with `abstract: true` so they are excluded from `policy.assignableRoles` (and `client.getAssignableRoles()`), cannot be included in `defaultRoles`, and cannot be directly assigned to users—while concrete roles that inherit from them inherit all of their capabilities and satisfy `hasRole(user, abstractRole)`.
   - **Role-Based User Management, Role Assignment & Safe Deletion (`userCapabilities`)**:
     - Configure `userCapabilities: { read?: TCapability; write?: TCapability; assignRoles?: TCapability }` so non-admin roles with the appropriate capability can view other users' profiles (`getUser`, `listUsers`), update/delete non-admin users (`updateUserProfile`, `deleteUser`), or assign concrete roles to non-admin users (`updateUserRoles`).
     - Protects `deleteUser({ scopeId, actor, targetUid, confirmTargetEmail })` with case-insensitive `confirmTargetEmail` verification against `targetUid`'s stored email so swapped-UID mistakes are caught before any deletion occurs.
@@ -120,7 +120,7 @@ export const workspacePolicy = createPermissionPolicy<WorkspaceRole, WorkspaceCa
       capabilities: []
     }
   },
-  defaultRole: "member",
+  defaultRoles: ["member"],
   userCapabilities: {
     read: "edit_content", // Roles with 'edit_content' can view other users' profiles
     write: "invite_members", // Roles with 'invite_members' can update/delete non-admin users
@@ -176,7 +176,7 @@ export interface UserPrefs {
 
 const store = new FirestoreClientStore<WorkspaceRole, WorkspaceCapability, UserPrefs>({
   db,
-  defaultRole: workspacePolicy.defaultRole,
+  defaultRoles: workspacePolicy.defaultRoles,
   scopeCollection: "workspaces",
   membersSubcollection: "members"
 });
@@ -235,6 +235,11 @@ const canEditPoints = lanyard.canWriteAttribute(activeWorkspaceId, "pointsAllTim
 const canViewNotes = lanyard.canReadHiddenAttribute(activeWorkspaceId, "internalNotes");
 const canEditNotes = lanyard.canWriteHiddenAttribute(activeWorkspaceId, "internalNotes");
 const canConfigureGeminiKey = lanyard.canWriteSecret(activeWorkspaceId, "geminiKey");
+
+// Indexed subscription to active system administrators (`where("isSystemAdmin", "==", true)` in Firestore):
+const unsubAdmins = lanyard.subscribeToSystemAdmins((admins) => {
+  console.log("System admins:", admins);
+});
 ```
 
 #### Authentication & Magic Links
@@ -278,7 +283,7 @@ import { workspacePolicy, type WorkspaceRole, type WorkspaceCapability } from ".
 
 const store = new FirestoreServerStore<WorkspaceRole, WorkspaceCapability>({
   db,
-  defaultRole: workspacePolicy.defaultRole,
+  defaultRoles: workspacePolicy.defaultRoles,
   scopeCollection: "workspaces",
   membersSubcollection: "members",
   encryptionKey: process.env.LANYARD_ENCRYPTION_KEY // Master key for AES-256-GCM encrypted secrets

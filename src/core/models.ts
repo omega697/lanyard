@@ -50,7 +50,7 @@ export interface RoleDefinition<TRole extends string = string, TCapability exten
   /**
    * If `true`, this role is an abstract grouping of capabilities/inheritance only:
    * - It is excluded from `policy.assignableRoles` (so it does not appear in UI role pickers).
-   * - It cannot be used as `defaultRole` or directly assigned to a user/member.
+   * - It cannot be used in `defaultRoles` or directly assigned to a user/member.
    * - Concrete roles that inherit from it still inherit all of its capabilities and satisfy `hasRole(user, abstractRole)`.
    */
   abstract?: boolean;
@@ -118,15 +118,17 @@ export interface SecretCipher {
  */
 export interface PermissionPolicyConfig<TRole extends string = string, TCapability extends string = string> {
   /**
-   * Map of every role in `TRole` to its `RoleDefinition` (inherited roles, implied capabilities, and presence tracking).
+   * Optional map of every role in `TRole` to its `RoleDefinition` (inherited roles, implied capabilities, and presence tracking).
+   * Omit or pass `{}` for applications where users do not hold roles and only `isSystemAdmin` grants elevated privileges.
    */
-  roles: Record<TRole, RoleDefinition<TRole, TCapability>>;
+  roles?: Record<TRole, RoleDefinition<TRole, TCapability>>;
   /**
-   * Default role assigned when provisioning a member without an explicit role
-   * (e.g., via `grantScopeCapabilitiesByEmail` or when reading a document missing a `role` field).
-   * If omitted, defaults to the first root role (a role that does not inherit from any other role).
+   * Default roles assigned when provisioning a user/member without explicit roles
+   * or when reading a document missing a `roles` field.
+   * If omitted, defaults to `[rootConcreteRole]` when `roles` are defined, or `[]` when `roles` is empty/omitted.
+   * Pass `[]` explicitly if defined roles are privileged-only and regular users should start with no roles.
    */
-  defaultRole?: TRole;
+  defaultRoles?: readonly TRole[];
   /**
    * Optional capability rule governing who can read, write (update profile/delete), or assign roles (`assignRoles`)
    * on other users' records (beyond global system admins). `self` can always read and update their own profile/account.
@@ -168,7 +170,7 @@ export interface PermissionPolicy<TRole extends string = string, TCapability ext
   readonly roleCapabilities: Readonly<Partial<Record<TRole, readonly TCapability[] | "*">>>;
   readonly roleInherits: Readonly<Record<TRole, readonly TRole[]>>;
   readonly assignableRoles: readonly TRole[];
-  readonly defaultRole: TRole;
+  readonly defaultRoles: readonly TRole[];
 
   /**
    * Returns `true` if `role` is defined in `policy.roles` and is concrete (`!roleDef.abstract`).
@@ -518,6 +520,17 @@ export interface LanyardWritable<T> extends LanyardReadable<T> {
 }
 
 /**
+ * Optional filter options when subscribing to `usersCollection` via `subscribeToUsers`.
+ */
+export interface SubscribeToUsersOptions {
+  /**
+   * When set to a boolean (`true` or `false`), filters the query to documents matching `isSystemAdmin == options.isSystemAdmin`
+   * (using an indexed `where("isSystemAdmin", "==", ...)` query in Firestore).
+   */
+  isSystemAdmin?: boolean;
+}
+
+/**
  * Storage-agnostic client adapter interface.
  *
  * Consuming applications can pass `FirestoreClientStore` (from `lanyard/client/firestore`),
@@ -542,8 +555,11 @@ export interface LanyardClientStore<
     onChange: (user: UserRecord<TRole, TCapability, TPreferences, TAttributes> | null) => void
   ): () => void;
 
-  /** Optional: Subscribe to all global `UserRecord` documents (`usersCollection`) for single-tenant user directories. */
-  subscribeToUsers?(onChange: (users: UserRecord<TRole, TCapability, TPreferences, TAttributes>[]) => void): () => void;
+  /** Optional: Subscribe to global `UserRecord` documents (`usersCollection`), optionally filtered (e.g. `{ isSystemAdmin: true }`). */
+  subscribeToUsers?(
+    onChange: (users: UserRecord<TRole, TCapability, TPreferences, TAttributes>[]) => void,
+    options?: SubscribeToUsersOptions
+  ): () => void;
 
   /** Optional: Self-service update of the user's own global profile fields (`firstName`, `lastName`, `displayName`, `photoUrl`). */
   updateUserProfile?(uid: string, patch: UserProfilePatch): Promise<void>;

@@ -310,13 +310,13 @@ describe.skipIf(!existsSync(EMULATOR_JAR) || !existsSync(AUTH_EMULATOR_SERVER_JS
 
       const serverStore = new FirestoreServerStore<Role, Cap, Prefs, Attrs, HiddenAttrs, Secrets>({
         db: adminDb,
-        defaultRole: "attendee",
+        defaultRoles: ["attendee"],
         usersCollection: "users_st",
         encryptionKey: "emulator-test-master-encryption-key"
       });
       const clientStore = new FirestoreClientStore<Role, Cap, Prefs, Attrs>({
         db: clientDb,
-        defaultRole: "attendee",
+        defaultRoles: ["attendee"],
         usersCollection: "users_st"
       });
 
@@ -800,7 +800,7 @@ describe.skipIf(!existsSync(EMULATOR_JAR) || !existsSync(AUTH_EMULATOR_SERVER_JS
         { geminiKey: string }
       >({
         db: adminDb,
-        defaultRole: "member",
+        defaultRoles: ["member"],
         usersCollection: "users_mt",
         scopeCollection: "orgs_mt",
         membersSubcollection: "members_mt",
@@ -808,7 +808,7 @@ describe.skipIf(!existsSync(EMULATOR_JAR) || !existsSync(AUTH_EMULATOR_SERVER_JS
       });
       const clientStore = new FirestoreClientStore<Role, Cap, Record<string, any>, { quotaTier: string }>({
         db: clientDb,
-        defaultRole: "member",
+        defaultRoles: ["member"],
         usersCollection: "users_mt",
         scopeCollection: "orgs_mt",
         membersSubcollection: "members_mt"
@@ -1077,7 +1077,7 @@ service cloud.firestore {
           { geminiKey: string }
         >({
           db: adminDb,
-          defaultRole: "member",
+          defaultRoles: ["member"],
           usersCollection: "users",
           scopeCollection: "workspaces",
           membersSubcollection: "members",
@@ -1086,7 +1086,7 @@ service cloud.firestore {
 
         const memberStore = new FirestoreClientStore<Role, Cap, Prefs, { badge: string }>({
           db: memberClient.db,
-          defaultRole: "member",
+          defaultRoles: ["member"],
           usersCollection: "users",
           scopeCollection: "workspaces",
           membersSubcollection: "members"

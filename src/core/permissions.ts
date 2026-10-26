@@ -40,9 +40,6 @@ export function createPermissionPolicy<TRole extends string = string, TCapabilit
     TRole,
     RoleDefinition<TRole, TCapability>
   ][];
-  if (entries.length === 0) {
-    throw new Error("PermissionPolicyConfig requires at least one role in roles.");
-  }
 
   const rawRoles = Object.create(null) as Record<TRole, RoleDefinition<TRole, TCapability>>;
 
@@ -140,17 +137,17 @@ export function createPermissionPolicy<TRole extends string = string, TCapabilit
   }
 
   const assignableEntries = entries.filter(([, def]) => !def.abstract);
-  if (assignableEntries.length === 0) {
+  if (entries.length > 0 && assignableEntries.length === 0) {
     throw new Error("PermissionPolicyConfig requires at least one concrete (non-abstract) role in roles.");
   }
   const assignableRoles = Object.freeze(assignableEntries.map(([r]) => r));
 
-  if (
-    config.defaultRole !== undefined &&
-    Object.hasOwn(roles, config.defaultRole) &&
-    roles[config.defaultRole].abstract
-  ) {
-    throw new Error(`Invalid defaultRole '${config.defaultRole}': abstract roles cannot be used as defaultRole.`);
+  if (Array.isArray(config.defaultRoles)) {
+    for (const r of config.defaultRoles) {
+      if (typeof r === "string" && Object.hasOwn(roles, r) && roles[r as TRole].abstract) {
+        throw new Error(`Invalid defaultRoles '${r}': abstract roles cannot be used in defaultRoles.`);
+      }
+    }
   }
 
   // Normalize userCapabilities, attributeCapabilities, hiddenAttributeCapabilities & secretCapabilities
@@ -228,12 +225,28 @@ export function createPermissionPolicy<TRole extends string = string, TCapabilit
   Object.freeze(resolvedCapabilities);
   Object.freeze(roleInherits);
 
-  // Default to explicit config.defaultRole or the first concrete root role (or first concrete role)
+  // Default to explicit config.defaultRoles or [rootConcreteRole] (or [] when no roles are defined)
   const rootConcreteRole =
-    assignableEntries.find(([, def]) => !Array.isArray(def.inherits) || def.inherits.length === 0)?.[0] ??
-    assignableEntries[0][0];
-  const defaultRole: TRole =
-    config.defaultRole && Object.hasOwn(roles, config.defaultRole) ? config.defaultRole : rootConcreteRole;
+    assignableEntries.length > 0
+      ? (assignableEntries.find(([, def]) => !Array.isArray(def.inherits) || def.inherits.length === 0)?.[0] ??
+        assignableEntries[0][0])
+      : undefined;
+  let resolvedDefaultRoles: TRole[];
+  if (Array.isArray(config.defaultRoles)) {
+    const valid = Array.from(
+      new Set(config.defaultRoles.filter((r): r is TRole => typeof r === "string" && Object.hasOwn(roles, r)))
+    );
+    if (config.defaultRoles.length === 0) {
+      resolvedDefaultRoles = [];
+    } else if (valid.length > 0) {
+      resolvedDefaultRoles = valid;
+    } else {
+      resolvedDefaultRoles = rootConcreteRole !== undefined ? [rootConcreteRole] : [];
+    }
+  } else {
+    resolvedDefaultRoles = rootConcreteRole !== undefined ? [rootConcreteRole] : [];
+  }
+  const defaultRoles: readonly TRole[] = Object.freeze(resolvedDefaultRoles);
 
   function isAssignableRole(role: TRole): boolean {
     if (typeof role !== "string" || !Object.hasOwn(roles, role)) return false;
@@ -320,7 +333,7 @@ export function createPermissionPolicy<TRole extends string = string, TCapabilit
   ): boolean {
     if (isSystemAdmin) return true;
     if (!member || typeof member !== "object") return false;
-    const effectiveRoles = member.roles === undefined ? [defaultRole] : Array.isArray(member.roles) ? member.roles : [];
+    const effectiveRoles = member.roles === undefined ? defaultRoles : Array.isArray(member.roles) ? member.roles : [];
     return effectiveRoles.some(
       (role: TRole) =>
         typeof role === "string" && Object.hasOwn(roles, role) && Boolean(roles[role as TRole]?.trackPresence)
@@ -504,7 +517,7 @@ export function createPermissionPolicy<TRole extends string = string, TCapabilit
     roleCapabilities: resolvedCapabilities,
     roleInherits,
     assignableRoles,
-    defaultRole,
+    defaultRoles,
     isAssignableRole,
     hasRole,
     hasAnyRole,

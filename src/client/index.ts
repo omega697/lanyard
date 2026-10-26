@@ -33,12 +33,21 @@ import {
   type ScopeId,
   type ScopedMember,
   type SocialProviderType,
+  type SubscribeToUsersOptions,
+  type SystemAdminProfile,
   type UserProfilePatch,
   type UserRecord,
   type VerifiedEmailChangeEvent
 } from "../core/index.js";
 
-export { GLOBAL_SCOPE, formatExistingAccountError, type GlobalScope, type ScopeId, type VerifiedEmailChangeEvent };
+export {
+  GLOBAL_SCOPE,
+  formatExistingAccountError,
+  type GlobalScope,
+  type ScopeId,
+  type SubscribeToUsersOptions,
+  type VerifiedEmailChangeEvent
+};
 
 export const HEARTBEAT_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
 
@@ -1131,7 +1140,8 @@ export function createLanyardClient<
 
   function subscribeToUsers(
     scopeId: GlobalScope,
-    cb: (users: UserRecord<TRole, TCapability, TPreferences, TAttributes>[]) => void
+    cb: (users: UserRecord<TRole, TCapability, TPreferences, TAttributes>[]) => void,
+    options?: SubscribeToUsersOptions
   ): () => void;
   function subscribeToUsers(
     scopeId: string,
@@ -1143,7 +1153,8 @@ export function createLanyardClient<
       users:
         | UserRecord<TRole, TCapability, TPreferences, TAttributes>[]
         | ScopedMember<TRole, TCapability, TPreferences, TAttributes>[]
-    ) => void
+    ) => void,
+    options?: SubscribeToUsersOptions
   ): () => void;
   function subscribeToUsers(
     scopeId: ScopeId,
@@ -1154,13 +1165,17 @@ export function createLanyardClient<
           users:
             | UserRecord<TRole, TCapability, TPreferences, TAttributes>[]
             | ScopedMember<TRole, TCapability, TPreferences, TAttributes>[]
-        ) => void)
+        ) => void),
+    options?: SubscribeToUsersOptions
   ): () => void {
     if (scopeId === GLOBAL_SCOPE) {
       if (typeof store.subscribeToUsers !== "function") {
         throw new Error("Backing store does not implement subscribeToUsers");
       }
-      return store.subscribeToUsers(cb as (users: UserRecord<TRole, TCapability, TPreferences, TAttributes>[]) => void);
+      return store.subscribeToUsers(
+        cb as (users: UserRecord<TRole, TCapability, TPreferences, TAttributes>[]) => void,
+        options
+      );
     }
     if (!isValidResourceId(scopeId)) {
       throw new Error("Invalid scopeId");
@@ -1171,6 +1186,21 @@ export function createLanyardClient<
     return store.subscribeToScopeMembers(
       scopeId,
       cb as (members: ScopedMember<TRole, TCapability, TPreferences, TAttributes>[]) => void
+    );
+  }
+
+  /**
+   * Subscribes to active system administrators (`isSystemAdmin === true`) in `usersCollection`.
+   * Uses an indexed `where("isSystemAdmin", "==", true)` query in `FirestoreClientStore` so only
+   * system admin documents are read from Firestore.
+   */
+  function subscribeToSystemAdmins(cb: (admins: SystemAdminProfile[]) => void): () => void {
+    return subscribeToUsers(
+      GLOBAL_SCOPE,
+      (users) => {
+        cb(users.filter((u) => u.isSystemAdmin === true) as SystemAdminProfile[]);
+      },
+      { isSystemAdmin: true }
     );
   }
 
@@ -1198,6 +1228,7 @@ export function createLanyardClient<
     setActiveUser,
     subscribeToAuthUser,
     subscribeToUsers,
+    subscribeToSystemAdmins,
     loginWithSocialProvider,
     sendPasswordlessEmailLink,
     completePasswordlessSignIn,

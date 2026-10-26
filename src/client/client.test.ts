@@ -386,7 +386,7 @@ describe("lanyard/client unit tests", () => {
     const fakeDb: any = {};
     const store = new FirestoreClientStore<TestRole, TestCap, TestPrefs>({
       db: fakeDb,
-      defaultRole: "member"
+      defaultRoles: ["member"]
     });
 
     // 1. subscribeToPreferences + savePreferences on unified users/{uid}
@@ -882,7 +882,7 @@ describe("lanyard/client unit tests", () => {
     // 3. FirestoreClientStore rejects path traversal and reserved __.*__ document IDs
     const fsStore = new FirestoreClientStore<TestRole, TestCap, TestPrefs>({
       db: {} as any,
-      defaultRole: "member"
+      defaultRoles: ["member"]
     });
     expect(() => fsStore.subscribeToScopeMembers("ws-1/../../system_admins", () => {})).toThrow(/Invalid scopeId/);
     expect(() => fsStore.subscribeToScopeMembers("__reserved__", () => {})).toThrow(/reserved Firestore document ID/);
@@ -1070,7 +1070,7 @@ describe("lanyard/client unit tests", () => {
 
     const fsStore = new FirestoreClientStore<TestRole, TestCap, TestPrefs>({
       db: { type: "custom-fs" } as any,
-      defaultRole: "member",
+      defaultRoles: ["member"],
       usersCollection: "custom_users",
       scopeCollection: "custom_scopes",
       membersSubcollection: "custom_members"
@@ -1104,7 +1104,7 @@ describe("lanyard/client unit tests", () => {
     const fakeDb: any = {};
     const fsStore = new FirestoreClientStore<TestRole, TestCap, TestPrefs, { pointsAllTime: number }>({
       db: fakeDb,
-      defaultRole: "member"
+      defaultRoles: ["member"]
     });
 
     let emitSnapshot!: (snap: any) => void;
@@ -1620,6 +1620,81 @@ describe("lanyard/client unit tests", () => {
 
     clientNoPolicy.destroy();
     clientFourTier.destroy();
+    client.destroy();
+  });
+
+  it("supports optional defaultRole (empty roles array) and indexed subscribeToSystemAdmins / subscribeToUsers({ isSystemAdmin }) on FirestoreClientStore", async () => {
+    const fakeDb: any = { type: "fs" };
+    // Instantiate FirestoreClientStore without defaultRole
+    const fsStore = new FirestoreClientStore({
+      db: fakeDb
+    });
+
+    // 1. User document without `roles` field resolves to `roles: []` when defaultRole is omitted
+    let emitUserSnap!: (snap: any) => void;
+    vi.mocked(firebaseFirestore.onSnapshot).mockImplementationOnce((_ref: any, onNext: any) => {
+      emitUserSnap = onNext;
+      return () => {};
+    });
+
+    const userEvents: any[] = [];
+    const unsubUser = fsStore.subscribeToUser("u-no-role", (u) => userEvents.push(u));
+    emitUserSnap({
+      exists: () => true,
+      data: () => ({
+        uid: "u-no-role",
+        email: "norole@example.com"
+      })
+    });
+    expect(userEvents[0]?.roles).toEqual([]);
+    unsubUser();
+
+    // 2. subscribeToSystemAdmins / subscribeToUsers(GLOBAL_SCOPE, cb, { isSystemAdmin: true }) uses where("isSystemAdmin", "==", true)
+    vi.mocked(firebaseFirestore.where).mockClear();
+    vi.mocked(firebaseFirestore.query).mockClear();
+    let emitAdminsSnap!: (snap: any) => void;
+    vi.mocked(firebaseFirestore.onSnapshot).mockImplementationOnce((_ref: any, onNext: any) => {
+      emitAdminsSnap = onNext;
+      return () => {};
+    });
+
+    const client = createLanyardClient({
+      store: fsStore,
+      defaultPreferences: DEFAULT_PREFS
+    });
+
+    const adminsList: any[][] = [];
+    const unsubAdmins = client.subscribeToSystemAdmins((admins) => adminsList.push(admins));
+
+    expect(firebaseFirestore.where).toHaveBeenCalledWith("isSystemAdmin", "==", true);
+    expect(firebaseFirestore.query).toHaveBeenCalledTimes(1);
+
+    emitAdminsSnap({
+      forEach: (cb: (doc: any) => void) => {
+        cb({
+          id: "u-admin-1",
+          data: () => ({
+            uid: "u-admin-1",
+            email: "admin1@example.com",
+            displayName: "Admin One",
+            isSystemAdmin: true
+          })
+        });
+      }
+    });
+
+    expect(adminsList).toHaveLength(1);
+    expect(adminsList[0]).toEqual([
+      expect.objectContaining({
+        uid: "u-admin-1",
+        email: "admin1@example.com",
+        displayName: "Admin One",
+        isSystemAdmin: true,
+        roles: []
+      })
+    ]);
+
+    unsubAdmins();
     client.destroy();
   });
 });

@@ -14,6 +14,7 @@ import {
   sanitizeAvatarUrl,
   type LanyardClientStore,
   type ScopedMember,
+  type SubscribeToUsersOptions,
   type UserProfilePatch,
   type UserRecord
 } from "../core/index.js";
@@ -43,8 +44,8 @@ function assertValidFirestoreDocId(id: string | null | undefined, label: string)
 
 export interface FirestoreClientStoreConfig<TRole extends string = string> {
   db: Firestore;
-  /** Default role assigned if a stored document does not have a `roles` field. */
-  defaultRole: TRole;
+  /** Optional default roles assigned if a stored document does not have a `roles` field (defaults to `[]`). */
+  defaultRoles?: readonly TRole[];
   /** Canonical users collection name (defaults to `"users"`). */
   usersCollection?: string;
   scopeCollection?: string;
@@ -78,7 +79,7 @@ export class FirestoreClientStore<
   TAttributes extends Record<string, any> = Record<string, any>
 > implements LanyardClientStore<TRole, TCapability, TPreferences, TAttributes> {
   private readonly db: Firestore;
-  private readonly defaultRole: TRole;
+  private readonly defaultRoles: readonly TRole[];
   private readonly usersCollection: string;
   private readonly scopeCollection: string;
   private readonly membersSubcollection: string;
@@ -90,7 +91,7 @@ export class FirestoreClientStore<
 
   constructor(config: FirestoreClientStoreConfig<TRole>) {
     this.db = config.db;
-    this.defaultRole = config.defaultRole;
+    this.defaultRoles = Object.freeze(Array.from(new Set(config.defaultRoles || [])));
     this.usersCollection = assertValidFirestoreDocId(config.usersCollection || "users", "usersCollection");
     this.scopeCollection = assertValidFirestoreDocId(config.scopeCollection || "workspaces", "scopeCollection");
     this.membersSubcollection = assertValidFirestoreDocId(
@@ -103,7 +104,7 @@ export class FirestoreClientStore<
     if (Array.isArray(data.roles) && data.roles.length > 0) {
       return Array.from(new Set(data.roles as TRole[]));
     }
-    return [this.defaultRole];
+    return [...this.defaultRoles];
   }
 
   private extractPreferencesFromDocData(data: Record<string, any>): Partial<TPreferences> {
@@ -222,10 +223,17 @@ export class FirestoreClientStore<
     };
   }
 
-  subscribeToUsers(onChange: (users: UserRecord<TRole, TCapability, TPreferences, TAttributes>[]) => void): () => void {
+  subscribeToUsers(
+    onChange: (users: UserRecord<TRole, TCapability, TPreferences, TAttributes>[]) => void,
+    options?: SubscribeToUsersOptions
+  ): () => void {
     const colRef = collection(this.db, this.usersCollection);
+    const target =
+      typeof options?.isSystemAdmin === "boolean"
+        ? query(colRef, where("isSystemAdmin", "==", options.isSystemAdmin))
+        : colRef;
     return onSnapshot(
-      colRef,
+      target,
       (snapshot) => {
         const list: UserRecord<TRole, TCapability, TPreferences, TAttributes>[] = [];
         snapshot.forEach((docSnap) => {

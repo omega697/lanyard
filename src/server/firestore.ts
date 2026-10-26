@@ -45,8 +45,8 @@ function assertValidFirestoreDocId(id: string | null | undefined, label: string)
 
 export interface FirestoreServerStoreConfig<TRole extends string = string> {
   db: Firestore;
-  /** Default role assigned if a stored document does not have a `roles` field. */
-  defaultRole: TRole;
+  /** Optional default roles assigned if a stored document does not have a `roles` field (defaults to `[]`). */
+  defaultRoles?: readonly TRole[];
   /** Canonical users collection name (defaults to `"users"`). */
   usersCollection?: string;
   scopeCollection?: string;
@@ -76,7 +76,7 @@ export class FirestoreServerStore<
   TSecrets extends Record<string, any> = Record<string, any>
 > implements LanyardServerStore<TRole, TCapability, TPreferences, TAttributes, THiddenAttributes, TSecrets> {
   private readonly db: Firestore;
-  private readonly defaultRole: TRole;
+  private readonly defaultRoles: readonly TRole[];
   private readonly usersCollection: string;
   private readonly scopeCollection: string;
   private readonly membersSubcollection: string;
@@ -84,7 +84,7 @@ export class FirestoreServerStore<
 
   constructor(config: FirestoreServerStoreConfig<TRole>) {
     this.db = config.db;
-    this.defaultRole = config.defaultRole;
+    this.defaultRoles = Object.freeze(Array.from(new Set(config.defaultRoles || [])));
     this.usersCollection = assertValidFirestoreDocId(config.usersCollection || "users", "usersCollection");
     this.scopeCollection = assertValidFirestoreDocId(config.scopeCollection || "workspaces", "scopeCollection");
     this.membersSubcollection = assertValidFirestoreDocId(
@@ -109,7 +109,7 @@ export class FirestoreServerStore<
     if (Array.isArray(data.roles) && data.roles.length > 0) {
       return Array.from(new Set(data.roles as TRole[]));
     }
-    return [this.defaultRole];
+    return [...this.defaultRoles];
   }
 
   private userDocRef(uid: string) {
@@ -327,7 +327,7 @@ export class FirestoreServerStore<
       if (!fallbackUser) {
         throw new Error(`User '${cleanUid}' does not exist`);
       }
-      const initialRoles = roles.length > 0 ? Array.from(new Set(roles)) : [this.defaultRole];
+      const initialRoles = roles.length > 0 ? Array.from(new Set(roles)) : [...this.defaultRoles];
       const created: UserRecord<TRole, TCapability, TPreferences, TAttributes> = {
         ...fallbackUser,
         ...(fallbackUser.photoUrl !== undefined ? { photoUrl: sanitizeAvatarUrl(fallbackUser.photoUrl) } : {}),
@@ -562,7 +562,7 @@ export class FirestoreServerStore<
       if (!fallbackMember) {
         throw new Error(`Member '${uid}' does not exist in scope '${scopeId}'`);
       }
-      const initialRoles = roles.length > 0 ? Array.from(new Set(roles)) : [this.defaultRole];
+      const initialRoles = roles.length > 0 ? Array.from(new Set(roles)) : [...this.defaultRoles];
       const created: ScopedMember<TRole, TCapability, TPreferences, TAttributes> = {
         ...fallbackMember,
         ...(fallbackMember.photoUrl !== undefined ? { photoUrl: sanitizeAvatarUrl(fallbackMember.photoUrl) } : {}),

@@ -5,6 +5,7 @@ import type {
   LanyardServerStore,
   ScopedMember,
   SecretCipher,
+  SubscribeToUsersOptions,
   SystemAdminProfile,
   UserProfilePatch,
   UserRecord
@@ -110,9 +111,10 @@ export class InMemoryLanyardStore<
     string,
     Set<(user: UserRecord<TRole, TCapability, TPreferences, TAttributes> | null) => void>
   >();
-  private usersDirectoryListeners = new Set<
-    (users: UserRecord<TRole, TCapability, TPreferences, TAttributes>[]) => void
-  >();
+  private usersDirectoryListeners = new Set<{
+    cb: (users: UserRecord<TRole, TCapability, TPreferences, TAttributes>[]) => void;
+    options?: SubscribeToUsersOptions;
+  }>();
   private userMembershipListeners = new Map<
     string,
     Set<(members: ScopedMember<TRole, TCapability, TPreferences, TAttributes>[]) => void>
@@ -185,12 +187,16 @@ export class InMemoryLanyardStore<
     };
   }
 
-  subscribeToUsers(onChange: (users: UserRecord<TRole, TCapability, TPreferences, TAttributes>[]) => void): () => void {
-    this.usersDirectoryListeners.add(onChange);
-    onChange(Array.from(this.users.values()).map((u) => this.cloneUser(u)!));
+  subscribeToUsers(
+    onChange: (users: UserRecord<TRole, TCapability, TPreferences, TAttributes>[]) => void,
+    options?: SubscribeToUsersOptions
+  ): () => void {
+    const entry = { cb: onChange, options };
+    this.usersDirectoryListeners.add(entry);
+    onChange(this.getFilteredUsersSnapshot(options));
 
     return () => {
-      this.usersDirectoryListeners.delete(onChange);
+      this.usersDirectoryListeners.delete(entry);
     };
   }
 
@@ -755,6 +761,17 @@ export class InMemoryLanyardStore<
     return Array.from(map.values()).map((m) => this.cloneMember(m));
   }
 
+  private getFilteredUsersSnapshot(
+    options?: SubscribeToUsersOptions
+  ): UserRecord<TRole, TCapability, TPreferences, TAttributes>[] {
+    const all = Array.from(this.users.values());
+    const filtered =
+      typeof options?.isSystemAdmin === "boolean"
+        ? all.filter((u) => Boolean(u.isSystemAdmin) === options.isSystemAdmin)
+        : all;
+    return filtered.map((u) => this.cloneUser(u)!);
+  }
+
   private notifyUserAndPrefListeners(uid: string): void {
     const user = this.users.get(uid) || null;
     const prefCallbacks = this.prefListeners.get(uid);
@@ -771,9 +788,8 @@ export class InMemoryLanyardStore<
       }
     }
     if (this.usersDirectoryListeners.size > 0) {
-      const allUsers = Array.from(this.users.values()).map((u) => this.cloneUser(u)!);
-      for (const cb of this.usersDirectoryListeners) {
-        cb(allUsers);
+      for (const entry of this.usersDirectoryListeners) {
+        entry.cb(this.getFilteredUsersSnapshot(entry.options));
       }
     }
   }
