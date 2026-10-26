@@ -45,7 +45,7 @@
   },
   "peerDependencies": {
     "express": "^4.18.0 || ^5.0.0",
-    "firebase": "^11.0.0",
+    "firebase": "^11.0.0 || ^12.0.0 || ^13.0.0",
     "firebase-admin": "^13.0.0 || ^14.0.0"
   },
   "peerDependenciesMeta": {
@@ -63,8 +63,8 @@
     "@types/express": "^4.17.21",
     "@types/node": "^20.11.19",
     "express": "^4.18.2",
-    "firebase": "^11.1.0",
-    "firebase-admin": "^14.1.0",
+    "firebase": "^13.1.0",
+    "firebase-admin": "^14.5.0",
     "husky": "^9.1.7",
     "lint-staged": "^17.0.7",
     "prettier": "^3.8.4",
@@ -72,10 +72,17 @@
     "vitest": "^4.1.9"
   },
   "lint-staged": {
+    "package-lock.json": [
+      "node -e \"const fs=require('fs'),f='package-lock.json',s=fs.readFileSync(f,'utf8'),u=s.replace(/https?:\\/\\/airlock-proxy\\.uplink\\.goog:999\\/npm\\/artifact-foundry-prod\\/[^/]+\\//g,'https://registry.npmjs.org/');if(s!==u)fs.writeFileSync(f,u);\"",
+      "prettier --write"
+    ],
     "*.{ts,js}": [
       "prettier --write"
     ],
-    "*.{json,md,yml,yaml}": [
+    "!(package-lock).json": [
+      "prettier --write"
+    ],
+    "*.{md,yml,yaml}": [
       "prettier --write"
     ]
   }
