@@ -1315,6 +1315,63 @@ describe("lanyard/client unit tests", () => {
     client.destroy();
   });
 
+  it("merges card-placed and attributes-tier keys into attributesStore and memberships, and rejects a store/policy placement mismatch", async () => {
+    type Attrs = { badges: string[]; points: number };
+    const policy = createPermissionPolicy<TestRole, TestCap>({ cardFields: { attributes: ["badges"] } });
+
+    expect(() =>
+      createLanyardClient<TestRole, TestCap, TestPrefs, Attrs>({
+        store: new InMemoryLanyardStore<TestRole, TestCap, TestPrefs, Attrs>(),
+        policy,
+        defaultPreferences: DEFAULT_PREFS
+      })
+    ).toThrow(/Store cardFields do not match the policy's cardFields/);
+
+    const store = new InMemoryLanyardStore<TestRole, TestCap, TestPrefs, Attrs>({ policy });
+    await store.upsertUser({ uid: "u-1", email: "u1@example.com", attributes: { badges: ["early"], points: 1 } });
+    await store.upsertScopeMember("ws-a", {
+      uid: "u-1",
+      email: "u1@example.com",
+      roles: ["member"],
+      attributes: { badges: ["scoped"], points: 10 }
+    });
+
+    const client = createLanyardClient<TestRole, TestCap, TestPrefs, Attrs>({
+      store,
+      policy,
+      defaultPreferences: DEFAULT_PREFS,
+      storageKeyPrefix: "attrtiers"
+    });
+    client.setActiveUser({
+      uid: "u-1",
+      email: "u1@example.com",
+      emailVerified: true,
+      displayName: null,
+      photoUrl: null,
+      isAdmin: false,
+      providerIds: []
+    });
+
+    // The card carries only the card-placed key; attributesStore merges in the tier
+    expect(client.userRecordStore.get()?.attributes).toEqual({ badges: ["early"] });
+    expect(client.getAttributes(GLOBAL_SCOPE)).toEqual({ badges: ["early"], points: 1 });
+    expect(client.getAttributes("ws-a")).toEqual({ badges: ["scoped"], points: 10 });
+
+    // Server-side updates to either location flow into the merged view
+    await store.updateUserAttributes("u-1", { points: 2 });
+    await store.updateUserAttributes("u-1", { badges: ["early", "vip"] });
+    expect(client.getAttributes(GLOBAL_SCOPE)).toEqual({ badges: ["early", "vip"], points: 2 });
+    await store.updateScopeMemberAttributes("ws-a", "u-1", { points: 11 });
+    expect(client.getAttributes("ws-a")).toEqual({ badges: ["scoped"], points: 11 });
+
+    // Leaving the scope drops its attributes; signing out clears everything
+    await store.deleteScopeMember("ws-a", "u-1");
+    expect(client.getAttributes("ws-a")).toEqual({});
+    client.setActiveUser(null);
+    expect(client.getAttributes(GLOBAL_SCOPE)).toEqual({});
+    client.destroy();
+  });
+
   it("wires userRecordStore, attributesStore, updateProfile, real-time isSystemAdmin sync, and single-tenant role presence tracking", async () => {
     interface CheckinAttrs {
       pointsAllTime: number;

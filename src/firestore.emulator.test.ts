@@ -630,12 +630,21 @@ describe.skipIf(!emulatorsAvailable)(
       const afterSelfUpdate = await waitForStore(client.userRecordStore, (u) => u?.firstName === "UpdatedTesty");
       await waitForStore(client.preferencesStore, (p) => p.leaderboardOptIn === true && p.theme === "dark");
       expect(afterSelfUpdate?.roles).toEqual(["attendee"]);
-      expect(afterSelfUpdate?.attributes?.pointsAllTime).toBe(35);
-      expect(afterSelfUpdate?.attributes?.merchCreditBalance).toBe(80);
+      // Attributes come from the private attributes tier (merged into attributesStore), not the card
+      expect(afterSelfUpdate?.attributes).toEqual({});
+      expect(client.attributesStore.get().pointsAllTime).toBe(35);
+      expect(client.attributesStore.get().merchCreditBalance).toBe(80);
+      const rawAttrs = (await adminDb.doc(`users_st/${attendee.uid}/private/attributes`).get()).data();
+      expect(rawAttrs).toMatchObject({
+        pointsAllTime: 35,
+        merchCreditBalance: 80,
+        _lanyard: { tier: "attributes", uid: attendee.uid, scopeId: null, updatedAt: expect.any(String) }
+      });
       // Preferences never land on the card; they live only in the self-only private/preferences tier doc
       expect(afterSelfUpdate?.preferences).toBeUndefined();
       const rawCard = (await adminDb.doc(`users_st/${attendee.uid}`).get()).data();
       expect(rawCard).not.toHaveProperty("preferences");
+      expect(rawCard).not.toHaveProperty("attributes");
       const rawPrefs = (await adminDb.doc(`users_st/${attendee.uid}/private/preferences`).get()).data();
       expect(rawPrefs).toEqual({
         leaderboardOptIn: true,
@@ -1070,6 +1079,11 @@ service cloud.firestore {
         allow read: if isOwner(uid);
         allow write: if isOwner(uid) && isPreferencesTierDoc(uid, null);
       }
+
+      // Self + staff attributes tier; written only by the server (Admin SDK)
+      match /private/attributes {
+        allow read: if isOwner(uid) || hasUserCapability(['manager', 'owner']);
+      }
     }
 
     match /{path=**}/members/{memberUid} {
@@ -1086,6 +1100,11 @@ service cloud.firestore {
 
       match /private/hiddenAttributes {
         allow read, write: if hasScopeCapability(scopeId, ['owner', 'manager']);
+      }
+
+      match /private/attributes {
+        allow read: if isOwner(memberUid) || hasScopeCapability(scopeId, ['owner', 'manager']);
+        allow write: if false;
       }
 
       match /private/preferences {
@@ -1456,6 +1475,67 @@ service cloud.firestore {
           })
         ).rejects.toMatchObject({ code: "permission-denied" });
 
+        // Attack F: The attributes tier is readable only by its owner and staff, and never writable from clients
+        await serverStore.updateUserAttributes("u-member", { badge: "global-badge" });
+        await serverStore.upsertScopeMember("org-A", {
+          uid: "u-mgr",
+          email: "mgr@example.com",
+          roles: ["manager"],
+          attributes: { badge: "mgr-badge" }
+        });
+        expect((await adminDb.doc("workspaces/org-A/members/u-member").get()).data()).not.toHaveProperty("attributes");
+        expect((await adminDb.doc("users/u-member").get()).data()).not.toHaveProperty("attributes");
+        expect(
+          (await clientGetDoc(clientDoc(memberClient.db, "users", "u-member", "private", "attributes"))).data()
+        ).toMatchObject({ badge: "global-badge", _lanyard: { tier: "attributes", scopeId: null } });
+        expect(
+          (
+            await clientGetDoc(
+              clientDoc(memberClient.db, "workspaces", "org-A", "members", "u-member", "private", "attributes")
+            )
+          ).data()
+        ).toMatchObject({ badge: "starter", _lanyard: { tier: "attributes", scopeId: "org-A" } });
+        const ownScopeAttrEvents: any[] = [];
+        const unsubOwnScopeAttrs = memberStore.subscribeToScopeAttributes("org-A", "u-member", (a) =>
+          ownScopeAttrEvents.push(a)
+        );
+        await new Promise((r) => setTimeout(r, 150));
+        expect(ownScopeAttrEvents.at(-1)).toEqual({ badge: "starter" });
+        unsubOwnScopeAttrs();
+        // A non-staff member can't read a fellow member's (or another user's) attributes
+        await expect(
+          clientGetDoc(clientDoc(memberClient.db, "workspaces", "org-A", "members", "u-mgr", "private", "attributes"))
+        ).rejects.toMatchObject({ code: "permission-denied" });
+        await expect(
+          clientGetDoc(clientDoc(mgrClient.db, "users", "u-member", "private", "attributes"))
+        ).rejects.toMatchObject({ code: "permission-denied" });
+        // Owners and staff can't write the attributes tier directly
+        await expect(
+          clientSetDoc(
+            clientDoc(memberClient.db, "users", "u-member", "private", "attributes"),
+            { badge: "self-awarded" },
+            { merge: true }
+          )
+        ).rejects.toMatchObject({ code: "permission-denied" });
+        await expect(
+          clientSetDoc(
+            clientDoc(mgrClient.db, "workspaces", "org-A", "members", "u-member", "private", "attributes"),
+            { badge: "staff-awarded" },
+            { merge: true }
+          )
+        ).rejects.toMatchObject({ code: "permission-denied" });
+        // Scope staff (org-A manager) can read org-A members' attributes, but not another scope's
+        expect(
+          (
+            await clientGetDoc(
+              clientDoc(mgrClient.db, "workspaces", "org-A", "members", "u-member", "private", "attributes")
+            )
+          ).data()
+        ).toMatchObject({ badge: "starter" });
+        await expect(
+          clientGetDoc(clientDoc(mgrClient.db, "workspaces", "org-B", "members", "u-other", "private", "attributes"))
+        ).rejects.toMatchObject({ code: "permission-denied" });
+
         // Positive Verification:
         // - Non-admin user with global `manager` role on `users/u-mgr` CAN read another user's profile (`users/u-member`) via `hasUserCapability(['manager', 'owner'])`!
         await adminDb
@@ -1464,6 +1544,10 @@ service cloud.firestore {
         const mgrReadOtherUser = await clientGetDoc(clientDoc(mgrClient.db, "users", "u-member"));
         expect(mgrReadOtherUser.exists()).toBe(true);
         expect(mgrReadOtherUser.data()?.firstName).toBe("Memby");
+        // ...and, as global staff, that user's attributes tier
+        expect(
+          (await clientGetDoc(clientDoc(mgrClient.db, "users", "u-member", "private", "attributes"))).data()
+        ).toMatchObject({ badge: "global-badge" });
 
         // - Manager of `org-A` CAN read/write `org-A` member `private/hiddenAttributes`, and System Admin CAN read/write global `private/hiddenAttributes`
         const orgAHiddenSnap = await clientGetDoc(

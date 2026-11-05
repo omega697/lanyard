@@ -551,6 +551,82 @@ describe("lanyard/core unit tests", () => {
       unsubs.forEach((unsub) => unsub());
     });
 
+    it("routes attributes to the card or the attributes tier by the policy's cardFields", async () => {
+      type Attrs = { badges: string[]; points: number; tier: string };
+      const policy = createPermissionPolicy<TestRole, TestCapability>({ cardFields: { attributes: ["badges"] } });
+      const store = new InMemoryLanyardStore<TestRole, TestCapability, Record<string, any>, Attrs>({ policy });
+      expect(store.cardFields).toBe(policy.cardFields);
+      expect(new InMemoryLanyardStore().cardFields).toEqual({ email: false, attributes: [] });
+
+      await store.upsertUser({ uid: "u-1", email: "u1@example.com", attributes: { badges: ["a"], points: 1 } });
+      await store.upsertScopeMember("ws-1", {
+        uid: "u-1",
+        email: "u1@example.com",
+        roles: ["member"],
+        attributes: { badges: ["b"], points: 2, tier: "gold" }
+      });
+
+      // Cards carry only card-placed keys; ordinary keys like `tier` are allowed in the attributes tier
+      const userEvents: any[] = [];
+      const rosterEvents: any[][] = [];
+      const globalAttrEvents: Partial<Attrs>[] = [];
+      const scopeAttrEvents: Partial<Attrs>[] = [];
+      const unsubs = [
+        store.subscribeToUser("u-1", (u) => userEvents.push(u)),
+        store.subscribeToScopeMembers("ws-1", (m) => rosterEvents.push(m)),
+        store.subscribeToAttributes("u-1", (a) => globalAttrEvents.push(a)),
+        store.subscribeToScopeAttributes("ws-1", "u-1", (a) => scopeAttrEvents.push(a))
+      ];
+      expect(userEvents.at(-1)?.attributes).toEqual({ badges: ["a"] });
+      expect(rosterEvents.at(-1)?.[0].attributes).toEqual({ badges: ["b"] });
+      expect(globalAttrEvents.at(-1)).toEqual({ points: 1 });
+      expect(scopeAttrEvents.at(-1)).toEqual({ points: 2, tier: "gold" });
+
+      // Server reads merge both locations back into one shape
+      expect((await store.getUser("u-1"))?.attributes).toEqual({ badges: ["a"], points: 1 });
+      expect((await store.getScopeMember("ws-1", "u-1"))?.attributes).toEqual({
+        badges: ["b"],
+        points: 2,
+        tier: "gold"
+      });
+
+      // Updates are routed per key: a tier-only update doesn't touch the card, and vice versa
+      const userEventCount = userEvents.length;
+      expect(await store.updateUserAttributes("u-1", { points: 5 })).toMatchObject({
+        attributes: { badges: ["a"], points: 5 }
+      });
+      expect(globalAttrEvents.at(-1)).toEqual({ points: 5 });
+      await store.updateUserAttributes("u-1", { badges: ["a", "c"] });
+      expect(userEvents.at(-1)?.attributes).toEqual({ badges: ["a", "c"] });
+      expect(globalAttrEvents.at(-1)).toEqual({ points: 5 });
+      expect(userEvents.length).toBeGreaterThan(userEventCount);
+      const scopeAttrEventCount = scopeAttrEvents.length;
+      await store.updateScopeMemberAttributes("ws-1", "u-1", { badges: ["b", "d"] });
+      expect(scopeAttrEvents).toHaveLength(scopeAttrEventCount);
+      expect(rosterEvents.at(-1)?.[0].attributes).toEqual({ badges: ["b", "d"] });
+
+      // Card-only updates (presence, roles) don't re-emit the private tiers
+      const globalAttrEventCount = globalAttrEvents.length;
+      await store.recordPresenceHeartbeat({ uid: "u-1", scopeId: "ws-1", lastSeenIso: "2026-01-01T00:00:00.000Z" });
+      await store.grantScopeRoles("ws-1", "u-1", ["manager"]);
+      expect(scopeAttrEvents).toHaveLength(scopeAttrEventCount);
+      expect(globalAttrEvents).toHaveLength(globalAttrEventCount);
+
+      // `_lanyard` is rejected as an attribute key, even when the patch also has card-placed keys
+      await expect(store.updateUserAttributes("u-1", { badges: ["x"], _lanyard: {} } as any)).rejects.toThrow(
+        "Invalid attributes key '_lanyard'"
+      );
+      expect((await store.getUser("u-1"))?.attributes).toEqual({ badges: ["a", "c"], points: 5 });
+
+      // Deleting removes both locations
+      await store.deleteScopeMember("ws-1", "u-1");
+      expect(scopeAttrEvents.at(-1)).toEqual({});
+      await store.deleteUser("u-1");
+      expect(globalAttrEvents.at(-1)).toEqual({});
+
+      unsubs.forEach((unsub) => unsub());
+    });
+
     it("enforces no-op write guards on syncAvatar when photoUrl already matches or scoped member does not exist", async () => {
       const store = new InMemoryLanyardStore<TestRole, TestCapability>();
       await store.upsertScopeMember("ws-1", {

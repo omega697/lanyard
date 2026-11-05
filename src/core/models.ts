@@ -133,6 +133,18 @@ export interface CardFieldsConfig {
   attributes?: readonly string[];
 }
 
+/** Normalized card field placement (see `CardFieldsConfig`). */
+export type CardFieldsPlacement = Readonly<{ email: boolean; attributes: readonly string[] }>;
+
+/**
+ * Storage placement a Lanyard store needs to route fields to the right document. Pass your
+ * `PermissionPolicy` (which satisfies this interface) so the store and the policy agree;
+ * `createLanyardServer`/`createLanyardClient` throw if they don't.
+ */
+export interface LanyardStorePlacementSource {
+  readonly cardFields: CardFieldsPlacement;
+}
+
 /**
  * Access rule for one side (read or write) of an app-defined custom document (`…/{uid}/{name}/data`).
  * Access is granted if any listed condition matches; system admins always have access.
@@ -272,7 +284,7 @@ export interface PermissionPolicy<TRole extends string = string, TCapability ext
   /** Normalized scoped card visibility rule (defaults to `"members"`). */
   readonly cardVisibility: CardVisibilityRule<TCapability>;
   /** Normalized card field placement (`email` defaults to `false`, `attributes` to `[]`). */
-  readonly cardFields: Readonly<{ email: boolean; attributes: readonly string[] }>;
+  readonly cardFields: CardFieldsPlacement;
   /** Normalized app-defined custom private documents. */
   readonly customDocs: Readonly<Record<string, Readonly<CustomDocDefinition<TCapability>>>>;
 
@@ -710,10 +722,25 @@ export interface LanyardClientStore<
     uid: string,
     onChange: (prefs: Partial<TPreferences>) => void
   ): () => void;
+  /**
+   * Optional: Subscribe to a user's global `attributes` tier (`users/{uid}/private/attributes`), readable by the
+   * user, staff, and system admins. Emits only the keys stored there; keys placed on the card via
+   * `cardFields.attributes` arrive with the card. Returns an unsubscribe function.
+   */
+  subscribeToAttributes?(uid: string, onChange: (attrs: Partial<TAttributes>) => void): () => void;
+  /** Optional: Like `subscribeToAttributes`, for a member's `attributes` tier within `scopeId`. */
+  subscribeToScopeAttributes?(
+    scopeId: string,
+    uid: string,
+    onChange: (attrs: Partial<TAttributes>) => void
+  ): () => void;
+  /** Optional: The card field placement this store routes reads by; must match the client's policy. */
+  readonly cardFields?: CardFieldsPlacement;
 
   /**
-   * Optional: Subscribe to the global `UserRecord` card (`users/{uid}`) including `attributes` and `roles`.
-   * Preferences are NOT included; subscribe to them with `subscribeToPreferences`.
+   * Optional: Subscribe to the global `UserRecord` card (`users/{uid}`) including `roles` and any card-placed
+   * `attributes`. Preferences and private attributes are NOT included; subscribe to them with
+   * `subscribeToPreferences` and `subscribeToAttributes`.
    */
   subscribeToUser?(
     uid: string,
@@ -777,6 +804,9 @@ export interface LanyardServerStore<
   THiddenAttributes extends Record<string, any> = Record<string, any>,
   TSecrets extends Record<string, any> = Record<string, any>
 > {
+  /** Optional: The card field placement this store routes writes by; must match the server's policy. */
+  readonly cardFields?: CardFieldsPlacement;
+
   // --- Global User (`users/{uid}`) & System Admin Operations ---
   getUser?(uid: string): Promise<UserRecord<TRole, TCapability, TPreferences, TAttributes> | null>;
   listUsers?(): Promise<UserRecord<TRole, TCapability, TPreferences, TAttributes>[]>;

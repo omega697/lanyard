@@ -39,6 +39,7 @@ import {
   type UserRecord,
   type VerifiedEmailChangeEvent
 } from "../core/index.js";
+import { assertStoreMatchesPolicyPlacement, resolveCardFields } from "../core/tierDocs.js";
 
 export {
   GLOBAL_SCOPE,
@@ -180,6 +181,7 @@ export function createLanyardClient<
     storageKeyPrefix = "lanyard",
     onVerifiedEmailChange
   } = config;
+  assertStoreMatchesPolicyPlacement(store, resolveCardFields(policy));
 
   const prefStorageKey = `${storageKeyPrefix}_user_preferences`;
   const emailForSignInKey = `${storageKeyPrefix}_emailForSignIn`;
@@ -225,45 +227,73 @@ export function createLanyardClient<
 
   let unsubUser: (() => void) | null = null;
   let unsubPrefs: (() => void) | null = null;
+  let unsubAttributes: (() => void) | null = null;
   let unsubMemberships: (() => void) | null = null;
   let unsubAuth: (() => void) | null = null;
   let authGeneration = 0;
 
-  // Scoped preferences live in their own self-only tier documents, so they're tracked per scope and
+  // The user's own attributes are split between card-placed keys (on the card) and the `attributes` tier
+  // document; `attributesStore` publishes their merge.
+  let cardAttributes: Partial<TAttributes> = {};
+  let tierAttributes: Partial<TAttributes> = {};
+
+  function publishAttributes(): void {
+    attributesStoreInternal.set(sanitizePreferencesObject<TAttributes>({ ...cardAttributes, ...tierAttributes }));
+  }
+
+  // Scoped preferences and attributes live in their own tier documents, so they're tracked per scope and
   // merged onto the membership objects published by `membershipsStore`.
   let latestMemberships: ScopedMember<TRole, TCapability, TPreferences, TAttributes>[] = [];
   const scopePreferences = new Map<string, Partial<TPreferences>>();
-  const scopePreferenceUnsubs = new Map<string, () => void>();
+  const scopeAttributes = new Map<string, Partial<TAttributes>>();
+  const scopeTierUnsubs = new Map<string, Array<() => void>>();
 
   function publishMemberships(isLoading: boolean): void {
     membershipsStoreInternal.set({
       memberships: latestMemberships.map((m) => {
-        const prefs = m.scopeId ? scopePreferences.get(m.scopeId) : undefined;
-        return prefs ? { ...m, preferences: { ...prefs } } : m;
+        if (!m.scopeId) return m;
+        const prefs = scopePreferences.get(m.scopeId);
+        const attrs = scopeAttributes.get(m.scopeId);
+        return {
+          ...m,
+          ...(prefs ? { preferences: { ...prefs } } : {}),
+          ...(attrs ? { attributes: { ...(m.attributes || {}), ...attrs } } : {})
+        };
       }),
       isLoading
     });
   }
 
-  /** Opens a preferences listener for each new membership scope and closes listeners for scopes the user left. */
-  function syncScopePreferenceSubscriptions(uid: string): void {
+  /** Opens tier listeners for each new membership scope and closes listeners for scopes the user left. */
+  function syncScopeTierSubscriptions(uid: string): void {
     const activeScopeIds = new Set(latestMemberships.map((m) => m.scopeId).filter((id): id is string => Boolean(id)));
-    for (const [scopeId, unsub] of scopePreferenceUnsubs) {
+    for (const [scopeId, unsubs] of scopeTierUnsubs) {
       if (activeScopeIds.has(scopeId)) continue;
-      unsub();
-      scopePreferenceUnsubs.delete(scopeId);
+      unsubs.forEach((unsub) => unsub());
+      scopeTierUnsubs.delete(scopeId);
       scopePreferences.delete(scopeId);
+      scopeAttributes.delete(scopeId);
     }
-    if (typeof store.subscribeToScopePreferences !== "function") return;
     for (const scopeId of activeScopeIds) {
-      if (scopePreferenceUnsubs.has(scopeId)) continue;
-      scopePreferenceUnsubs.set(
-        scopeId,
-        store.subscribeToScopePreferences(scopeId, uid, (prefs) => {
-          scopePreferences.set(scopeId, sanitizePreferencesObject<TPreferences>(prefs));
-          publishMemberships(membershipsStoreInternal.get().isLoading);
-        })
-      );
+      if (scopeTierUnsubs.has(scopeId)) continue;
+      const unsubs: Array<() => void> = [];
+      scopeTierUnsubs.set(scopeId, unsubs);
+      if (typeof store.subscribeToScopePreferences === "function") {
+        unsubs.push(
+          store.subscribeToScopePreferences(scopeId, uid, (prefs) => {
+            scopePreferences.set(scopeId, sanitizePreferencesObject<TPreferences>(prefs));
+            publishMemberships(membershipsStoreInternal.get().isLoading);
+          })
+        );
+      }
+      if (typeof store.subscribeToScopeAttributes === "function") {
+        unsubs.push(
+          store.subscribeToScopeAttributes(scopeId, uid, (attrs) => {
+            scopeAttributes.set(scopeId, sanitizePreferencesObject<TAttributes>(attrs));
+            publishMemberships(membershipsStoreInternal.get().isLoading);
+          })
+        );
+      }
     }
   }
 
@@ -276,14 +306,21 @@ export function createLanyardClient<
       unsubPrefs();
       unsubPrefs = null;
     }
+    if (unsubAttributes) {
+      unsubAttributes();
+      unsubAttributes = null;
+    }
     if (unsubMemberships) {
       unsubMemberships();
       unsubMemberships = null;
     }
-    scopePreferenceUnsubs.forEach((unsub) => unsub());
-    scopePreferenceUnsubs.clear();
+    scopeTierUnsubs.forEach((unsubs) => unsubs.forEach((unsub) => unsub()));
+    scopeTierUnsubs.clear();
     scopePreferences.clear();
+    scopeAttributes.clear();
     latestMemberships = [];
+    cardAttributes = {};
+    tierAttributes = {};
   }
 
   function applyRemotePreferences(remotePrefs: Partial<TPreferences> | undefined): void {
@@ -343,7 +380,8 @@ export function createLanyardClient<
       unsubUser = store.subscribeToUser(user.uid, (record) => {
         userRecordStoreInternal.set(record);
         if (record) {
-          attributesStoreInternal.set(sanitizePreferencesObject<TAttributes>(record.attributes || {}));
+          cardAttributes = record.attributes || {};
+          publishAttributes();
 
           // If a provisioned global user record exists with a stale/missing photoUrl, sync it once
           const isProvisionedProfile = Boolean(
@@ -425,7 +463,8 @@ export function createLanyardClient<
             }
           }
         } else {
-          attributesStoreInternal.set({});
+          cardAttributes = {};
+          publishAttributes();
         }
       });
     }
@@ -433,6 +472,13 @@ export function createLanyardClient<
     unsubPrefs = store.subscribeToPreferences(user.uid, (remotePrefs) => {
       applyRemotePreferences(remotePrefs);
     });
+
+    if (typeof store.subscribeToAttributes === "function") {
+      unsubAttributes = store.subscribeToAttributes(user.uid, (attrs) => {
+        tierAttributes = attrs;
+        publishAttributes();
+      });
+    }
 
     unsubMemberships = store.subscribeToUserMemberships(user.uid, (members) => {
       // Smart Avatar Sync: when a pre-provisioned member doc loads with a stale/missing photoUrl,
@@ -460,7 +506,7 @@ export function createLanyardClient<
       });
 
       latestMemberships = normalizedMembers;
-      syncScopePreferenceSubscriptions(user.uid);
+      syncScopeTierSubscriptions(user.uid);
       publishMemberships(false);
     });
   }

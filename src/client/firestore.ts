@@ -13,13 +13,15 @@ import {
 import {
   assertValidResourceId,
   sanitizeAvatarUrl,
+  type CardFieldsPlacement,
   type LanyardClientStore,
+  type LanyardStorePlacementSource,
   type ScopedMember,
   type SubscribeToUsersOptions,
   type UserProfilePatch,
   type UserRecord
 } from "../core/index.js";
-import { assertNoReservedTierKeys, readTierDocValues, tierDocMetadata } from "../core/tierDocs.js";
+import { assertNoReservedTierKeys, readTierDocValues, resolveCardFields, tierDocMetadata } from "../core/tierDocs.js";
 
 const FORBIDDEN_KEYS = new Set(["__proto__", "constructor", "prototype"]);
 
@@ -52,7 +54,15 @@ export interface FirestoreClientStoreConfig<TRole extends string = string> {
   usersCollection?: string;
   scopeCollection?: string;
   membersSubcollection?: string;
+  /**
+   * The app's `PermissionPolicy`, describing which fields (`cardFields`) live on the card rather than in their
+   * private tier. Omit only if the policy doesn't set `cardFields`; `createLanyardClient` throws if they disagree.
+   */
+  policy?: LanyardStorePlacementSource;
 }
+
+/** Private tier documents the client store reads directly. */
+type ClientTier = "preferences" | "attributes";
 
 interface MultiplexedUserWatcher<
   TRole extends string,
@@ -69,12 +79,13 @@ interface MultiplexedUserWatcher<
  * Firestore implementation of `LanyardClientStore`.
  *
  * Uses a single canonical `users/{uid}` card for profile, presence, `isSystemAdmin`,
- * single-tenant `roles`, and `attributes`, and multiplexes `onSnapshot` listeners per UID so
- * repeated `subscribeToUser` calls only ever open **1 Firestore document listener**.
+ * single-tenant `roles`, and card-placed `attributes` (`cardFields.attributes`), and multiplexes
+ * `onSnapshot` listeners per UID so repeated `subscribeToUser` calls only ever open
+ * **1 Firestore document listener**.
  *
- * Preferences live in the self-only `preferences` tier document, `users/{uid}/private/preferences`
- * (or `{scope}/{scopeId}/members/{uid}/private/preferences` for scoped preferences), so other
- * readers of the card never see them.
+ * Preferences live in the self-only `users/{uid}/private/preferences` document and other attributes in the
+ * self + staff `users/{uid}/private/attributes` document (or the same paths under
+ * `{scope}/{scopeId}/members/{uid}` when scoped), so other readers of the card never see them.
  */
 export class FirestoreClientStore<
   TRole extends string = string,
@@ -87,6 +98,7 @@ export class FirestoreClientStore<
   private readonly usersCollection: string;
   private readonly scopeCollection: string;
   private readonly membersSubcollection: string;
+  readonly cardFields: CardFieldsPlacement;
 
   private readonly userWatchers = new Map<
     string,
@@ -102,6 +114,7 @@ export class FirestoreClientStore<
       config.membersSubcollection || "members",
       "membersSubcollection"
     );
+    this.cardFields = resolveCardFields(config.policy);
   }
 
   private extractRoles(data: Record<string, any>): TRole[] {
@@ -226,36 +239,25 @@ export class FirestoreClientStore<
     );
   }
 
-  private userPreferencesDocRef(uid: string) {
+  /** `users/{uid}/private/{tier}` (global, `scopeId === null`) or `{scope}/{scopeId}/members/{uid}/private/{tier}`. */
+  private tierDocRef(tier: ClientTier, uid: string, scopeId: string | null) {
     const cleanUid = assertValidFirestoreDocId(uid, "uid");
-    return doc(this.db, this.usersCollection, cleanUid, "private", "preferences");
-  }
-
-  private memberPreferencesDocRef(scopeId: string, uid: string) {
+    if (scopeId === null) return doc(this.db, this.usersCollection, cleanUid, "private", tier);
     const cleanScopeId = assertValidFirestoreDocId(scopeId, "scopeId");
-    const cleanUid = assertValidFirestoreDocId(uid, "uid");
-    return doc(
-      this.db,
-      this.scopeCollection,
-      cleanScopeId,
-      this.membersSubcollection,
-      cleanUid,
-      "private",
-      "preferences"
-    );
+    return doc(this.db, this.scopeCollection, cleanScopeId, this.membersSubcollection, cleanUid, "private", tier);
   }
 
   /**
-   * Listens to a private preferences document, emitting `{}` when it doesn't exist. Permission or offline
-   * errors are ignored so cached preferences stay in place.
+   * Listens to a private tier document, emitting `{}` when it doesn't exist. Permission or offline
+   * errors are ignored so cached values stay in place.
    */
-  private subscribeToPreferencesDoc(
+  private subscribeToTierDoc<T extends Record<string, any>>(
     ref: DocumentReference,
-    onChange: (prefs: Partial<TPreferences>) => void
+    onChange: (values: Partial<T>) => void
   ): () => void {
     return onSnapshot(
       ref,
-      (snap) => onChange(snap.exists() ? readTierDocValues<TPreferences>(snap.data()) : {}),
+      (snap) => onChange(snap.exists() ? readTierDocValues<T>(snap.data()) : {}),
       () => {}
     );
   }
@@ -273,7 +275,7 @@ export class FirestoreClientStore<
   }
 
   subscribeToPreferences(uid: string, onChange: (prefs: Partial<TPreferences>) => void): () => void {
-    return this.subscribeToPreferencesDoc(this.userPreferencesDocRef(uid), onChange);
+    return this.subscribeToTierDoc(this.tierDocRef("preferences", uid, null), onChange);
   }
 
   subscribeToScopePreferences(
@@ -281,19 +283,36 @@ export class FirestoreClientStore<
     uid: string,
     onChange: (prefs: Partial<TPreferences>) => void
   ): () => void {
-    return this.subscribeToPreferencesDoc(this.memberPreferencesDocRef(scopeId, uid), onChange);
+    return this.subscribeToTierDoc(this.tierDocRef("preferences", uid, scopeId), onChange);
+  }
+
+  subscribeToAttributes(uid: string, onChange: (attrs: Partial<TAttributes>) => void): () => void {
+    return this.subscribeToTierDoc(this.tierDocRef("attributes", uid, null), onChange);
+  }
+
+  subscribeToScopeAttributes(
+    scopeId: string,
+    uid: string,
+    onChange: (attrs: Partial<TAttributes>) => void
+  ): () => void {
+    return this.subscribeToTierDoc(this.tierDocRef("attributes", uid, scopeId), onChange);
   }
 
   async savePreferences(uid: string, patch: Partial<TPreferences>): Promise<void> {
     const cleanUid = assertValidFirestoreDocId(uid, "uid");
-    await this.writePreferencesDoc(this.userPreferencesDocRef(cleanUid), cleanUid, null, patch);
+    await this.writePreferencesDoc(this.tierDocRef("preferences", cleanUid, null), cleanUid, null, patch);
   }
 
   async saveScopePreferences(scopeId: string, uid: string, patch: Partial<TPreferences>): Promise<void> {
     const cleanScopeId = assertValidFirestoreDocId(scopeId, "scopeId");
     const cleanUid = assertValidFirestoreDocId(uid, "uid");
     if (Object.keys(sanitizeObjectPatch<TPreferences>(patch)).length === 0) return;
-    await this.writePreferencesDoc(this.memberPreferencesDocRef(cleanScopeId, cleanUid), cleanUid, cleanScopeId, patch);
+    await this.writePreferencesDoc(
+      this.tierDocRef("preferences", cleanUid, cleanScopeId),
+      cleanUid,
+      cleanScopeId,
+      patch
+    );
   }
 
   async updateUserProfile(uid: string, patch: UserProfilePatch): Promise<void> {

@@ -17,6 +17,7 @@ import {
   type UserRecord,
   type VerifiedEmailChangeEvent
 } from "../core/index.js";
+import { assertStoreMatchesPolicyPlacement } from "../core/tierDocs.js";
 
 export { GLOBAL_SCOPE, type GlobalScope, type LanyardActor, type ScopeId, type VerifiedEmailChangeEvent };
 export * from "./encryption.js";
@@ -171,6 +172,7 @@ export function createLanyardServer<
     defaultScopeParam = "scopeId",
     onVerifiedEmailChange
   } = config;
+  assertStoreMatchesPolicyPlacement(store, policy.cardFields);
 
   // Tracks in-flight verified email change syncs per (uid -> targetEmail) so concurrent requests don't double-fire
   const inFlightEmailSyncs = new Map<string, Promise<void>>();

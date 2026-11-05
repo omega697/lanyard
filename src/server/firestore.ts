@@ -2,13 +2,21 @@ import { FieldValue, type Firestore } from "firebase-admin/firestore";
 import {
   assertValidResourceId,
   sanitizeAvatarUrl,
+  type CardFieldsPlacement,
   type LanyardServerStore,
+  type LanyardStorePlacementSource,
   type ScopedMember,
   type SecretCipher,
   type SystemAdminProfile,
   type UserRecord
 } from "../core/index.js";
-import { assertNoReservedTierKeys, readTierDocValues, tierDocMetadata } from "../core/tierDocs.js";
+import {
+  assertNoReservedTierKeys,
+  readTierDocValues,
+  resolveCardFields,
+  splitAttributesByPlacement,
+  tierDocMetadata
+} from "../core/tierDocs.js";
 import { createSecretCipher, isEncryptedSecretData } from "./encryption.js";
 
 const FORBIDDEN_KEYS = new Set(["__proto__", "constructor", "prototype"]);
@@ -59,15 +67,25 @@ export interface FirestoreServerStoreConfig<TRole extends string = string> {
   encryptionKey?: string;
   /** Optional custom `SecretCipher` instance (overrides `encryptionKey`). */
   cipher?: SecretCipher;
+  /**
+   * The app's `PermissionPolicy`, used to place fields (`cardFields`) on the card or in their private tier.
+   * Omit only if the policy doesn't set `cardFields`; `createLanyardServer` throws if they disagree.
+   */
+  policy?: LanyardStorePlacementSource;
 }
+
+/** Private tier documents whose values are merged into user/member records. */
+type MergedTier = "preferences" | "attributes";
 
 /**
  * Firebase Admin Firestore implementation of `LanyardServerStore`.
  *
  * Uses a single canonical `users/{uid}` card document for profile, presence, `isSystemAdmin`,
- * single-tenant `roles`, and `attributes`, plus private tier documents in the `private` subcollection:
- * self-only `private/preferences`, `private/hiddenAttributes`, and AES-256-GCM encrypted `private/secrets`.
+ * single-tenant `roles`, and card-placed `attributes` (`cardFields.attributes`), plus private tier documents
+ * in the `private` subcollection: self-only `private/preferences`, self + staff `private/attributes`,
+ * `private/hiddenAttributes`, and AES-256-GCM encrypted `private/secrets`.
  * Scoped members (`{scopeCollection}/{scopeId}/{membersSubcollection}/{uid}`) use the same layout.
+ * Reads merge the tiers back together, so records keep the same shape regardless of placement.
  */
 export class FirestoreServerStore<
   TRole extends string = string,
@@ -83,6 +101,7 @@ export class FirestoreServerStore<
   private readonly scopeCollection: string;
   private readonly membersSubcollection: string;
   private readonly cipher?: SecretCipher;
+  readonly cardFields: CardFieldsPlacement;
 
   constructor(config: FirestoreServerStoreConfig<TRole>) {
     this.db = config.db;
@@ -95,6 +114,7 @@ export class FirestoreServerStore<
     );
     const key = config.encryptionKey || process.env.MASTER_ENCRYPTION_KEY;
     this.cipher = config.cipher ?? (key ? createSecretCipher(key) : undefined);
+    this.cardFields = resolveCardFields(config.policy);
   }
 
   private requireCipher(): SecretCipher {
@@ -124,34 +144,74 @@ export class FirestoreServerStore<
     return this.db.doc(`${this.usersCollection}/${cleanUid}/private/hiddenAttributes`);
   }
 
-  private userPreferencesDocRef(uid: string) {
+  /** `users/{uid}/private/{tier}` (global, `scopeId === null`) or `{scope}/{scopeId}/members/{uid}/private/{tier}`. */
+  private tierDocRef(tier: MergedTier, uid: string, scopeId: string | null) {
     const cleanUid = assertValidFirestoreDocId(uid, "uid");
-    return this.db.doc(`${this.usersCollection}/${cleanUid}/private/preferences`);
-  }
-
-  private memberPreferencesDocRef(scopeId: string, uid: string) {
+    if (scopeId === null) return this.db.doc(`${this.usersCollection}/${cleanUid}/private/${tier}`);
     const cleanScopeId = assertValidFirestoreDocId(scopeId, "scopeId");
-    const cleanUid = assertValidFirestoreDocId(uid, "uid");
     return this.db.doc(
-      `${this.scopeCollection}/${cleanScopeId}/${this.membersSubcollection}/${cleanUid}/private/preferences`
+      `${this.scopeCollection}/${cleanScopeId}/${this.membersSubcollection}/${cleanUid}/private/${tier}`
     );
   }
 
-  /** Merges a preferences patch into a private preferences document, stamping tier metadata. */
-  private async writePreferencesDoc(
-    ref: FirebaseFirestore.DocumentReference,
+  /** Merges `values` into a private tier document, stamping tier metadata. */
+  private async writeTierDoc(
+    tier: MergedTier,
     uid: string,
     scopeId: string | null,
-    preferences: Partial<TPreferences>
+    values: Record<string, any>
   ): Promise<void> {
-    const cleanPrefs = sanitizeObjectPatch<TPreferences>(preferences);
-    assertNoReservedTierKeys(cleanPrefs, "preferences");
-    await ref.set({ ...cleanPrefs, ...tierDocMetadata("preferences", uid, scopeId) }, { merge: true });
+    await this.tierDocRef(tier, uid, scopeId).set(
+      { ...values, ...tierDocMetadata(tier, uid, scopeId) },
+      { merge: true }
+    );
   }
 
-  private async readPreferencesDoc(ref: FirebaseFirestore.DocumentReference): Promise<Partial<TPreferences> | null> {
-    const snap = await ref.get();
-    return snap.exists ? readTierDocValues<TPreferences>(snap.data()) : null;
+  /** Sanitizes and validates a patch for a tier document (throws on reserved metadata keys). */
+  private cleanTierPatch<T extends Record<string, any>>(patch: Partial<T>, tier: MergedTier): Partial<T> {
+    const clean = sanitizeObjectPatch<T>(patch);
+    assertNoReservedTierKeys(clean, tier);
+    return clean;
+  }
+
+  /**
+   * Splits `attributes` into card-placed keys and `attributes`-tier keys, writing the tier keys to their
+   * private document. Returns the card-placed keys for the caller to store on the card.
+   */
+  private async writeAttributesTier(
+    uid: string,
+    scopeId: string | null,
+    attributes: Partial<TAttributes>
+  ): Promise<Partial<TAttributes>> {
+    const { card, tier } = splitAttributesByPlacement(this.cleanTierPatch(attributes, "attributes"), this.cardFields);
+    if (Object.keys(tier).length > 0) await this.writeTierDoc("attributes", uid, scopeId, tier);
+    return card;
+  }
+
+  /** Reads the private tiers of a user/member and merges them into its parsed card. */
+  private async mergePrivateTiers<R extends { attributes?: Partial<TAttributes>; preferences?: Partial<TPreferences> }>(
+    card: R,
+    uid: string,
+    scopeId: string | null
+  ): Promise<R> {
+    const [prefsSnap, attrsSnap] = await Promise.all([
+      this.tierDocRef("preferences", uid, scopeId).get(),
+      this.tierDocRef("attributes", uid, scopeId).get()
+    ]);
+    const merged = { ...card };
+    if (prefsSnap.exists) merged.preferences = readTierDocValues<TPreferences>(prefsSnap.data());
+    if (attrsSnap.exists) {
+      merged.attributes = { ...(card.attributes || {}), ...readTierDocValues<TAttributes>(attrsSnap.data()) };
+    }
+    return merged;
+  }
+
+  /** Deletes the private tier documents merged into user/member records. */
+  private async deleteMergedTiers(uid: string, scopeId: string | null): Promise<void> {
+    await Promise.all([
+      this.tierDocRef("preferences", uid, scopeId).delete(),
+      this.tierDocRef("attributes", uid, scopeId).delete()
+    ]);
   }
 
   private userSecretsDocRef(uid: string) {
@@ -253,29 +313,17 @@ export class FirestoreServerStore<
     };
   }
 
-  /** Reads `users/{uid}` and merges its self-only `private/preferences` tier into the returned record. */
+  /** Reads `users/{uid}` and merges its `private/preferences` and `private/attributes` tiers into the record. */
   async getUser(uid: string): Promise<UserRecord<TRole, TCapability, TPreferences, TAttributes> | null> {
-    const [snap, preferences] = await Promise.all([
-      this.userDocRef(uid).get(),
-      this.readPreferencesDoc(this.userPreferencesDocRef(uid))
-    ]);
+    const snap = await this.userDocRef(uid).get();
     if (!snap.exists) return null;
-    return {
-      ...this.parseUserRecord(snap.id, snap.data() || {}),
-      ...(preferences ? { preferences } : {})
-    };
+    return this.mergePrivateTiers(this.parseUserRecord(snap.id, snap.data() || {}), snap.id, null);
   }
 
   async listUsers(): Promise<UserRecord<TRole, TCapability, TPreferences, TAttributes>[]> {
     const snap = await this.db.collection(this.usersCollection).get();
     return Promise.all(
-      snap.docs.map(async (doc) => {
-        const preferences = await this.readPreferencesDoc(this.userPreferencesDocRef(doc.id));
-        return {
-          ...this.parseUserRecord(doc.id, doc.data() || {}),
-          ...(preferences ? { preferences } : {})
-        };
-      })
+      snap.docs.map((doc) => this.mergePrivateTiers(this.parseUserRecord(doc.id, doc.data() || {}), doc.id, null))
     );
   }
 
@@ -284,7 +332,7 @@ export class FirestoreServerStore<
     const userRef = this.userDocRef(cleanUid);
     await Promise.all([
       userRef.delete(),
-      this.userPreferencesDocRef(cleanUid).delete(),
+      this.deleteMergedTiers(cleanUid, null),
       this.userHiddenAttributesDocRef(cleanUid).delete(),
       this.userSecretsDocRef(cleanUid).delete()
     ]);
@@ -294,21 +342,24 @@ export class FirestoreServerStore<
   }
 
   /**
-   * Upserts the `users/{uid}` card. If `user.preferences` is provided it is merged into the separate
-   * self-only `private/preferences` tier document (never stored on the card).
+   * Upserts the `users/{uid}` card. `user.preferences` are merged into the self-only `private/preferences`
+   * tier and `user.attributes` into the `private/attributes` tier (except keys placed on the card via
+   * `cardFields.attributes`); neither tier is ever stored on the card.
    */
   async upsertUser(user: UserRecord<TRole, TCapability, TPreferences, TAttributes>): Promise<void> {
     const cleanUid = assertValidFirestoreDocId(user.uid, "uid");
-    const { preferences, ...card } = user;
-    if (preferences !== undefined) {
-      await this.writePreferencesDoc(this.userPreferencesDocRef(cleanUid), cleanUid, null, preferences);
-    }
+    const { preferences, attributes, ...card } = user;
+    // Validate both tier patches before writing anything
+    const cleanPrefs = preferences !== undefined ? this.cleanTierPatch(preferences, "preferences") : undefined;
+    if (attributes !== undefined) this.cleanTierPatch(attributes, "attributes");
+    if (cleanPrefs !== undefined) await this.writeTierDoc("preferences", cleanUid, null, cleanPrefs);
+    const cardAttributes = attributes !== undefined ? await this.writeAttributesTier(cleanUid, null, attributes) : {};
     const payload = stripUndefinedFields({
       ...card,
       uid: cleanUid,
       ...(card.photoUrl !== undefined ? { photoUrl: sanitizeAvatarUrl(card.photoUrl) } : {}),
       ...(card.roles !== undefined ? { roles: Array.from(new Set(card.roles)) } : {}),
-      ...(card.attributes !== undefined ? { attributes: sanitizeObjectPatch<TAttributes>(card.attributes) } : {})
+      ...(Object.keys(cardAttributes).length > 0 ? { attributes: cardAttributes } : {})
     });
     await this.userDocRef(cleanUid).set(payload, { merge: true });
   }
@@ -318,13 +369,12 @@ export class FirestoreServerStore<
     patch: Partial<TAttributes>
   ): Promise<UserRecord<TRole, TCapability, TPreferences, TAttributes>> {
     const cleanUid = assertValidFirestoreDocId(uid, "uid");
-    const ref = this.userDocRef(cleanUid);
-    const now = new Date().toISOString();
-    await ref.set(
+    const cardAttributes = await this.writeAttributesTier(cleanUid, null, patch);
+    await this.userDocRef(cleanUid).set(
       {
         uid: cleanUid,
-        attributes: sanitizeObjectPatch<TAttributes>(patch),
-        updatedAt: now
+        ...(Object.keys(cardAttributes).length > 0 ? { attributes: cardAttributes } : {}),
+        updatedAt: new Date().toISOString()
       },
       { merge: true }
     );
@@ -501,40 +551,35 @@ export class FirestoreServerStore<
     };
   }
 
-  /** Reads a scoped member card and merges its self-only `private/preferences` tier into the returned member. */
+  /** Reads a scoped member card and merges its `private/preferences` and `private/attributes` tiers into it. */
   async getScopeMember(
     scopeId: string,
     uid: string
   ): Promise<ScopedMember<TRole, TCapability, TPreferences, TAttributes> | null> {
     const cleanScopeId = assertValidFirestoreDocId(scopeId, "scopeId");
-    const [snap, preferences] = await Promise.all([
-      this.memberDocRef(cleanScopeId, uid).get(),
-      this.readPreferencesDoc(this.memberPreferencesDocRef(cleanScopeId, uid))
-    ]);
+    const snap = await this.memberDocRef(cleanScopeId, uid).get();
     if (!snap.exists) return null;
-    return {
-      ...this.parseScopedMember(snap.id, cleanScopeId, snap.data() || {}),
-      ...(preferences ? { preferences } : {})
-    };
+    return this.mergePrivateTiers(
+      this.parseScopedMember(snap.id, cleanScopeId, snap.data() || {}),
+      snap.id,
+      cleanScopeId
+    );
   }
 
   async listScopeMembers(scopeId: string): Promise<ScopedMember<TRole, TCapability, TPreferences, TAttributes>[]> {
     const cleanScopeId = assertValidFirestoreDocId(scopeId, "scopeId");
     const snap = await this.db.collection(`${this.scopeCollection}/${cleanScopeId}/${this.membersSubcollection}`).get();
     return Promise.all(
-      snap.docs.map(async (d) => {
-        const preferences = await this.readPreferencesDoc(this.memberPreferencesDocRef(cleanScopeId, d.id));
-        return {
-          ...this.parseScopedMember(d.id, cleanScopeId, d.data() || {}),
-          ...(preferences ? { preferences } : {})
-        };
-      })
+      snap.docs.map((d) =>
+        this.mergePrivateTiers(this.parseScopedMember(d.id, cleanScopeId, d.data() || {}), d.id, cleanScopeId)
+      )
     );
   }
 
   /**
-   * Upserts a scoped member card. If `member.preferences` is provided it is merged into the separate
-   * self-only `private/preferences` tier document (never stored on the card).
+   * Upserts a scoped member card. `member.preferences` are merged into the self-only `private/preferences`
+   * tier and `member.attributes` into the `private/attributes` tier (except keys placed on the card via
+   * `cardFields.attributes`); neither tier is ever stored on the card.
    */
   async upsertScopeMember(
     scopeId: string,
@@ -542,22 +587,20 @@ export class FirestoreServerStore<
   ): Promise<void> {
     const cleanScopeId = assertValidFirestoreDocId(scopeId, "scopeId");
     const cleanUid = assertValidFirestoreDocId(member.uid, "uid");
-    const { preferences, ...card } = member;
-    if (preferences !== undefined) {
-      await this.writePreferencesDoc(
-        this.memberPreferencesDocRef(cleanScopeId, cleanUid),
-        cleanUid,
-        cleanScopeId,
-        preferences
-      );
-    }
+    const { preferences, attributes, ...card } = member;
+    // Validate both tier patches before writing anything
+    const cleanPrefs = preferences !== undefined ? this.cleanTierPatch(preferences, "preferences") : undefined;
+    if (attributes !== undefined) this.cleanTierPatch(attributes, "attributes");
+    if (cleanPrefs !== undefined) await this.writeTierDoc("preferences", cleanUid, cleanScopeId, cleanPrefs);
+    const cardAttributes =
+      attributes !== undefined ? await this.writeAttributesTier(cleanUid, cleanScopeId, attributes) : {};
     const payload = stripUndefinedFields({
       ...card,
       ...(card.photoUrl !== undefined ? { photoUrl: sanitizeAvatarUrl(card.photoUrl) } : {}),
       uid: cleanUid,
       scopeId: cleanScopeId,
       roles: Array.from(new Set(card.roles || [])),
-      ...(card.attributes !== undefined ? { attributes: sanitizeObjectPatch<TAttributes>(card.attributes) } : {})
+      ...(Object.keys(cardAttributes).length > 0 ? { attributes: cardAttributes } : {})
     });
     await this.memberDocRef(cleanScopeId, cleanUid).set(payload, { merge: true });
   }
@@ -574,12 +617,10 @@ export class FirestoreServerStore<
     if (!snap.exists) {
       throw new Error(`Member '${cleanUid}' does not exist in scope '${cleanScopeId}'`);
     }
-    await ref.set(
-      {
-        attributes: sanitizeObjectPatch<TAttributes>(patch)
-      },
-      { merge: true }
-    );
+    const cardAttributes = await this.writeAttributesTier(cleanUid, cleanScopeId, patch);
+    if (Object.keys(cardAttributes).length > 0) {
+      await ref.set({ attributes: cardAttributes }, { merge: true });
+    }
     return (await this.getScopeMember(cleanScopeId, cleanUid))!;
   }
 
@@ -667,9 +708,7 @@ export class FirestoreServerStore<
   }
 
   async deleteScopeMember(scopeId: string, uid: string): Promise<void> {
-    await this.memberPreferencesDocRef(scopeId, uid)
-      .delete()
-      .catch(() => {});
+    await this.deleteMergedTiers(uid, assertValidFirestoreDocId(scopeId, "scopeId")).catch(() => {});
     await this.memberHiddenAttributesDocRef(scopeId, uid)
       .delete()
       .catch(() => {});

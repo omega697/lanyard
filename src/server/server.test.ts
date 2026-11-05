@@ -1609,7 +1609,13 @@ describe("lanyard/server unit tests", () => {
       openaiKey: "sk-proj-live999"
     });
 
-    expect(docs.get("users/u-1")?.attributes).toEqual({ pointsAllTime: 250 });
+    // Attributes live in the private attributes tier, never on the card (no cardFields configured)
+    expect(docs.get("users/u-1")?.attributes).toBeUndefined();
+    expect(docs.get("users/u-1/private/attributes")).toEqual({
+      pointsAllTime: 250,
+      _lanyard: { tier: "attributes", uid: "u-1", scopeId: null, updatedAt: expect.any(String) }
+    });
+    expect((await fsStore.getUser("u-1"))?.attributes).toEqual({ pointsAllTime: 250 });
     expect(docs.get("users/u-1")?.note).toBeUndefined();
     expect(docs.get("users/u-1")?.geminiKey).toBeUndefined();
     expect(docs.get("users/u-1/private/hiddenAttributes")).toEqual({ note: "Top secret" });
@@ -1650,7 +1656,12 @@ describe("lanyard/server unit tests", () => {
     await fsStore.updateScopeMemberHiddenAttributes("ws-1", "u-1", { note: "Workspace note" });
     await fsStore.updateScopeMemberSecrets("ws-1", "u-1", { geminiKey: "AIzaSyMemberSecret" });
 
-    expect(docs.get("workspaces/ws-1/members/u-1")?.attributes).toEqual({ pointsAllTime: 77 });
+    expect(docs.get("workspaces/ws-1/members/u-1")?.attributes).toBeUndefined();
+    expect(docs.get("workspaces/ws-1/members/u-1/private/attributes")).toEqual({
+      pointsAllTime: 77,
+      _lanyard: { tier: "attributes", uid: "u-1", scopeId: "ws-1", updatedAt: expect.any(String) }
+    });
+    expect((await fsStore.getScopeMember("ws-1", "u-1"))?.attributes).toEqual({ pointsAllTime: 77 });
     expect(docs.get("workspaces/ws-1/members/u-1/private/hiddenAttributes")).toEqual({ note: "Workspace note" });
     expect(await fsStore.getScopeMemberHiddenAttributes("ws-1", "u-1")).toEqual({ note: "Workspace note" });
     expect(isEncryptedSecretData(docs.get("workspaces/ws-1/members/u-1/private/secrets")?.geminiKey)).toBe(true);
@@ -3042,7 +3053,23 @@ describe("lanyard/server unit tests", () => {
     });
 
     const adminAuth = createFakeAdminAuth();
-    const store = new InMemoryLanyardStore<Role, Cap, Record<string, any>, { badges: string[]; points: number }>();
+    // A store that doesn't know the policy's card placement is rejected
+    expect(() => createLanyardServer({ adminAuth, store: new InMemoryLanyardStore<Role, Cap>(), policy })).toThrow(
+      /Store cardFields do not match the policy's cardFields/
+    );
+    expect(() =>
+      createLanyardServer({
+        adminAuth,
+        store: new InMemoryLanyardStore<Role, Cap>({
+          policy: createPermissionPolicy<Role, Cap>({ cardFields: { attributes: ["points"] } })
+        }),
+        policy
+      })
+    ).toThrow(/Store cardFields do not match/);
+
+    const store = new InMemoryLanyardStore<Role, Cap, Record<string, any>, { badges: string[]; points: number }>({
+      policy
+    });
     const server = createLanyardServer<Role, Cap, Record<string, any>, { badges: string[]; points: number }>({
       adminAuth,
       store,
@@ -3057,6 +3084,14 @@ describe("lanyard/server unit tests", () => {
     });
     const peer = await server.upsertUserByEmail({ scopeId: "camp-1", email: "peer@example.com", roles: ["volunteer"] });
     const lead = await server.upsertUserByEmail({ scopeId: "camp-1", email: "lead@example.com", roles: ["lead"] });
+
+    // `badges` is stored on the member card (visible to roster subscribers); `points` only in the attributes tier
+    const rosterEvents: any[][] = [];
+    store.subscribeToScopeMembers("camp-1", (m) => rosterEvents.push(m))();
+    expect(rosterEvents.at(-1)?.find((m) => m.uid === target.uid)?.attributes).toEqual({ badges: ["early-bird"] });
+    const tierEvents: any[] = [];
+    store.subscribeToScopeAttributes("camp-1", target.uid, (a) => tierEvents.push(a))();
+    expect(tierEvents.at(-1)).toEqual({ points: 42 });
 
     // Non-staff peer can read the card, so it sees only the card-placed key
     expect(await server.readUserAttributes({ scopeId: "camp-1", actor: peer, targetUid: target.uid })).toEqual({
