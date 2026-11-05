@@ -1099,13 +1099,15 @@ describe("lanyard/server unit tests", () => {
           capabilities: "*"
         }
       },
+      // Holders of 'read:tier' (auditor, moderator, tenant_owner) are staff: they can read attributes/hiddenAttributes tiers
+      staffCapability: "read:tier",
       attributeCapabilities: {
         pointsAllTime: "write:points",
         awardedBadges: "write:badges",
-        vipTier: { read: "read:tier", write: "write:tier" }
+        vipTier: { write: "write:tier" }
       },
       hiddenAttributeCapabilities: {
-        moderatorNotes: { read: "read:notes", write: "write:notes" }
+        moderatorNotes: { write: "write:notes" }
       },
       secretCapabilities: {
         geminiKey: { allowSelfWrite: true },
@@ -1202,14 +1204,15 @@ describe("lanyard/server unit tests", () => {
       })
     ).rejects.toThrow(/Forbidden/);
 
-    // - Scanner can read public attributes (pointsAllTime, awardedBadges) but NOT vipTier, and can ONLY write pointsAllTime
+    // - Scanner is NOT staff (lacks 'read:tier'), so it can't read another user's attributes tier,
+    //   but it can still write pointsAllTime (per-key write capability)
     expect(
       await server.readUserAttributes({
         scopeId: GLOBAL_SCOPE,
         actor: scanner,
         targetUid: attendee.uid
       })
-    ).toEqual({ pointsAllTime: 10, awardedBadges: [] });
+    ).toEqual({});
 
     await server.updateUserAttributes({
       scopeId: GLOBAL_SCOPE,
@@ -1273,14 +1276,14 @@ describe("lanyard/server unit tests", () => {
       })
     ).rejects.toThrow(/Forbidden/);
 
-    // - Auditor can read `moderatorNotes` (redacting `superAdminSecret`), and CANNOT write `moderatorNotes`
+    // - Auditor is staff, so it reads the whole hiddenAttributes tier, and CANNOT write `moderatorNotes`
     expect(
       await server.readUserHiddenAttributes({
         scopeId: GLOBAL_SCOPE,
         actor: auditor,
         targetUid: attendee.uid
       })
-    ).toEqual({ moderatorNotes: "Verified ID at booth" });
+    ).toEqual({ moderatorNotes: "Verified ID at booth", superAdminSecret: "classified-flag" });
 
     await expect(
       server.updateUserHiddenAttributes({
@@ -1715,17 +1718,19 @@ describe("lanyard/server unit tests", () => {
           capabilities: ["write:badges", "write:audit_hash"]
         }
       },
+      // Holders of 'read:merch' (merch_seller, moderator) are staff: they can read attributes/hiddenAttributes tiers
+      staffCapability: "read:merch",
       attributeCapabilities: {
         pointsAllTime: "write:points",
-        merchCreditBalance: { read: "read:merch", write: "write:merch" },
+        merchCreditBalance: { write: "write:merch" },
         awardedBadges: "write:badges",
-        // Read-only for merch/moderator, writable ONLY by system admin (no write capability configured)
-        readonlySystemBadge: { read: "read:merch" }
+        // Writable ONLY by system admin (no write capability configured)
+        readonlySystemBadge: {}
       },
       hiddenAttributeCapabilities: {
-        scannerAuditLog: { read: "read:scanner_log", write: "write:scanner_log" },
-        merchPosPin: { read: "read:merch_Pin", write: "write:merch_Pin" },
-        // Write-only hiddenAttribute for moderator; readable ONLY by system admin
+        scannerAuditLog: { write: "write:scanner_log" },
+        merchPosPin: { write: "write:merch_Pin" },
+        // Write-only hiddenAttribute for moderator
         blindAuditHash: { write: "write:audit_hash" }
       }
     });
@@ -1838,18 +1843,15 @@ describe("lanyard/server unit tests", () => {
       })
     ).rejects.toThrow(/Forbidden/);
 
-    // Reading attributes & hiddenAttributes redacts each sibling's restricted fields:
+    // Reads are per tier: scanner is NOT staff (can't read the attributes/hiddenAttributes tiers of other users),
+    // while merch_seller holds 'read:merch' (staffCapability) and reads both tiers in full:
     expect(
       await server.readUserAttributes({
         scopeId: GLOBAL_SCOPE,
         actor: scanner,
         targetUid: attendee.uid
       })
-    ).toEqual({
-      pointsAllTime: 40,
-      awardedBadges: ["welcome"]
-      // merchCreditBalance and readonlySystemBadge are redacted for scanner!
-    });
+    ).toEqual({});
     expect(
       await server.readUserAttributes({
         scopeId: GLOBAL_SCOPE,
@@ -1862,20 +1864,20 @@ describe("lanyard/server unit tests", () => {
       awardedBadges: ["welcome"],
       readonlySystemBadge: "founding-member"
     });
-    expect(
-      await server.readUserHiddenAttributes({
+    await expect(
+      server.readUserHiddenAttributes({
         scopeId: GLOBAL_SCOPE,
         actor: scanner,
         targetUid: attendee.uid
       })
-    ).toEqual({ scannerAuditLog: "Scanned booth #4" });
+    ).rejects.toThrow(/Forbidden/);
     expect(
       await server.readUserHiddenAttributes({
         scopeId: GLOBAL_SCOPE,
         actor: merchSeller,
         targetUid: attendee.uid
       })
-    ).toEqual({ merchPosPin: "4821" });
+    ).toEqual({ scannerAuditLog: "Scanned booth #4", merchPosPin: "4821" });
 
     // Sibling middleware check: scanner fails requireRole("merch_seller", GLOBAL_SCOPE) and vice versa
     const resScannerAsMerch = createMockRes();
@@ -1886,8 +1888,8 @@ describe("lanyard/server unit tests", () => {
     );
     expect(resScannerAsMerch.statusCode).toBe(403);
 
-    // 2. Write-only hiddenAttribute & Read-only attribute enforcement:
-    // Moderator can write `blindAuditHash`, but CANNOT read `blindAuditHash` back (only systemAdmin can read it)
+    // 2. Write-only-for-non-admins attribute enforcement:
+    // Moderator (staff via merch_seller) can write `blindAuditHash` and, as staff, reads the whole hiddenAttributes tier
     await server.updateUserHiddenAttributes({
       scopeId: GLOBAL_SCOPE,
       actor: moderator,
@@ -1902,8 +1904,8 @@ describe("lanyard/server unit tests", () => {
       })
     ).toEqual({
       scannerAuditLog: "Scanned booth #4",
-      merchPosPin: "4821"
-      // blindAuditHash is redacted for non-system-admins!
+      merchPosPin: "4821",
+      blindAuditHash: "sha256:abcdef"
     });
     expect(
       await server.readUserHiddenAttributes({
@@ -2021,18 +2023,15 @@ describe("lanyard/server unit tests", () => {
       readonlySystemBadge: "vip"
     });
 
-    // Scanner in scope can read attributes without restricted `read` capability (`pointsAllTime`, `awardedBadges`),
-    // whereas Moderator in scope also inherits `read:merch` and can read `merchCreditBalance` & `readonlySystemBadge`!
+    // Scanner in scope is NOT staff, so another member's attributes tier is redacted entirely,
+    // whereas Moderator in scope inherits `read:merch` (staffCapability) and reads the whole tier!
     expect(
       await server.readUserAttributes({
         scopeId: "event-2026",
         actor: scanner,
         targetUid: attendee.uid
       })
-    ).toEqual({
-      pointsAllTime: 88,
-      awardedBadges: ["scoped-badge"]
-    });
+    ).toEqual({});
     expect(
       await server.readUserAttributes({
         scopeId: "event-2026",
@@ -2056,8 +2055,8 @@ describe("lanyard/server unit tests", () => {
     ).rejects.toThrow(/Forbidden: Caller is not a member of scope/);
 
     // 5. Role demotion on users/{uid}:
-    // Demote `moderator` down to `scanner` -> immediately loses access to `merchPosPin` and `awardedBadges`,
-    // while retaining `scanner` access to `pointsAllTime` and `scannerAuditLog`
+    // Demote `moderator` down to `scanner` -> immediately loses staff status (can no longer read the hiddenAttributes tier)
+    // and write access to `awardedBadges`, while retaining `scanner` write access to `pointsAllTime`
     await server.upsertUserByEmail({
       scopeId: GLOBAL_SCOPE,
       email: "mod@example.com",
@@ -2071,16 +2070,13 @@ describe("lanyard/server unit tests", () => {
         patch: { awardedBadges: ["demoted-mod-badge"] }
       })
     ).rejects.toThrow(/Forbidden/);
-    expect(
-      await server.readUserHiddenAttributes({
+    await expect(
+      server.readUserHiddenAttributes({
         scopeId: GLOBAL_SCOPE,
         actor: moderator,
         targetUid: attendee.uid
       })
-    ).toEqual({
-      scannerAuditLog: "Scanned booth #4"
-      // merchPosPin is no longer visible after demotion from moderator to scanner!
-    });
+    ).rejects.toThrow(/Forbidden/);
     await server.updateUserAttributes({
       scopeId: GLOBAL_SCOPE,
       actor: moderator,
@@ -2361,9 +2357,10 @@ describe("lanyard/server unit tests", () => {
         write: "write:users",
         assignRoles: "assign:roles"
       },
+      staffCapability: "read:vip_tier",
       attributeCapabilities: {
         points: "write:users",
-        vipTier: { read: "read:vip_tier", write: "write:users" }
+        vipTier: { write: "write:users" }
       }
     });
 
@@ -2551,19 +2548,20 @@ describe("lanyard/server unit tests", () => {
       })
     ).rejects.toThrow(/Forbidden/);
 
-    // - Scanner (inherits `read:users` from abstract `user_reader_base`, lacks `read:vip_tier`) CAN read another user's profile and list users;
-    //   restricted attributes (`vipTier`) are redacted on OTHER users (`attendee`), while remaining UNREDACTED on `scanner`'s own record in `listUsers`!
+    // - Scanner (inherits `read:users` from abstract `user_reader_base`, lacks `read:vip_tier` so is NOT staff) CAN read another
+    //   user's profile and list users; the attributes tier is redacted entirely on OTHER users (`attendee`), while remaining
+    //   UNREDACTED on `scanner`'s own record in `listUsers`!
     const scannerReadAttendee = await server.getUser({
       scopeId: GLOBAL_SCOPE,
       actor: scanner,
       targetUid: attendee.uid
     });
     expect(scannerReadAttendee?.email).toBe("attendee@example.com");
-    expect(scannerReadAttendee?.attributes).toEqual({ points: 50 });
+    expect(scannerReadAttendee?.attributes).toEqual({});
 
     const scannerListed = await server.listUsers({ scopeId: GLOBAL_SCOPE, actor: scanner });
     expect(scannerListed).toHaveLength(9);
-    expect(scannerListed.find((u) => u.uid === attendee.uid)?.attributes).toEqual({ points: 50 });
+    expect(scannerListed.find((u) => u.uid === attendee.uid)?.attributes).toEqual({});
     expect(scannerListed.find((u) => u.uid === scanner.uid)?.attributes).toEqual({ points: 10, vipTier: "silver" });
 
     // - Multi-role grant (`scanner`) to `merchSeller` (`roles: ["merch_seller", "scanner"]`) then revoked:
@@ -2580,7 +2578,7 @@ describe("lanyard/server unit tests", () => {
       server.getUser({ scopeId: GLOBAL_SCOPE, actor: merchSeller, targetUid: attendee.uid })
     ).rejects.toThrow(/Forbidden/);
 
-    // - Moderator (holds `read:users` + `read:vip_tier`) sees unredacted `vipTier`, and `note`/`apiKey` still never leak onto UserRecord
+    // - Moderator (holds `read:users` + `read:vip_tier`, so is staff) sees the full attributes tier, and `note`/`apiKey` still never leak onto UserRecord
     const modReadAttendee = await server.getUser({
       scopeId: GLOBAL_SCOPE,
       actor: moderator,
@@ -2863,7 +2861,7 @@ describe("lanyard/server unit tests", () => {
       actor: scanner,
       targetUid: attendee.uid
     });
-    expect(scopedReadByScanner?.attributes).toEqual({ points: 77 }); // vipTier redacted for scanner!
+    expect(scopedReadByScanner?.attributes).toEqual({}); // attributes tier redacted for non-staff scanner!
     const scopedListedByScanner = await server.listUsers({
       scopeId: "ws-scoped",
       actor: scanner
@@ -3027,5 +3025,58 @@ describe("lanyard/server unit tests", () => {
     });
     expect(provisioned.roles).toEqual([]);
     expect((await store.getUser(provisioned.uid))?.roles).toEqual([]);
+  });
+
+  it("returns the full attributes tier to self/staff and only card-placed attribute keys to other card readers", async () => {
+    type Role = "volunteer" | "lead";
+    type Cap = "manage_members" | "view_directory";
+
+    const policy = createPermissionPolicy<Role, Cap>({
+      roles: {
+        volunteer: { capabilities: ["view_directory"] },
+        lead: { inherits: ["volunteer"], capabilities: ["manage_members"] }
+      },
+      userCapabilities: { read: "view_directory" },
+      staffCapability: "manage_members",
+      cardFields: { attributes: ["badges"] }
+    });
+
+    const adminAuth = createFakeAdminAuth();
+    const store = new InMemoryLanyardStore<Role, Cap, Record<string, any>, { badges: string[]; points: number }>();
+    const server = createLanyardServer<Role, Cap, Record<string, any>, { badges: string[]; points: number }>({
+      adminAuth,
+      store,
+      policy
+    });
+
+    const target = await server.upsertUserByEmail({
+      scopeId: "camp-1",
+      email: "target@example.com",
+      roles: ["volunteer"],
+      attributes: { badges: ["early-bird"], points: 42 }
+    });
+    const peer = await server.upsertUserByEmail({ scopeId: "camp-1", email: "peer@example.com", roles: ["volunteer"] });
+    const lead = await server.upsertUserByEmail({ scopeId: "camp-1", email: "lead@example.com", roles: ["lead"] });
+
+    // Non-staff peer can read the card, so it sees only the card-placed key
+    expect(await server.readUserAttributes({ scopeId: "camp-1", actor: peer, targetUid: target.uid })).toEqual({
+      badges: ["early-bird"]
+    });
+    expect((await server.getUser({ scopeId: "camp-1", actor: peer, targetUid: target.uid }))?.attributes).toEqual({
+      badges: ["early-bird"]
+    });
+    expect(
+      (await server.listUsers({ scopeId: "camp-1", actor: peer })).find((m) => m.uid === target.uid)?.attributes
+    ).toEqual({ badges: ["early-bird"] });
+
+    // Staff and self see the whole tier
+    expect(await server.readUserAttributes({ scopeId: "camp-1", actor: lead, targetUid: target.uid })).toEqual({
+      badges: ["early-bird"],
+      points: 42
+    });
+    expect(await server.readUserAttributes({ scopeId: "camp-1", actor: target, targetUid: target.uid })).toEqual({
+      badges: ["early-bird"],
+      points: 42
+    });
   });
 });

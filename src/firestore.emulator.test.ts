@@ -342,15 +342,17 @@ describe.skipIf(!emulatorsAvailable)(
           read: "read:scanner_log",
           write: "write:badges"
         },
+        // Holders of 'read:merch' (merch_seller, auditor, moderator) are staff: they read attributes/hiddenAttributes tiers
+        staffCapability: "read:merch",
         attributeCapabilities: {
           pointsAllTime: "write:points",
-          merchCreditBalance: { read: "read:merch", write: "write:merch" },
+          merchCreditBalance: { write: "write:merch" },
           awardedBadges: "write:badges",
-          readonlySystemBadge: { read: "read:merch" }
+          readonlySystemBadge: {}
         },
         hiddenAttributeCapabilities: {
-          scannerAuditLog: { read: "read:scanner_log", write: "write:scanner_log" },
-          merchPosPin: { read: "read:merch_pin", write: "write:merch_pin" },
+          scannerAuditLog: { write: "write:scanner_log" },
+          merchPosPin: { write: "write:merch_pin" },
           blindAuditHash: { write: "write:audit_hash" }
         },
         secretCapabilities: {
@@ -502,26 +504,21 @@ describe.skipIf(!emulatorsAvailable)(
         })
       ).rejects.toThrow(/Forbidden/);
 
-      // Sibling attribute & hiddenAttribute read redaction from real Firestore:
+      // Tier-based read redaction from real Firestore: scanner is NOT staff; merch_seller is staff
       expect(
         await server.readUserAttributes({
           scopeId: GLOBAL_SCOPE,
           actor: scanner,
           targetUid: attendee.uid
         })
-      ).toEqual({
-        pointsAllTime: 35,
-        awardedBadges: ["registered"]
-      });
-      expect(
-        await server.readUserHiddenAttributes({
+      ).toEqual({});
+      await expect(
+        server.readUserHiddenAttributes({
           scopeId: GLOBAL_SCOPE,
           actor: scanner,
           targetUid: attendee.uid
         })
-      ).toEqual({
-        scannerAuditLog: "Checked in at Main Hall"
-      });
+      ).rejects.toThrow(/Forbidden/);
       expect(
         await server.readUserHiddenAttributes({
           scopeId: GLOBAL_SCOPE,
@@ -529,10 +526,11 @@ describe.skipIf(!emulatorsAvailable)(
           targetUid: attendee.uid
         })
       ).toEqual({
+        scannerAuditLog: "Checked in at Main Hall",
         merchPosPin: "7744"
       });
 
-      // Auditor can read merchCreditBalance, readonlySystemBadge, and scannerAuditLog, but cannot write anything
+      // Auditor (staff) reads the whole attributes tier, but cannot write anything
       expect(
         await server.readUserAttributes({
           scopeId: GLOBAL_SCOPE,
@@ -568,7 +566,7 @@ describe.skipIf(!emulatorsAvailable)(
         patch: { superAdminSecret: "root-eyes-only" }
       });
 
-      // Moderator reads both sibling hiddenAttributes via diamond inheritance, while `blindAuditHash` and `superAdminSecret` are redacted
+      // Moderator (staff via merch_seller/auditor) reads the whole hiddenAttributes tier
       expect(
         await server.readUserHiddenAttributes({
           scopeId: GLOBAL_SCOPE,
@@ -577,7 +575,9 @@ describe.skipIf(!emulatorsAvailable)(
         })
       ).toEqual({
         scannerAuditLog: "Checked in at Main Hall",
-        merchPosPin: "7744"
+        merchPosPin: "7744",
+        blindAuditHash: "sha256:998877",
+        superAdminSecret: "root-eyes-only"
       });
 
       // System admin reads all 4 hiddenAttribute fields from real Firestore
@@ -831,11 +831,12 @@ describe.skipIf(!emulatorsAvailable)(
           manager: { inherits: ["member"], capabilities: ["edit:content", "read:notes"] },
           owner: { inherits: ["manager"], capabilities: "*" }
         },
+        staffCapability: "read:notes",
         attributeCapabilities: {
           quotaTier: "manage:billing"
         },
         hiddenAttributeCapabilities: {
-          internalNotes: { read: "read:notes", write: "write:notes" }
+          internalNotes: { write: "write:notes" }
         },
         secretCapabilities: {
           geminiKey: { write: "manage:secrets", allowSelfWrite: false }

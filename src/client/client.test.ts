@@ -1358,12 +1358,13 @@ describe("lanyard/client unit tests", () => {
         write: "invite_members",
         assignRoles: "invite_members"
       },
+      staffCapability: "invite_members",
       attributeCapabilities: {
         points: "edit_content",
-        tier: { read: "invite_members", write: "invite_members" }
+        tier: { write: "invite_members" }
       },
       hiddenAttributeCapabilities: {
-        moderatorNotes: { read: "invite_members", write: "edit_content" }
+        moderatorNotes: { write: "edit_content" }
       },
       secretCapabilities: {
         personalGeminiKey: { allowSelfWrite: true },
@@ -1527,19 +1528,19 @@ describe("lanyard/client unit tests", () => {
     expect(clientFourTier.canWriteUser(GLOBAL_SCOPE)).toBe(false);
     expect(clientFourTier.canAssignRoles(GLOBAL_SCOPE)).toBe(false);
     expect(clientFourTier.canAssignRoles("ws-alpha")).toBe(true);
-    // - Attributes: self can read own 'tier' (isSelf defaults to true), cannot read another user's 'tier' ({ isSelf: false }), can write 'points' (has 'edit_content'), cannot write 'tier' (lacks 'invite_members')
+    // - Attributes: self can read own 'tier' (isSelf defaults to true), cannot read another user's 'tier' ({ isSelf: false }; not staff), can write 'points' (has 'edit_content'), cannot write 'tier' (lacks 'invite_members')
     expect(clientFourTier.canReadAttribute(GLOBAL_SCOPE, "tier")).toBe(true);
     expect(clientFourTier.canReadAttribute(GLOBAL_SCOPE, "tier", { isSelf: false })).toBe(false);
     expect(clientFourTier.canWriteAttribute(GLOBAL_SCOPE, "points")).toBe(true);
     expect(clientFourTier.canWriteAttribute(GLOBAL_SCOPE, "tier")).toBe(false);
-    // - HiddenAttributes: lacks 'invite_members' so cannot read 'moderatorNotes', but has 'edit_content' so CAN write 'moderatorNotes'
+    // - HiddenAttributes: not staff (lacks 'invite_members') so cannot read 'moderatorNotes', but has 'edit_content' so CAN write 'moderatorNotes'
     expect(clientFourTier.canReadHiddenAttribute(GLOBAL_SCOPE, "moderatorNotes")).toBe(false);
     expect(clientFourTier.canWriteHiddenAttribute(GLOBAL_SCOPE, "moderatorNotes")).toBe(true);
     // - Secrets: can write own 'personalGeminiKey' (allowSelfWrite: true), cannot write 'workspaceOpenaiKey' (allowSelfWrite: false, lacks 'invite_members')
     expect(clientFourTier.canWriteSecret(GLOBAL_SCOPE, "personalGeminiKey")).toBe(true);
     expect(clientFourTier.canWriteSecret(GLOBAL_SCOPE, "workspaceOpenaiKey")).toBe(false);
 
-    // Scoped in 'ws-alpha' ('u-dual' is 'manager' -> has 'edit_content' + 'invite_members'):
+    // Scoped in 'ws-alpha' ('u-dual' is 'manager' -> has 'edit_content' + 'invite_members', so is scope staff):
     expect(clientFourTier.canReadAttribute("ws-alpha", "tier", { isSelf: false })).toBe(true);
     expect(clientFourTier.canWriteAttribute("ws-alpha", "tier")).toBe(true);
     expect(clientFourTier.canReadHiddenAttribute("ws-alpha", "moderatorNotes")).toBe(true);

@@ -784,16 +784,15 @@ describe("lanyard/core unit tests", () => {
       ).toThrow(/inherits from unknown role '__proto__'/);
     });
 
-    it("enforces independent read/write capabilities on userCapabilities, attributes, hiddenAttributes, and write-only secrets with strict self/admin/prototype invariants", () => {
+    it("enforces tier-based reads with per-key writes on userCapabilities, attributes, hiddenAttributes, and write-only secrets with strict self/admin/prototype invariants", () => {
       type Role = "attendee" | "scanner" | "auditor" | "moderator" | "role_manager";
       type Cap =
         | "read:users"
         | "write:users"
         | "assign:roles"
         | "write:points"
-        | "read:internal_tier"
+        | "view:member_private"
         | "write:internal_tier"
-        | "read:notes"
         | "write:notes"
         | "full:risk"
         | "write:ai_keys";
@@ -802,7 +801,7 @@ describe("lanyard/core unit tests", () => {
         roles: {
           attendee: { capabilities: [] },
           scanner: { inherits: ["attendee"], capabilities: ["read:users", "write:points"] },
-          auditor: { inherits: ["attendee"], capabilities: ["read:users", "read:internal_tier", "read:notes"] },
+          auditor: { inherits: ["attendee"], capabilities: ["read:users", "view:member_private"] },
           moderator: {
             inherits: ["scanner", "auditor"],
             capabilities: ["write:users", "write:internal_tier", "write:notes", "full:risk", "write:ai_keys"]
@@ -817,20 +816,20 @@ describe("lanyard/core unit tests", () => {
           write: "write:users",
           assignRoles: "assign:roles"
         },
+        // Holders of 'view:member_private' are scope staff: they can read the attributes and hiddenAttributes tiers
+        staffCapability: "view:member_private",
         attributeCapabilities: {
-          // String shorthand: anyone (including self) can read, only 'write:points' can write
+          // String shorthand: only 'write:points' can write
           pointsAllTime: "write:points",
-          // Object syntax: self or 'read:internal_tier' can read; 'write:internal_tier' can write
-          internalTier: { read: "read:internal_tier", write: "write:internal_tier" },
-          // Read-only attribute with no non-admin writer
-          systemFlag: { read: "read:internal_tier" }
+          // Object syntax: 'write:internal_tier' can write
+          internalTier: { write: "write:internal_tier" },
+          // Attribute with no non-admin writer
+          systemFlag: {}
         },
         hiddenAttributeCapabilities: {
-          // Object syntax: independent read and write capabilities; self NEVER gets access
-          moderatorNotes: { read: "read:notes", write: "write:notes" },
-          // String shorthand on hiddenAttributes: gates BOTH read and write
+          moderatorNotes: { write: "write:notes" },
+          // String shorthand on hiddenAttributes gates writes (reads are governed by the staff tier)
           riskScore: "full:risk",
-          // Write-only hiddenAttribute for non-admins (no read capability configured)
           auditTrailHash: { write: "write:notes" }
         },
         secretCapabilities: {
@@ -871,11 +870,14 @@ describe("lanyard/core unit tests", () => {
       expect(policy.canAssignRoles(roleManager)).toBe(true);
       expect(policy.canAssignRoles(null, true)).toBe(true);
 
-      // 1. Attributes: self can ALWAYS read their own attributes, but can NEVER write attributes without capability
+      // 1. Attributes tier: readable by self, scope staff, and system admins; self can NEVER write without capability
       expect(policy.canReadAttribute(attendee, "pointsAllTime", { isSelf: true })).toBe(true);
       expect(policy.canReadAttribute(attendee, "internalTier", { isSelf: true })).toBe(true);
       expect(policy.canReadAttribute(attendee, "internalTier", { isSelf: false })).toBe(false);
+      expect(policy.canReadAttribute(attendee, "pointsAllTime", { isSelf: false })).toBe(false);
+      expect(policy.canReadAttribute(scanner, "pointsAllTime", { isSelf: false })).toBe(false); // writer, but not staff
       expect(policy.canReadAttribute(auditor, "internalTier", { isSelf: false })).toBe(true);
+      expect(policy.canReadAttribute(null, "internalTier", { isSystemAdmin: true })).toBe(true);
 
       expect(policy.canWriteAttribute(attendee, "pointsAllTime")).toBe(false);
       expect(policy.canWriteAttribute(scanner, "pointsAllTime")).toBe(true);
@@ -886,37 +888,33 @@ describe("lanyard/core unit tests", () => {
       expect(policy.canWriteAttribute(moderator, "unconfiguredAttr")).toBe(false);
       expect(policy.canWriteAttribute(null, "unconfiguredAttr", true)).toBe(true);
 
-      // filterReadableAttributes redacts restricted attributes for non-self callers lacking read capability
+      // filterReadableAttributes returns the whole tier to self/staff/admins and nothing to other callers
       const sampleAttrs = { pointsAllTime: 100, internalTier: "gold", systemFlag: true };
-      expect(policy.filterReadableAttributes(attendee, sampleAttrs, { isSelf: false })).toEqual({
-        pointsAllTime: 100
-      });
+      expect(policy.filterReadableAttributes(attendee, sampleAttrs, { isSelf: false })).toEqual({});
       expect(policy.filterReadableAttributes(attendee, sampleAttrs, { isSelf: true })).toEqual(sampleAttrs);
       expect(policy.filterReadableAttributes(auditor, sampleAttrs, { isSelf: false })).toEqual(sampleAttrs);
 
-      // 2. HiddenAttributes: self NEVER gets read or write access; only explicit capability holders or systemAdmin
+      // 2. HiddenAttributes tier: self NEVER gets read or write access; scope staff and system admins can read
       expect(policy.canReadHiddenAttribute(attendee, "moderatorNotes")).toBe(false);
       expect(policy.canReadHiddenAttribute(scanner, "moderatorNotes")).toBe(false);
       expect(policy.canReadHiddenAttribute(auditor, "moderatorNotes")).toBe(true);
-      expect(policy.canWriteHiddenAttribute(auditor, "moderatorNotes")).toBe(false); // auditor has read:notes, NOT write:notes!
+      expect(policy.canWriteHiddenAttribute(auditor, "moderatorNotes")).toBe(false); // staff can read, NOT write:notes!
       expect(policy.canWriteHiddenAttribute(moderator, "moderatorNotes")).toBe(true);
 
-      expect(policy.canReadHiddenAttribute(auditor, "riskScore")).toBe(false);
+      expect(policy.canReadHiddenAttribute(auditor, "riskScore")).toBe(true);
+      expect(policy.canWriteHiddenAttribute(auditor, "riskScore")).toBe(false);
       expect(policy.canReadHiddenAttribute(moderator, "riskScore")).toBe(true);
       expect(policy.canWriteHiddenAttribute(moderator, "riskScore")).toBe(true);
 
-      // HiddenAttribute with write capability but no read capability cannot be read by non-admins
       expect(policy.canWriteHiddenAttribute(moderator, "auditTrailHash")).toBe(true);
-      expect(policy.canReadHiddenAttribute(moderator, "auditTrailHash")).toBe(false);
+      expect(policy.canReadHiddenAttribute(moderator, "auditTrailHash")).toBe(true);
       expect(policy.canReadHiddenAttribute(null, "auditTrailHash", true)).toBe(true);
 
       const sampleHidden = { moderatorNotes: "Trusted", riskScore: 0, superAdminOnly: "top-secret" };
       expect(policy.filterReadableHiddenAttributes(attendee, sampleHidden)).toEqual({});
-      expect(policy.filterReadableHiddenAttributes(auditor, sampleHidden)).toEqual({ moderatorNotes: "Trusted" });
-      expect(policy.filterReadableHiddenAttributes(moderator, sampleHidden)).toEqual({
-        moderatorNotes: "Trusted",
-        riskScore: 0
-      });
+      expect(policy.filterReadableHiddenAttributes(scanner, sampleHidden)).toEqual({});
+      expect(policy.filterReadableHiddenAttributes(auditor, sampleHidden)).toEqual(sampleHidden);
+      expect(policy.filterReadableHiddenAttributes(moderator, sampleHidden)).toEqual(sampleHidden);
       expect(policy.filterReadableHiddenAttributes(null, sampleHidden, true)).toEqual(sampleHidden);
 
       // 3. Write-only Secrets:
@@ -976,6 +974,367 @@ describe("lanyard/core unit tests", () => {
       expect(policy.canWriteAttribute(null, "__proto__", true)).toBe(false);
       expect(policy.canReadHiddenAttribute(null, "constructor", true)).toBe(false);
       expect(policy.canWriteSecret(null, "__proto__", true)).toBe(false);
+    });
+
+    it("evaluates storage-tier reads, staff status, scoped card visibility, card field placement, and custom docs", () => {
+      type Role = "volunteer" | "coordinator" | "creator";
+      type Cap = "manage_members" | "view_roster" | "view_shift_notes" | "edit_shift_notes";
+
+      const basePolicyConfig = {
+        roles: {
+          volunteer: { capabilities: [] as Cap[] },
+          coordinator: {
+            inherits: ["volunteer"] as Role[],
+            capabilities: ["view_roster", "view_shift_notes"] as Cap[]
+          },
+          creator: { inherits: ["coordinator"] as Role[], capabilities: "*" as const }
+        },
+        staffCapability: "manage_members" as const
+      };
+
+      const policy = createPermissionPolicy<Role, Cap>({
+        ...basePolicyConfig,
+        cardFields: { attributes: ["badges", "badges", "__proto__"] },
+        customDocs: {
+          shiftNotes: {
+            read: { capability: "view_shift_notes", self: true },
+            write: { capability: "edit_shift_notes" }
+          },
+          auditLog: { read: { staff: true }, write: {} }
+        }
+      });
+
+      const volunteer = { roles: ["volunteer"] as const };
+      const coordinator = { roles: ["coordinator"] as const };
+      const creator = { roles: ["creator"] as const };
+
+      // Normalized configuration
+      expect(policy.staffCapability).toBe("manage_members");
+      expect(policy.cardVisibility).toBe("members");
+      expect(policy.cardFields).toEqual({ email: false, attributes: ["badges"] });
+      expect(Object.keys(policy.customDocs)).toEqual(["shiftNotes", "auditLog"]);
+
+      // Staff = holders of staffCapability (creator via "*") or system admins
+      expect(policy.isStaff(volunteer)).toBe(false);
+      expect(policy.isStaff(coordinator)).toBe(false);
+      expect(policy.isStaff(creator)).toBe(true);
+      expect(policy.isStaff(null, true)).toBe(true);
+
+      // preferences: self + system admins only
+      expect(policy.canReadTier(creator, "preferences")).toBe(false);
+      expect(policy.canReadTier(volunteer, "preferences", { isSelf: true })).toBe(true);
+      expect(policy.canReadTier(null, "preferences", { isSystemAdmin: true })).toBe(true);
+
+      // attributes: self + staff + system admins
+      expect(policy.canReadTier(coordinator, "attributes")).toBe(false);
+      expect(policy.canReadTier(volunteer, "attributes", { isSelf: true })).toBe(true);
+      expect(policy.canReadTier(creator, "attributes")).toBe(true);
+
+      // hiddenAttributes: staff + system admins; never self
+      expect(policy.canReadTier(volunteer, "hiddenAttributes", { isSelf: true })).toBe(false);
+      expect(policy.canReadTier(creator, "hiddenAttributes")).toBe(true);
+      expect(policy.canReadTier(null, "hiddenAttributes", { isSystemAdmin: true })).toBe(true);
+
+      // secrets: never readable by any client
+      expect(policy.canReadTier(null, "secrets", { isSystemAdmin: true, isSelf: true })).toBe(false);
+
+      // card (default "members"): any scope member; global card follows userCapabilities.read (unset: self + admins)
+      expect(policy.canReadTier(volunteer, "card", { isScopeMember: true })).toBe(true);
+      expect(policy.canReadTier(volunteer, "card", { isScopeMember: false })).toBe(false);
+      expect(policy.canReadTier(volunteer, "card", { isSelf: true })).toBe(true);
+      expect(policy.canReadTier(creator, "card", { isGlobal: true })).toBe(false);
+      expect(policy.canReadTier(creator, "card", { isGlobal: true, isSelf: true })).toBe(true);
+      expect(policy.canReadTier(null, "card", { isGlobal: true, isSystemAdmin: true })).toBe(true);
+
+      // Card-placed attributes are readable by card readers; tier attributes are not
+      expect(policy.isCardAttribute("badges")).toBe(true);
+      expect(policy.isCardAttribute("points")).toBe(false);
+      expect(policy.canReadAttribute(volunteer, "badges", { canReadCard: true })).toBe(true);
+      expect(policy.canReadAttribute(volunteer, "points", { canReadCard: true })).toBe(false);
+      expect(policy.canReadAttribute(volunteer, "badges", { canReadCard: false })).toBe(false);
+      expect(
+        policy.filterReadableAttributes(volunteer, { badges: ["early-bird"], points: 10 }, { canReadCard: true })
+      ).toEqual({ badges: ["early-bird"] });
+
+      // Custom docs: app-defined audiences; system admins always allowed; unknown names denied
+      expect(policy.canReadCustomDoc(volunteer, "shiftNotes")).toBe(false);
+      expect(policy.canReadCustomDoc(volunteer, "shiftNotes", { isSelf: true })).toBe(true);
+      expect(policy.canReadCustomDoc(coordinator, "shiftNotes")).toBe(true);
+      expect(policy.canWriteCustomDoc(coordinator, "shiftNotes")).toBe(false);
+      expect(policy.canWriteCustomDoc(creator, "shiftNotes")).toBe(true);
+      expect(policy.canReadCustomDoc(coordinator, "auditLog")).toBe(false);
+      expect(policy.canReadCustomDoc(creator, "auditLog")).toBe(true);
+      expect(policy.canWriteCustomDoc(creator, "auditLog")).toBe(false); // empty rule: admins/server only
+      expect(policy.canWriteCustomDoc(null, "auditLog", { isSystemAdmin: true })).toBe(true);
+      expect(policy.canReadCustomDoc(creator, "unknownDoc")).toBe(false);
+      expect(policy.canReadCustomDoc(null, "__proto__", { isSystemAdmin: true })).toBe(false);
+
+      // Scoped card visibility modes
+      const staffOnlyCards = createPermissionPolicy<Role, Cap>({ ...basePolicyConfig, cardVisibility: "staff" });
+      expect(staffOnlyCards.canReadTier(coordinator, "card", { isScopeMember: true })).toBe(false);
+      expect(staffOnlyCards.canReadTier(creator, "card", { isScopeMember: true })).toBe(true);
+
+      const capabilityCards = createPermissionPolicy<Role, Cap>({
+        ...basePolicyConfig,
+        cardVisibility: { capability: "view_roster" }
+      });
+      expect(capabilityCards.canReadTier(volunteer, "card", { isScopeMember: true })).toBe(false);
+      expect(capabilityCards.canReadTier(coordinator, "card", { isScopeMember: true })).toBe(true);
+
+      // Without staffCapability, only system admins are staff
+      const noStaff = createPermissionPolicy<Role, Cap>({ roles: basePolicyConfig.roles });
+      expect(noStaff.staffCapability).toBeUndefined();
+      expect(noStaff.isStaff(creator)).toBe(false);
+      expect(noStaff.canReadTier(creator, "attributes")).toBe(false);
+      expect(noStaff.canReadTier(null, "attributes", { isSystemAdmin: true })).toBe(true);
+    });
+
+    it("matches an independent reference model for every role x tier x cardVisibility x caller-flag combination", () => {
+      type Role = "volunteer" | "coordinator" | "creator" | "auditor";
+      type Cap = "manage_members" | "view_roster" | "view_directory";
+      const roles = {
+        volunteer: { capabilities: [] as Cap[] },
+        coordinator: { inherits: ["volunteer"] as Role[], capabilities: ["view_roster"] as Cap[] },
+        creator: { inherits: ["coordinator"] as Role[], capabilities: "*" as const },
+        auditor: { capabilities: ["view_directory"] as Cap[] }
+      };
+      // Independent capability table (mirrors `roles` above without using the policy engine)
+      const caps: Record<Role, readonly Cap[]> = {
+        volunteer: [],
+        coordinator: ["view_roster"],
+        creator: ["manage_members", "view_roster", "view_directory"],
+        auditor: ["view_directory"]
+      };
+      const subjects: { label: string; subject: { roles: readonly Role[] } | null }[] = [
+        { label: "null", subject: null },
+        { label: "no roles", subject: { roles: [] } },
+        { label: "volunteer", subject: { roles: ["volunteer"] } },
+        { label: "coordinator", subject: { roles: ["coordinator"] } },
+        { label: "creator", subject: { roles: ["creator"] } },
+        { label: "auditor", subject: { roles: ["auditor"] } },
+        { label: "volunteer+auditor", subject: { roles: ["volunteer", "auditor"] } },
+        { label: "unknown role", subject: { roles: ["ghost" as Role] } }
+      ];
+      const holds = (s: { roles: readonly Role[] } | null, cap: Cap) =>
+        Boolean(s?.roles.some((r) => Object.hasOwn(caps, r) && caps[r].includes(cap)));
+
+      const visibilityModes: { label: string; rule: "members" | "staff" | { capability: Cap } }[] = [
+        { label: "members", rule: "members" },
+        { label: "staff", rule: "staff" },
+        { label: "capability", rule: { capability: "view_roster" } }
+      ];
+      const tiers = ["card", "preferences", "attributes", "hiddenAttributes", "secrets"] as const;
+      const bools = [false, true];
+      let checked = 0;
+
+      for (const staffCapability of [undefined, "manage_members" as const]) {
+        for (const userRead of [undefined, "view_directory" as const]) {
+          for (const mode of visibilityModes) {
+            const policy = createPermissionPolicy<Role, Cap>({
+              roles,
+              staffCapability,
+              cardVisibility: mode.rule,
+              ...(userRead ? { userCapabilities: { read: userRead } } : {})
+            });
+            for (const { label, subject } of subjects) {
+              const isStaffRef = (admin: boolean) =>
+                admin || (staffCapability !== undefined && holds(subject, staffCapability));
+              for (const tier of tiers) {
+                for (const isSystemAdmin of bools) {
+                  for (const isSelf of bools) {
+                    for (const isGlobal of bools) {
+                      for (const isScopeMember of bools) {
+                        let expected: boolean;
+                        switch (tier) {
+                          case "card":
+                            if (isSystemAdmin || isSelf) expected = true;
+                            else if (isGlobal) expected = userRead !== undefined && holds(subject, userRead);
+                            else if (mode.rule === "members") expected = isScopeMember;
+                            else if (mode.rule === "staff") expected = isStaffRef(false);
+                            else expected = holds(subject, mode.rule.capability);
+                            break;
+                          case "preferences":
+                            expected = isSystemAdmin || isSelf;
+                            break;
+                          case "attributes":
+                            expected = isSystemAdmin || isSelf || isStaffRef(false);
+                            break;
+                          case "hiddenAttributes":
+                            expected = isStaffRef(isSystemAdmin);
+                            break;
+                          case "secrets":
+                            expected = false;
+                            break;
+                        }
+                        const actual = policy.canReadTier(subject, tier, {
+                          isSystemAdmin,
+                          isSelf,
+                          isGlobal,
+                          isScopeMember
+                        });
+                        if (actual !== expected) {
+                          throw new Error(
+                            `canReadTier mismatch: staff=${staffCapability} userRead=${userRead} visibility=${mode.label} ` +
+                              `subject=${label} tier=${tier} admin=${isSystemAdmin} self=${isSelf} global=${isGlobal} ` +
+                              `member=${isScopeMember}: expected ${expected}, got ${actual}`
+                          );
+                        }
+                        checked++;
+                      }
+                    }
+                  }
+                }
+              }
+              // hiddenAttributes reads never depend on self; attributes reads never depend on per-key config
+              expect(policy.canReadHiddenAttribute(subject, "anyKey", false)).toBe(isStaffRef(false));
+              expect(policy.canReadHiddenAttribute(subject, "anyKey", true)).toBe(true);
+              expect(policy.canReadAttribute(subject, "anyKey", { isSelf: false })).toBe(isStaffRef(false));
+              expect(policy.isStaff(subject)).toBe(isStaffRef(false));
+            }
+          }
+        }
+      }
+      expect(checked).toBe(2 * 2 * 3 * 8 * 5 * 16);
+    });
+
+    it("never treats prototype keys, unsafe names, or mutated config as granting access", () => {
+      type Cap = "manage_members" | "edit";
+      const policy = createPermissionPolicy<"lead" | "member", Cap>({
+        roles: { lead: { capabilities: ["manage_members", "edit"] }, member: { capabilities: [] } },
+        staffCapability: "manage_members",
+        cardFields: { attributes: ["badges", "", "  ", "__proto__", "constructor", "prototype", 42 as any] },
+        customDocs: { notes: { read: { self: true }, write: { capability: "edit" } } }
+      });
+      const lead = { roles: ["lead"] as const };
+      const member = { roles: ["member"] as const };
+
+      // Unsafe card attribute names are dropped during normalization
+      expect(policy.cardFields.attributes).toEqual(["badges"]);
+      for (const key of ["__proto__", "constructor", "prototype", "", "  "]) {
+        expect(policy.isCardAttribute(key)).toBe(false);
+        expect(policy.canReadAttribute(lead, key, { isSystemAdmin: true, isSelf: true, canReadCard: true })).toBe(
+          false
+        );
+        expect(policy.canReadHiddenAttribute(lead, key, true)).toBe(false);
+        expect(policy.canReadCustomDoc(lead, key, { isSystemAdmin: true })).toBe(false);
+        expect(policy.canWriteCustomDoc(lead, key, { isSystemAdmin: true })).toBe(false);
+      }
+
+      // Normalized configuration is deeply frozen: callers can't widen access after creation
+      expect(Object.isFrozen(policy.cardFields)).toBe(true);
+      expect(Object.isFrozen(policy.cardFields.attributes)).toBe(true);
+      expect(Object.isFrozen(policy.customDocs)).toBe(true);
+      expect(Object.isFrozen(policy.customDocs.notes)).toBe(true);
+      expect(Object.isFrozen(policy.customDocs.notes.read)).toBe(true);
+      expect(() => {
+        (policy.cardFields.attributes as string[]).push("secretKey");
+      }).toThrow();
+      expect(() => {
+        (policy.customDocs.notes.read as any).staff = true;
+      }).toThrow();
+      expect(() => {
+        (policy as any).staffCapability = "edit";
+      }).toThrow();
+      expect(policy.isCardAttribute("secretKey")).toBe(false);
+      expect(policy.canReadCustomDoc(lead, "notes")).toBe(false); // lead is staff, but notes.read is self-only
+      expect(policy.isStaff(member)).toBe(false);
+
+      // Mutating the input config after creation has no effect
+      const input = {
+        roles: { lead: { capabilities: ["manage_members"] as Cap[] } },
+        staffCapability: "manage_members" as Cap,
+        cardFields: { attributes: ["badges"] },
+        customDocs: { notes: { read: { self: true } as { self?: boolean; staff?: boolean }, write: {} } }
+      };
+      const snapshotPolicy = createPermissionPolicy<"lead", Cap>(input);
+      input.cardFields.attributes.push("points");
+      input.customDocs.notes.read.staff = true;
+      expect(snapshotPolicy.isCardAttribute("points")).toBe(false);
+      expect(snapshotPolicy.canReadCustomDoc(lead, "notes")).toBe(false);
+
+      // Unsafe staffCapability / customDoc capability values are ignored rather than matched
+      const unsafe = createPermissionPolicy<"lead", string>({
+        roles: { lead: { capabilities: "*" } },
+        staffCapability: "__proto__",
+        customDocs: { doc: { read: { capability: "constructor" }, write: {} } }
+      });
+      expect(unsafe.staffCapability).toBeUndefined();
+      expect(unsafe.isStaff({ roles: ["lead"] })).toBe(false);
+      expect(unsafe.canReadCustomDoc({ roles: ["lead"] }, "doc")).toBe(false);
+
+      // Legacy string shorthand on hiddenAttributeCapabilities no longer grants READ (only write)
+      const legacy = createPermissionPolicy<"mod", "full:risk">({
+        roles: { mod: { capabilities: ["full:risk"] } },
+        hiddenAttributeCapabilities: { riskScore: "full:risk" }
+      });
+      expect(legacy.canWriteHiddenAttribute({ roles: ["mod"] }, "riskScore")).toBe(true);
+      expect(legacy.canReadHiddenAttribute({ roles: ["mod"] }, "riskScore")).toBe(false);
+    });
+
+    it("rejects legacy per-key read rules, reserved or invalid custom doc names, and invalid cardVisibility", () => {
+      type Cap = "read:x" | "write:x";
+      expect(() =>
+        createPermissionPolicy<never, Cap>({
+          attributeCapabilities: { tier: { read: "read:x", write: "write:x" } as any }
+        })
+      ).toThrow(/attributeCapabilities\.tier: per-key 'read' rules are not supported/);
+      expect(() =>
+        createPermissionPolicy<never, Cap>({
+          hiddenAttributeCapabilities: { notes: { read: "read:x" } as any }
+        })
+      ).toThrow(/hiddenAttributeCapabilities\.notes: per-key 'read' rules are not supported/);
+      expect(() =>
+        createPermissionPolicy<never, Cap>({ customDocs: { preferences: { read: { self: true }, write: {} } } })
+      ).toThrow(/reserved for a built-in storage tier/);
+      expect(() =>
+        createPermissionPolicy<never, Cap>({ customDocs: { "bad/name": { read: { self: true }, write: {} } } })
+      ).toThrow(/Invalid customDocs name/);
+      expect(() => createPermissionPolicy<never, Cap>({ cardVisibility: { capability: "" as Cap } })).toThrow(
+        /Invalid cardVisibility/
+      );
+    });
+
+    it("rejects malformed policy config loudly instead of falling back to defaults", () => {
+      type Cap = "read:x" | "write:x";
+      // A legacy `read` key throws even when its value is undefined
+      expect(() =>
+        createPermissionPolicy<never, Cap>({
+          attributeCapabilities: { tier: { read: undefined, write: "write:x" } as any }
+        })
+      ).toThrow(/per-key 'read' rules are not supported/);
+      // Custom doc definitions must be objects
+      for (const definition of [null, "x", 42]) {
+        expect(() => createPermissionPolicy<never, Cap>({ customDocs: { notes: definition as any } })).toThrow(
+          /Invalid definition for customDocs 'notes'/
+        );
+      }
+      // Typos or unsafe values in cardVisibility never fall back to a default visibility
+      for (const cardVisibility of ["public", null, {}, { capability: "__proto__" }]) {
+        expect(() => createPermissionPolicy<never, Cap>({ cardVisibility: cardVisibility as any })).toThrow(
+          /Invalid cardVisibility/
+        );
+      }
+    });
+
+    it("grants custom doc writes to self only for the document's owner, and staff writes only with a staffCapability", () => {
+      type Role = "admin" | "member";
+      type Cap = "everything";
+      const selfWrite = createPermissionPolicy<Role, Cap>({
+        roles: { admin: { capabilities: "*" }, member: {} },
+        customDocs: { notes: { read: {}, write: { self: true } } }
+      });
+      const member = { roles: ["member"] as Role[] };
+      expect(selfWrite.canWriteCustomDoc(member, "notes", { isSelf: true })).toBe(true);
+      expect(selfWrite.canWriteCustomDoc(member, "notes", { isSelf: false })).toBe(false);
+      expect(selfWrite.canReadCustomDoc(member, "notes", { isSelf: true })).toBe(false);
+
+      // Without a staffCapability nobody is staff, not even a "*" role; only system admins pass
+      const staffWrite = createPermissionPolicy<Role, Cap>({
+        roles: { admin: { capabilities: "*" }, member: {} },
+        customDocs: { notes: { read: {}, write: { staff: true } } }
+      });
+      expect(staffWrite.canWriteCustomDoc({ roles: ["admin"] }, "notes")).toBe(false);
+      expect(staffWrite.canWriteCustomDoc(member, "notes", { isSystemAdmin: true })).toBe(true);
     });
 
     it("preserves user preferences, attributes, hiddenAttributes, encrypted secrets, and profile when demoting a system admin in InMemoryLanyardStore", async () => {

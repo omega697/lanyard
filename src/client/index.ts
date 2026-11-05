@@ -890,6 +890,8 @@ export function createLanyardClient<
    * Checks whether the current user can read `key` on `attributes` within `scopeId` (`GLOBAL_SCOPE` or tenant `string`).
    * Defaults `isSelf: true` when checking the current user's own attributes; pass `{ isSelf: false }`
    * when checking whether the current user can read another user's/member's `attributes` key.
+   * The attributes tier is readable by self, scope staff (`staffCapability`), and system admins; keys placed on
+   * the card via `cardFields.attributes` are additionally readable by anyone who can read the card.
    */
   function canReadAttribute(
     scopeId: ScopeId,
@@ -904,7 +906,13 @@ export function createLanyardClient<
     const subject = resolveTargetSubject(scopeId);
     if (scopeId !== GLOBAL_SCOPE && !isAdmin && !subject) return false;
     if (policy) {
-      return policy.canReadAttribute(subject, key, { isSystemAdmin: isAdmin, isSelf });
+      const canReadCard = policy.canReadTier(subject, "card", {
+        isSystemAdmin: isAdmin,
+        isSelf,
+        isGlobal: scopeId === GLOBAL_SCOPE,
+        isScopeMember: scopeId !== GLOBAL_SCOPE && Boolean(subject)
+      });
+      return policy.canReadAttribute(subject, key, { isSystemAdmin: isAdmin, isSelf, canReadCard });
     }
     return isAdmin || isSelf;
   }

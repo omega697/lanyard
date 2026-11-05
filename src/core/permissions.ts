@@ -1,5 +1,9 @@
 import type {
+  CardVisibilityRule,
+  CustomDocAccessRule,
+  CustomDocDefinition,
   FieldCapabilityRule,
+  LanyardTier,
   PermissionPolicy,
   PermissionPolicyConfig,
   PolicySubject,
@@ -8,22 +12,65 @@ import type {
 
 const FORBIDDEN_PROTOTYPE_KEYS = new Set(["__proto__", "constructor", "prototype"]);
 
+/** Built-in storage tier names; app-defined `customDocs` may not reuse them. */
+const RESERVED_TIER_NAMES = new Set<string>(["card", "preferences", "attributes", "hiddenAttributes", "secrets"]);
+
 function isSafeKey(key: unknown): key is string {
   return typeof key === "string" && key.trim().length > 0 && !FORBIDDEN_PROTOTYPE_KEYS.has(key);
 }
 
 interface NormalizedFieldRule<TCapability extends string> {
-  read?: TCapability;
   write?: TCapability;
 }
 
-interface NormalizedUserRule<TCapability extends string> extends NormalizedFieldRule<TCapability> {
+interface NormalizedUserRule<TCapability extends string> {
+  read?: TCapability;
+  write?: TCapability;
   assignRoles?: TCapability;
 }
 
 interface NormalizedSecretRule<TCapability extends string> {
   write?: TCapability;
   allowSelfWrite?: boolean;
+}
+
+/**
+ * Normalizes per-key `attributeCapabilities` / `hiddenAttributeCapabilities` WRITE rules.
+ * Throws if a legacy per-key `read` rule is present: reads are governed by storage tiers, because
+ * Firestore security rules can only grant or deny whole documents.
+ */
+function normalizeFieldWriteRules<TCapability extends string>(
+  configKey: "attributeCapabilities" | "hiddenAttributeCapabilities",
+  input: Record<string, FieldCapabilityRule<TCapability>> | undefined
+): Record<string, NormalizedFieldRule<TCapability>> {
+  const rules = Object.create(null) as Record<string, NormalizedFieldRule<TCapability>>;
+  if (!input || typeof input !== "object") return rules;
+  for (const [key, rule] of Object.entries(input)) {
+    if (!isSafeKey(key) || !rule) continue;
+    if (typeof rule === "string") {
+      rules[key] = Object.freeze({ write: rule as TCapability });
+    } else if (typeof rule === "object") {
+      if ("read" in rule) {
+        throw new Error(
+          `Invalid ${configKey}.${key}: per-key 'read' rules are not supported. ` +
+            `Reads are governed by storage tiers (see staffCapability and cardFields).`
+        );
+      }
+      rules[key] = Object.freeze(rule.write ? { write: rule.write } : {});
+    }
+  }
+  return rules;
+}
+
+function normalizeCustomDocRule<TCapability extends string>(
+  rule: CustomDocAccessRule<TCapability> | undefined
+): Readonly<CustomDocAccessRule<TCapability>> {
+  if (!rule || typeof rule !== "object") return Object.freeze({});
+  return Object.freeze({
+    ...(rule.self ? { self: true } : {}),
+    ...(rule.staff ? { staff: true } : {}),
+    ...(rule.capability && isSafeKey(rule.capability) ? { capability: rule.capability } : {})
+  });
 }
 
 /**
@@ -174,37 +221,8 @@ export function createPermissionPolicy<TRole extends string = string, TCapabilit
     }
   }
 
-  const attrRules = Object.create(null) as Record<string, NormalizedFieldRule<TCapability>>;
-  if (config.attributeCapabilities && typeof config.attributeCapabilities === "object") {
-    for (const [key, rule] of Object.entries(config.attributeCapabilities)) {
-      if (!isSafeKey(key) || !rule) continue;
-      if (typeof rule === "string") {
-        // String shorthand on attributeCapabilities gates writes while leaving reads open to self/readers
-        attrRules[key] = Object.freeze({ write: rule as TCapability });
-      } else if (typeof rule === "object") {
-        attrRules[key] = Object.freeze({
-          ...(rule.read ? { read: rule.read } : {}),
-          ...(rule.write ? { write: rule.write } : {})
-        });
-      }
-    }
-  }
-
-  const hiddenAttrRules = Object.create(null) as Record<string, NormalizedFieldRule<TCapability>>;
-  if (config.hiddenAttributeCapabilities && typeof config.hiddenAttributeCapabilities === "object") {
-    for (const [key, rule] of Object.entries(config.hiddenAttributeCapabilities)) {
-      if (!isSafeKey(key) || !rule) continue;
-      if (typeof rule === "string") {
-        // String shorthand on hiddenAttributeCapabilities gates BOTH read and write
-        hiddenAttrRules[key] = Object.freeze({ read: rule as TCapability, write: rule as TCapability });
-      } else if (typeof rule === "object") {
-        hiddenAttrRules[key] = Object.freeze({
-          ...(rule.read ? { read: rule.read } : {}),
-          ...(rule.write ? { write: rule.write } : {})
-        });
-      }
-    }
-  }
+  const attrRules = normalizeFieldWriteRules("attributeCapabilities", config.attributeCapabilities);
+  const hiddenAttrRules = normalizeFieldWriteRules("hiddenAttributeCapabilities", config.hiddenAttributeCapabilities);
 
   const secretRules = Object.create(null) as Record<string, NormalizedSecretRule<TCapability>>;
   if (config.secretCapabilities && typeof config.secretCapabilities === "object") {
@@ -224,6 +242,53 @@ export function createPermissionPolicy<TRole extends string = string, TCapabilit
   Object.freeze(roles);
   Object.freeze(resolvedCapabilities);
   Object.freeze(roleInherits);
+
+  // Normalize storage-tier configuration: staff capability, scoped card visibility, card field placement, custom docs
+  const staffCapability: TCapability | undefined =
+    config.staffCapability && isSafeKey(config.staffCapability) ? config.staffCapability : undefined;
+
+  let cardVisibility: CardVisibilityRule<TCapability> = "members";
+  if (config.cardVisibility === "members" || config.cardVisibility === "staff") {
+    cardVisibility = config.cardVisibility;
+  } else if (config.cardVisibility !== undefined) {
+    const capability =
+      typeof config.cardVisibility === "object" && config.cardVisibility !== null
+        ? config.cardVisibility.capability
+        : undefined;
+    if (!capability || !isSafeKey(capability)) {
+      throw new Error('Invalid cardVisibility: expected "members", "staff", or { capability }.');
+    }
+    cardVisibility = Object.freeze({ capability });
+  }
+
+  const cardAttributeKeys = Array.isArray(config.cardFields?.attributes)
+    ? Array.from(new Set(config.cardFields!.attributes.filter(isSafeKey)))
+    : [];
+  const cardFields = Object.freeze({
+    email: Boolean(config.cardFields?.email),
+    attributes: Object.freeze(cardAttributeKeys)
+  });
+  const cardAttributeSet = new Set<string>(cardAttributeKeys);
+
+  const customDocs = Object.create(null) as Record<string, Readonly<CustomDocDefinition<TCapability>>>;
+  if (config.customDocs && typeof config.customDocs === "object") {
+    for (const [name, def] of Object.entries(config.customDocs)) {
+      if (!isSafeKey(name) || !/^[A-Za-z0-9_-]+$/.test(name)) {
+        throw new Error(`Invalid customDocs name '${name}': use letters, digits, '_' or '-'.`);
+      }
+      if (RESERVED_TIER_NAMES.has(name)) {
+        throw new Error(`Invalid customDocs name '${name}': reserved for a built-in storage tier.`);
+      }
+      if (!def || typeof def !== "object") {
+        throw new Error(`Invalid definition for customDocs '${name}'.`);
+      }
+      customDocs[name] = Object.freeze({
+        read: normalizeCustomDocRule(def.read),
+        write: normalizeCustomDocRule(def.write)
+      });
+    }
+  }
+  Object.freeze(customDocs);
 
   // Default to explicit config.defaultRoles or [rootConcreteRole] (or [] when no roles are defined)
   const rootConcreteRole =
@@ -362,19 +427,86 @@ export function createPermissionPolicy<TRole extends string = string, TCapabilit
     return hasCapability(actor, userRule.assignRoles, false);
   }
 
+  function isStaff(actor: PolicySubject<TRole, TCapability> | null | undefined, isSystemAdmin = false): boolean {
+    if (isSystemAdmin) return true;
+    if (!staffCapability) return false;
+    return hasCapability(actor, staffCapability, false);
+  }
+
+  function canReadTier(
+    actor: PolicySubject<TRole, TCapability> | null | undefined,
+    tier: LanyardTier,
+    options: { isSystemAdmin?: boolean; isSelf?: boolean; isGlobal?: boolean; isScopeMember?: boolean } = {}
+  ): boolean {
+    const { isSystemAdmin = false, isSelf = false, isGlobal = false, isScopeMember = false } = options;
+    switch (tier) {
+      case "card":
+        if (isSystemAdmin || isSelf) return true;
+        if (isGlobal) return canReadUser(actor);
+        if (cardVisibility === "members") return isScopeMember;
+        if (cardVisibility === "staff") return isStaff(actor);
+        return hasCapability(actor, cardVisibility.capability, false);
+      case "preferences":
+        return isSystemAdmin || isSelf;
+      case "attributes":
+        return isSystemAdmin || isSelf || isStaff(actor);
+      case "hiddenAttributes":
+        return isStaff(actor, isSystemAdmin);
+      case "secrets":
+        return false;
+      default:
+        return false;
+    }
+  }
+
+  function isCardAttribute(key: string): boolean {
+    return isSafeKey(key) && cardAttributeSet.has(key);
+  }
+
+  function evaluateCustomDocRule(
+    actor: PolicySubject<TRole, TCapability> | null | undefined,
+    rule: Readonly<CustomDocAccessRule<TCapability>>,
+    isSystemAdmin: boolean,
+    isSelf: boolean
+  ): boolean {
+    if (isSystemAdmin) return true;
+    if (rule.self && isSelf) return true;
+    if (rule.staff && isStaff(actor)) return true;
+    if (rule.capability && hasCapability(actor, rule.capability, false)) return true;
+    return false;
+  }
+
+  function canReadCustomDoc(
+    actor: PolicySubject<TRole, TCapability> | null | undefined,
+    name: string,
+    options: { isSystemAdmin?: boolean; isSelf?: boolean } = {}
+  ): boolean {
+    if (!isSafeKey(name) || !Object.hasOwn(customDocs, name)) return false;
+    return evaluateCustomDocRule(actor, customDocs[name].read, Boolean(options.isSystemAdmin), Boolean(options.isSelf));
+  }
+
+  function canWriteCustomDoc(
+    actor: PolicySubject<TRole, TCapability> | null | undefined,
+    name: string,
+    options: { isSystemAdmin?: boolean; isSelf?: boolean } = {}
+  ): boolean {
+    if (!isSafeKey(name) || !Object.hasOwn(customDocs, name)) return false;
+    return evaluateCustomDocRule(
+      actor,
+      customDocs[name].write,
+      Boolean(options.isSystemAdmin),
+      Boolean(options.isSelf)
+    );
+  }
+
   function canReadAttribute(
     actor: PolicySubject<TRole, TCapability> | null | undefined,
     key: string,
-    options: { isSystemAdmin?: boolean; isSelf?: boolean } = {}
+    options: { isSystemAdmin?: boolean; isSelf?: boolean; canReadCard?: boolean } = {}
   ): boolean {
     if (!isSafeKey(key)) return false;
-    const { isSystemAdmin = false, isSelf = false } = options;
-    if (isSystemAdmin || isSelf) return true;
-    const rule = Object.hasOwn(attrRules, key) ? attrRules[key] : undefined;
-    if (rule?.read) {
-      return hasCapability(actor, rule.read, false);
-    }
-    return true;
+    if (canReadTier(actor, "attributes", options)) return true;
+    return Boolean(options.canReadCard) && cardAttributeSet.has(key);
   }
 
   function canWriteAttribute(
@@ -416,10 +548,7 @@ export function createPermissionPolicy<TRole extends string = string, TCapabilit
     isSystemAdmin = false
   ): boolean {
     if (!isSafeKey(key)) return false;
-    if (isSystemAdmin) return true;
-    const rule = Object.hasOwn(hiddenAttrRules, key) ? hiddenAttrRules[key] : undefined;
-    if (!rule?.read) return false;
-    return hasCapability(actor, rule.read, false);
+    return canReadTier(actor, "hiddenAttributes", { isSystemAdmin });
   }
 
   function canWriteHiddenAttribute(
@@ -481,7 +610,7 @@ export function createPermissionPolicy<TRole extends string = string, TCapabilit
   function filterReadableAttributes<TAttributes extends Record<string, any>>(
     actor: PolicySubject<TRole, TCapability> | null | undefined,
     attributes: Partial<TAttributes> | null | undefined,
-    options: { isSystemAdmin?: boolean; isSelf?: boolean } = {}
+    options: { isSystemAdmin?: boolean; isSelf?: boolean; canReadCard?: boolean } = {}
   ): Partial<TAttributes> {
     const result: Record<string, any> = {};
     if (!attributes || typeof attributes !== "object" || Array.isArray(attributes)) {
@@ -518,6 +647,10 @@ export function createPermissionPolicy<TRole extends string = string, TCapabilit
     roleInherits,
     assignableRoles,
     defaultRoles,
+    staffCapability,
+    cardVisibility,
+    cardFields,
+    customDocs,
     isAssignableRole,
     hasRole,
     hasAnyRole,
@@ -529,6 +662,11 @@ export function createPermissionPolicy<TRole extends string = string, TCapabilit
     canReadUser,
     canWriteUser,
     canAssignRoles,
+    isStaff,
+    canReadTier,
+    isCardAttribute,
+    canReadCustomDoc,
+    canWriteCustomDoc,
     canReadAttribute,
     canWriteAttribute,
     canWriteAttributesPatch,

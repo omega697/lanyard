@@ -814,7 +814,8 @@ export function createLanyardServer<
    * Reads a user's record in `GLOBAL_SCOPE` (`users/{targetUid}`) or a specific tenant `scopeId`
    * after verifying the caller (`actor`) is the user themselves, holds the `read` capability
    * in `userCapabilities` within that scope, or is an active system admin.
-   * Automatically filters `attributes` to only keys readable by `actor`.
+   * `attributes` are returned only if `actor` can read the attributes tier (self, scope staff, or system admin);
+   * otherwise only keys placed on the card via `cardFields.attributes` are returned.
    */
   async function getUser(params: {
     scopeId: GlobalScope;
@@ -865,7 +866,8 @@ export function createLanyardServer<
         targetUser.attributes,
         {
           isSystemAdmin: isAdmin,
-          isSelf
+          isSelf,
+          canReadCard: true
         }
       );
       return {
@@ -886,7 +888,8 @@ export function createLanyardServer<
     if (!targetMember) return null;
     const filteredAttributes = policy.filterReadableAttributes<TAttributes>(actorMember, targetMember.attributes, {
       isSystemAdmin: isAdmin,
-      isSelf
+      isSelf,
+      canReadCard: true
     });
     return {
       ...targetMember,
@@ -898,7 +901,8 @@ export function createLanyardServer<
    * Lists all users in `GLOBAL_SCOPE` (`usersCollection`) or all members in a tenant `scopeId`
    * after verifying the caller (`actor`) holds the `read` capability in `userCapabilities`
    * within that scope or is an active system admin.
-   * Automatically filters each user's `attributes` to only keys readable by `actor`.
+   * Each user's `attributes` are returned only if `actor` can read that user's attributes tier
+   * (self, scope staff, or system admin); otherwise only card-placed attribute keys are returned.
    */
   async function listUsers(params: {
     scopeId: GlobalScope;
@@ -938,7 +942,8 @@ export function createLanyardServer<
         const isSelf = u.uid === actorUid;
         const filteredAttributes = policy.filterReadableAttributes<TAttributes>(actorGlobalRecord, u.attributes, {
           isSystemAdmin: isAdmin,
-          isSelf
+          isSelf,
+          canReadCard: true
         });
         return {
           ...u,
@@ -959,7 +964,8 @@ export function createLanyardServer<
       const isSelf = Boolean(actorMember && m.uid === actorUid);
       const filteredAttributes = policy.filterReadableAttributes<TAttributes>(actorMember, m.attributes, {
         isSystemAdmin: isAdmin,
-        isSelf
+        isSelf,
+        canReadCard: true
       });
       return {
         ...m,
@@ -1284,8 +1290,9 @@ export function createLanyardServer<
   // --- Capability-Gated Attributes & Secrets Operations ---
 
   /**
-   * Reads a user's `attributes` in `GLOBAL_SCOPE` (`users/{targetUid}`) or a specific tenant `scopeId`,
-   * filtering out any keys the caller (`actor`) is not permitted to read in that exact `scopeId`.
+   * Reads a user's `attributes` in `GLOBAL_SCOPE` (`users/{targetUid}`) or a specific tenant `scopeId`.
+   * The whole attributes tier is returned to the user themselves, scope staff (`staffCapability`), and system admins;
+   * other callers receive only keys placed on the card via `cardFields.attributes`.
    */
   async function readUserAttributes(params: {
     scopeId: ScopeId;
@@ -1303,9 +1310,11 @@ export function createLanyardServer<
         throw new Error("Backing store does not implement getUser");
       }
       const targetUser = await store.getUser(params.targetUid);
+      const isSelf = actorUid === params.targetUid;
       return policy.filterReadableAttributes<TAttributes>(actorGlobalRecord, targetUser?.attributes, {
         isSystemAdmin: isAdmin,
-        isSelf: actorUid === params.targetUid
+        isSelf,
+        canReadCard: policy.canReadTier(actorGlobalRecord, "card", { isSystemAdmin: isAdmin, isSelf, isGlobal: true })
       });
     }
 
@@ -1314,9 +1323,15 @@ export function createLanyardServer<
       throw new Error(`Forbidden: Caller is not a member of scope '${params.scopeId}'`);
     }
     const targetMember = await store.getScopeMember(params.scopeId, params.targetUid);
+    const isSelf = Boolean(actorMember && actorUid === params.targetUid);
     return policy.filterReadableAttributes<TAttributes>(actorMember, targetMember?.attributes, {
       isSystemAdmin: isAdmin,
-      isSelf: Boolean(actorMember && actorUid === params.targetUid)
+      isSelf,
+      canReadCard: policy.canReadTier(actorMember, "card", {
+        isSystemAdmin: isAdmin,
+        isSelf,
+        isScopeMember: Boolean(actorMember)
+      })
     });
   }
 
@@ -1384,8 +1399,8 @@ export function createLanyardServer<
 
   /**
    * Reads a user's `hiddenAttributes` in `GLOBAL_SCOPE` (`users/{targetUid}/private/hiddenAttributes`)
-   * or a specific tenant `scopeId`, returning only keys the caller (`actor`) holds the required `read`
-   * capability for in that scope (or all keys if `isSystemAdmin`).
+   * or a specific tenant `scopeId`. The whole hiddenAttributes tier is returned to scope staff
+   * (`staffCapability`) and system admins; other callers get a `Forbidden` error when the tier contains data.
    * Self-ownership (`actor.uid === targetUid`) never grants read access to `hiddenAttributes`.
    */
   async function readUserHiddenAttributes(params: {

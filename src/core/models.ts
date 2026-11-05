@@ -69,16 +69,74 @@ export type UserCapabilitiesRule<TCapability extends string = string> =
     };
 
 /**
- * Specifies the required capability for reading and/or writing a specific `attributes` or `hiddenAttributes` field.
- * If a string `TCapability` is passed directly, it is treated as `{ write: capability }` for `attributes`,
- * or `{ read: capability, write: capability }` for `hiddenAttributes`.
+ * Specifies the required capability for writing a specific `attributes` or `hiddenAttributes` key.
+ * If a string `TCapability` is passed directly, it is treated as `{ write: capability }`.
+ *
+ * Reads are NOT configured per key: Firestore security rules grant or deny whole documents,
+ * so read access is defined per storage tier (see `LanyardTier` and `PermissionPolicyConfig.staffCapability`).
  */
 export type FieldCapabilityRule<TCapability extends string = string> =
   | TCapability
   | {
-      read?: TCapability;
       write?: TCapability;
     };
+
+/**
+ * Storage tiers for user/member data. Each tier is stored in its own Firestore document so that
+ * read access (which Firestore enforces per document) matches the tier's audience:
+ *
+ * - `card`: the main `users/{uid}` / `members/{uid}` document. Readable by anyone allowed to know the user exists.
+ * - `preferences`: readable/writable only by the user themselves (and system admins).
+ * - `attributes`: readable by the user themselves and scope staff; writable by staff/server per key.
+ * - `hiddenAttributes`: readable/writable only by scope staff (and system admins).
+ * - `secrets`: never readable by any client; write-only encrypted values decrypted on the server.
+ */
+export type LanyardTier = "card" | "preferences" | "attributes" | "hiddenAttributes" | "secrets";
+
+/**
+ * Who can read the `card` tier of a scoped member (`{scope}/{scopeId}/members/{uid}`):
+ * - `"members"` (default): any member of the same scope.
+ * - `"staff"`: only scope staff (holders of `staffCapability`).
+ * - `{ capability }`: only holders of the given capability in the scope.
+ *
+ * The member themselves and system admins can always read their own card.
+ * The global card (`users/{uid}`) is always governed by `userCapabilities.read` (default: self + system admins).
+ */
+export type CardVisibilityRule<TCapability extends string = string> = "members" | "staff" | { capability: TCapability };
+
+/**
+ * Fields stored on the `card` instead of their default private tier (opt-in exposure).
+ * A field always lives in exactly one location: placing it on the card moves it (it is never copied).
+ */
+export interface CardFieldsConfig {
+  /** Store `email` on the card instead of the `attributes` tier (default: `false`). */
+  email?: boolean;
+  /** `attributes` keys stored on the card instead of the `attributes` tier (default: none). */
+  attributes?: readonly string[];
+}
+
+/**
+ * Access rule for one side (read or write) of an app-defined custom document (`…/{uid}/{name}/data`).
+ * Access is granted if any listed condition matches; system admins always have access.
+ * An empty rule (`{}`) means system admins and trusted server code only.
+ */
+export interface CustomDocAccessRule<TCapability extends string = string> {
+  /** The user/member the document belongs to. */
+  self?: boolean;
+  /** Scope staff (holders of `staffCapability`). */
+  staff?: boolean;
+  /** Holders of a specific capability in the scope. */
+  capability?: TCapability;
+}
+
+/**
+ * Definition of an app-defined custom private document (escape hatch for audiences that the built-in tiers
+ * don't cover, e.g. "readable by roles holding `view_shift_notes`").
+ */
+export interface CustomDocDefinition<TCapability extends string = string> {
+  read: CustomDocAccessRule<TCapability>;
+  write: CustomDocAccessRule<TCapability>;
+}
 
 /**
  * Specifies who is allowed to set or clear a write-only encrypted secret field (e.g., an API key or OAuth token).
@@ -135,13 +193,28 @@ export interface PermissionPolicyConfig<TRole extends string = string, TCapabili
    */
   userCapabilities?: UserCapabilitiesRule<TCapability>;
   /**
-   * Optional capability rules governing who can read or write specific keys in `attributes`
-   * (beyond global system admins). `self` can always read their own `attributes`.
+   * Capability identifying "scope staff": holders can read members' `attributes` and `hiddenAttributes` tiers
+   * within the scope (or, for `GLOBAL_SCOPE`, users' tiers via their global roles). System admins are always staff.
+   * If omitted, only system admins count as staff.
+   */
+  staffCapability?: TCapability;
+  /**
+   * Who can read scoped member cards (`{scope}/{scopeId}/members/{uid}`). Defaults to `"members"`.
+   */
+  cardVisibility?: CardVisibilityRule<TCapability>;
+  /**
+   * Fields stored on the card instead of their default private tier (opt-in exposure; moved, never copied).
+   */
+  cardFields?: CardFieldsConfig;
+  /**
+   * Optional per-key WRITE capability rules for `attributes` (beyond global system admins).
+   * Reads are governed by the `attributes` tier: the user themselves, scope staff, and system admins
+   * (plus card readers for keys listed in `cardFields.attributes`).
    */
   attributeCapabilities?: Record<string, FieldCapabilityRule<TCapability>>;
   /**
-   * Optional capability rules governing who can read or write specific keys in `hiddenAttributes`
-   * (properties about a user that are hidden from the user and only readable/writable by authorized roles or system admins).
+   * Optional per-key WRITE capability rules for `hiddenAttributes` (properties about a user that are hidden
+   * from the user). Reads are governed by the `hiddenAttributes` tier: scope staff and system admins only.
    */
   hiddenAttributeCapabilities?: Record<string, FieldCapabilityRule<TCapability>>;
   /**
@@ -150,6 +223,11 @@ export interface PermissionPolicyConfig<TRole extends string = string, TCapabili
    * is allowed to set/clear their own secret by default.
    */
   secretCapabilities?: Record<string, SecretCapabilityRule<TCapability>>;
+  /**
+   * App-defined custom private documents (`…/{uid}/{name}/data`) with their own read/write audiences.
+   * Names must not collide with built-in tier names.
+   */
+  customDocs?: Record<string, CustomDocDefinition<TCapability>>;
 }
 
 /**
@@ -171,6 +249,14 @@ export interface PermissionPolicy<TRole extends string = string, TCapability ext
   readonly roleInherits: Readonly<Record<TRole, readonly TRole[]>>;
   readonly assignableRoles: readonly TRole[];
   readonly defaultRoles: readonly TRole[];
+  /** Capability identifying scope staff (`undefined` means only system admins are staff). */
+  readonly staffCapability: TCapability | undefined;
+  /** Normalized scoped card visibility rule (defaults to `"members"`). */
+  readonly cardVisibility: CardVisibilityRule<TCapability>;
+  /** Normalized card field placement (`email` defaults to `false`, `attributes` to `[]`). */
+  readonly cardFields: Readonly<{ email: boolean; attributes: readonly string[] }>;
+  /** Normalized app-defined custom private documents. */
+  readonly customDocs: Readonly<Record<string, Readonly<CustomDocDefinition<TCapability>>>>;
 
   /**
    * Returns `true` if `role` is defined in `policy.roles` and is concrete (`!roleDef.abstract`).
@@ -261,14 +347,60 @@ export interface PermissionPolicy<TRole extends string = string, TCapability ext
   canAssignRoles(actor: PolicySubject<TRole, TCapability> | null | undefined, isSystemAdmin?: boolean): boolean;
 
   /**
+   * Evaluates whether `actor` counts as scope staff: system admins, or holders of `staffCapability`.
+   */
+  isStaff(actor: PolicySubject<TRole, TCapability> | null | undefined, isSystemAdmin?: boolean): boolean;
+
+  /**
+   * Evaluates whether the caller can read a storage tier of a user/member record.
+   *
+   * - `card`: self, system admins, and, for the global card, `userCapabilities.read` holders;
+   *   for scoped cards, the audience configured by `cardVisibility` (`isScopeMember` is required for `"members"`).
+   * - `preferences`: self and system admins.
+   * - `attributes`: self, scope staff, and system admins.
+   * - `hiddenAttributes`: scope staff and system admins.
+   * - `secrets`: never (write-only; decrypted only by trusted server code).
+   */
+  canReadTier(
+    actor: PolicySubject<TRole, TCapability> | null | undefined,
+    tier: LanyardTier,
+    options?: { isSystemAdmin?: boolean; isSelf?: boolean; isGlobal?: boolean; isScopeMember?: boolean }
+  ): boolean;
+
+  /**
+   * Returns `true` if `key` is an `attributes` key placed on the card via `cardFields.attributes`.
+   */
+  isCardAttribute(key: string): boolean;
+
+  /**
+   * Evaluates whether the caller can read an app-defined custom document (`customDocs[name].read`).
+   * Returns `false` for unknown custom document names.
+   */
+  canReadCustomDoc(
+    actor: PolicySubject<TRole, TCapability> | null | undefined,
+    name: string,
+    options?: { isSystemAdmin?: boolean; isSelf?: boolean }
+  ): boolean;
+
+  /**
+   * Evaluates whether the caller can write an app-defined custom document (`customDocs[name].write`).
+   * Returns `false` for unknown custom document names.
+   */
+  canWriteCustomDoc(
+    actor: PolicySubject<TRole, TCapability> | null | undefined,
+    name: string,
+    options?: { isSystemAdmin?: boolean; isSelf?: boolean }
+  ): boolean;
+
+  /**
    * Evaluates whether the caller can read a specific `attributes` key.
-   * By default, `isSelf = true` or `isSystemAdmin = true` can read attributes, unless a `read` capability
-   * is configured for `key` and the non-self/non-admin caller lacks that capability.
+   * Keys in the `attributes` tier are readable by self, scope staff, and system admins.
+   * Keys placed on the card (`cardFields.attributes`) are additionally readable when `canReadCard` is `true`.
    */
   canReadAttribute(
     actor: PolicySubject<TRole, TCapability> | null | undefined,
     key: string,
-    options?: { isSystemAdmin?: boolean; isSelf?: boolean }
+    options?: { isSystemAdmin?: boolean; isSelf?: boolean; canReadCard?: boolean }
   ): boolean;
 
   /**
@@ -294,8 +426,8 @@ export interface PermissionPolicy<TRole extends string = string, TCapability ext
 
   /**
    * Evaluates whether the caller can read a specific `hiddenAttributes` key.
-   * `self` NEVER grants read access to `hiddenAttributes`. Only `isSystemAdmin = true` or an actor holding
-   * the configured `read` capability for `key` in `hiddenAttributeCapabilities` is permitted.
+   * `self` NEVER grants read access to `hiddenAttributes`. Only scope staff (holders of `staffCapability`)
+   * and system admins can read the `hiddenAttributes` tier.
    */
   canReadHiddenAttribute(
     actor: PolicySubject<TRole, TCapability> | null | undefined,
@@ -348,7 +480,7 @@ export interface PermissionPolicy<TRole extends string = string, TCapability ext
   filterReadableAttributes<TAttributes extends Record<string, any>>(
     actor: PolicySubject<TRole, TCapability> | null | undefined,
     attributes: Partial<TAttributes> | null | undefined,
-    options?: { isSystemAdmin?: boolean; isSelf?: boolean }
+    options?: { isSystemAdmin?: boolean; isSelf?: boolean; canReadCard?: boolean }
   ): Partial<TAttributes>;
 
   /**
