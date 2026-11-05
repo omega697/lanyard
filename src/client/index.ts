@@ -223,20 +223,67 @@ export function createLanyardClient<
 
   const preferencesStoreInternal = createWritableStore<TPreferences>(loadCachedPreferences());
 
-  let unsubUserOrPrefs: (() => void) | null = null;
+  let unsubUser: (() => void) | null = null;
+  let unsubPrefs: (() => void) | null = null;
   let unsubMemberships: (() => void) | null = null;
   let unsubAuth: (() => void) | null = null;
   let authGeneration = 0;
 
+  // Scoped preferences live in their own self-only tier documents, so they're tracked per scope and
+  // merged onto the membership objects published by `membershipsStore`.
+  let latestMemberships: ScopedMember<TRole, TCapability, TPreferences, TAttributes>[] = [];
+  const scopePreferences = new Map<string, Partial<TPreferences>>();
+  const scopePreferenceUnsubs = new Map<string, () => void>();
+
+  function publishMemberships(isLoading: boolean): void {
+    membershipsStoreInternal.set({
+      memberships: latestMemberships.map((m) => {
+        const prefs = m.scopeId ? scopePreferences.get(m.scopeId) : undefined;
+        return prefs ? { ...m, preferences: { ...prefs } } : m;
+      }),
+      isLoading
+    });
+  }
+
+  /** Opens a preferences listener for each new membership scope and closes listeners for scopes the user left. */
+  function syncScopePreferenceSubscriptions(uid: string): void {
+    const activeScopeIds = new Set(latestMemberships.map((m) => m.scopeId).filter((id): id is string => Boolean(id)));
+    for (const [scopeId, unsub] of scopePreferenceUnsubs) {
+      if (activeScopeIds.has(scopeId)) continue;
+      unsub();
+      scopePreferenceUnsubs.delete(scopeId);
+      scopePreferences.delete(scopeId);
+    }
+    if (typeof store.subscribeToScopePreferences !== "function") return;
+    for (const scopeId of activeScopeIds) {
+      if (scopePreferenceUnsubs.has(scopeId)) continue;
+      scopePreferenceUnsubs.set(
+        scopeId,
+        store.subscribeToScopePreferences(scopeId, uid, (prefs) => {
+          scopePreferences.set(scopeId, sanitizePreferencesObject<TPreferences>(prefs));
+          publishMemberships(membershipsStoreInternal.get().isLoading);
+        })
+      );
+    }
+  }
+
   function cleanupUserSubscriptions(): void {
-    if (unsubUserOrPrefs) {
-      unsubUserOrPrefs();
-      unsubUserOrPrefs = null;
+    if (unsubUser) {
+      unsubUser();
+      unsubUser = null;
+    }
+    if (unsubPrefs) {
+      unsubPrefs();
+      unsubPrefs = null;
     }
     if (unsubMemberships) {
       unsubMemberships();
       unsubMemberships = null;
     }
+    scopePreferenceUnsubs.forEach((unsub) => unsub());
+    scopePreferenceUnsubs.clear();
+    scopePreferences.clear();
+    latestMemberships = [];
   }
 
   function applyRemotePreferences(remotePrefs: Partial<TPreferences> | undefined): void {
@@ -293,10 +340,9 @@ export function createLanyardClient<
     }
 
     if (typeof store.subscribeToUser === "function") {
-      unsubUserOrPrefs = store.subscribeToUser(user.uid, (record) => {
+      unsubUser = store.subscribeToUser(user.uid, (record) => {
         userRecordStoreInternal.set(record);
         if (record) {
-          applyRemotePreferences(record.preferences);
           attributesStoreInternal.set(sanitizePreferencesObject<TAttributes>(record.attributes || {}));
 
           // If a provisioned global user record exists with a stale/missing photoUrl, sync it once
@@ -382,11 +428,11 @@ export function createLanyardClient<
           attributesStoreInternal.set({});
         }
       });
-    } else {
-      unsubUserOrPrefs = store.subscribeToPreferences(user.uid, (remotePrefs) => {
-        applyRemotePreferences(remotePrefs);
-      });
     }
+
+    unsubPrefs = store.subscribeToPreferences(user.uid, (remotePrefs) => {
+      applyRemotePreferences(remotePrefs);
+    });
 
     unsubMemberships = store.subscribeToUserMemberships(user.uid, (members) => {
       // Smart Avatar Sync: when a pre-provisioned member doc loads with a stale/missing photoUrl,
@@ -413,10 +459,9 @@ export function createLanyardClient<
         return m;
       });
 
-      membershipsStoreInternal.set({
-        memberships: normalizedMembers,
-        isLoading: false
-      });
+      latestMemberships = normalizedMembers;
+      syncScopePreferenceSubscriptions(user.uid);
+      publishMemberships(false);
     });
   }
 
@@ -646,20 +691,8 @@ export function createLanyardClient<
       throw new Error("Invalid scopeId");
     }
 
-    membershipsStoreInternal.update((state) => ({
-      ...state,
-      memberships: state.memberships.map((m) =>
-        m.scopeId === scopeId
-          ? {
-              ...m,
-              preferences: {
-                ...(m.preferences || {}),
-                ...cleanPatch
-              }
-            }
-          : m
-      )
-    }));
+    scopePreferences.set(scopeId, { ...(scopePreferences.get(scopeId) || {}), ...cleanPatch });
+    publishMemberships(membershipsStoreInternal.get().isLoading);
 
     const currentUser = authStoreInternal.get().user;
     if (syncToStore && currentUser?.uid) {

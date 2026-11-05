@@ -94,6 +94,24 @@ export type FieldCapabilityRule<TCapability extends string = string> =
 export type LanyardTier = "card" | "preferences" | "attributes" | "hiddenAttributes" | "secrets";
 
 /**
+ * Field under which Lanyard stamps metadata on every private tier document (`…/{uid}/private/{tier}`).
+ * The metadata identifies the document for collection-group queries and security rules (e.g.
+ * `where("_lanyard.tier", "==", "attributes")`, `resource.data._lanyard.tier`), so this one key can't be
+ * used as a preference/attribute key.
+ */
+export const TIER_METADATA_KEY = "_lanyard";
+
+/** Metadata Lanyard stamps on every private tier document under `TIER_METADATA_KEY`. */
+export interface TierDocMetadata {
+  tier: LanyardTier;
+  uid: string;
+  /** Owning scope, or `null` for global (`users/{uid}`) documents. */
+  scopeId: string | null;
+  /** ISO timestamp of the last write through Lanyard. */
+  updatedAt: string;
+}
+
+/**
  * Who can read the `card` tier of a scoped member (`{scope}/{scopeId}/members/{uid}`):
  * - `"members"` (default): any member of the same scope.
  * - `"staff"`: only scope staff (holders of `staffCapability`).
@@ -674,14 +692,29 @@ export interface LanyardClientStore<
   TPreferences extends Record<string, any> = Record<string, any>,
   TAttributes extends Record<string, any> = Record<string, any>
 > {
-  /** Subscribe to real-time updates for a user's global preferences. Returns an unsubscribe function. */
+  /**
+   * Subscribe to real-time updates for a user's global preferences (the self-only `preferences` tier,
+   * stored separately from the card). Returns an unsubscribe function.
+   */
   subscribeToPreferences(uid: string, onChange: (prefs: Partial<TPreferences>) => void): () => void;
   /** Persist a partial update to a user's global preferences. */
   savePreferences(uid: string, patch: Partial<TPreferences>): Promise<void>;
   /** Optional: Persist a partial update to a user's tenant-scoped preferences within `scopeId`. */
   saveScopePreferences?(scopeId: string, uid: string, patch: Partial<TPreferences>): Promise<void>;
+  /**
+   * Optional: Subscribe to real-time updates for a user's tenant-scoped preferences within `scopeId`
+   * (the self-only `preferences` tier of `{scope}/{scopeId}/members/{uid}`). Returns an unsubscribe function.
+   */
+  subscribeToScopePreferences?(
+    scopeId: string,
+    uid: string,
+    onChange: (prefs: Partial<TPreferences>) => void
+  ): () => void;
 
-  /** Optional: Subscribe to the full global `UserRecord` (`users/{uid}`) including `attributes`, `preferences`, and `roles`. */
+  /**
+   * Optional: Subscribe to the global `UserRecord` card (`users/{uid}`) including `attributes` and `roles`.
+   * Preferences are NOT included; subscribe to them with `subscribeToPreferences`.
+   */
   subscribeToUser?(
     uid: string,
     onChange: (user: UserRecord<TRole, TCapability, TPreferences, TAttributes> | null) => void

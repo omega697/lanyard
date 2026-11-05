@@ -10,6 +10,7 @@ import type {
   UserProfilePatch,
   UserRecord
 } from "./models.js";
+import { assertNoReservedTierKeys } from "./tierDocs.js";
 
 const FORBIDDEN_KEYS = new Set(["__proto__", "constructor", "prototype"]);
 
@@ -31,8 +32,12 @@ function sanitizePatch<T extends Record<string, any>>(patch: Partial<T> | null |
  * for fast, deterministic unit tests without mocking external databases.
  *
  * Uses a unified `users` map (`users/{uid}`) for profile, presence, `isSystemAdmin`,
- * single-tenant `role`/`capabilities`, `preferences`, and `attributes`, plus isolated
- * maps for `userSecrets`, `scopeMembers`, and `scopeMemberSecrets`.
+ * single-tenant `role`/`capabilities`, and `attributes`, plus isolated maps for each private
+ * tier (`userPreferences`, `userHiddenAttributes`, `userSecrets`) and their scoped equivalents.
+ *
+ * Mirrors the Firestore stores' tier layout: client subscriptions to users and members return only
+ * the card (preferences arrive via `subscribeToPreferences`/`subscribeToScopePreferences`), while
+ * server reads (`getUser`, `listUsers`, `getScopeMember`, `listScopeMembers`) merge preferences in.
  */
 export class InMemoryLanyardStore<
   TRole extends string = string,
@@ -48,10 +53,13 @@ export class InMemoryLanyardStore<
 {
   private readonly cipher?: SecretCipher;
   private users = new Map<string, UserRecord<TRole, TCapability, TPreferences, TAttributes>>();
+  private userPreferences = new Map<string, Partial<TPreferences>>();
   private userHiddenAttributes = new Map<string, Partial<THiddenAttributes>>();
   private userSecrets = new Map<string, Record<string, string | EncryptedSecretData>>();
   // scopeId -> (uid -> ScopedMember)
   private scopeMembers = new Map<string, Map<string, ScopedMember<TRole, TCapability, TPreferences, TAttributes>>>();
+  // scopeId -> (uid -> Partial<TPreferences>)
+  private scopeMemberPreferences = new Map<string, Map<string, Partial<TPreferences>>>();
   // scopeId -> (uid -> Partial<THiddenAttributes>)
   private scopeMemberHiddenAttributes = new Map<string, Map<string, Partial<THiddenAttributes>>>();
   // scopeId -> (uid -> Record<string, string | EncryptedSecretData>)
@@ -107,6 +115,8 @@ export class InMemoryLanyardStore<
   }
 
   private prefListeners = new Map<string, Set<(prefs: Partial<TPreferences>) => void>>();
+  // `${scopeId}/${uid}` -> listeners
+  private scopePrefListeners = new Map<string, Set<(prefs: Partial<TPreferences>) => void>>();
   private userListeners = new Map<
     string,
     Set<(user: UserRecord<TRole, TCapability, TPreferences, TAttributes> | null) => void>
@@ -132,43 +142,44 @@ export class InMemoryLanyardStore<
       this.prefListeners.set(uid, new Set());
     }
     this.prefListeners.get(uid)!.add(onChange);
-    const existing = this.users.get(uid);
-    onChange({ ...(existing?.preferences || {}) } as Partial<TPreferences>);
+    onChange({ ...(this.userPreferences.get(uid) || {}) } as Partial<TPreferences>);
 
     return () => {
       this.prefListeners.get(uid)?.delete(onChange);
     };
   }
 
+  subscribeToScopePreferences(
+    scopeId: string,
+    uid: string,
+    onChange: (prefs: Partial<TPreferences>) => void
+  ): () => void {
+    assertValidResourceId(scopeId, "scopeId");
+    assertValidResourceId(uid, "uid");
+    const key = `${scopeId}/${uid}`;
+    if (!this.scopePrefListeners.has(key)) {
+      this.scopePrefListeners.set(key, new Set());
+    }
+    this.scopePrefListeners.get(key)!.add(onChange);
+    onChange({ ...(this.scopeMemberPreferences.get(scopeId)?.get(uid) || {}) } as Partial<TPreferences>);
+
+    return () => {
+      this.scopePrefListeners.get(key)?.delete(onChange);
+    };
+  }
+
   async savePreferences(uid: string, patch: Partial<TPreferences>): Promise<void> {
     assertValidResourceId(uid, "uid");
-    const existing = this.users.get(uid);
-    const currentPrefs = existing?.preferences || {};
-    const updatedPrefs = { ...currentPrefs, ...sanitizePatch(patch) };
-    const updatedUser: UserRecord<TRole, TCapability, TPreferences, TAttributes> = {
-      ...(existing || { uid, email: "" }),
-      uid,
-      preferences: updatedPrefs
-    };
-    this.users.set(uid, updatedUser);
-    this.notifyUserAndPrefListeners(uid);
+    this.mergeUserPreferences(uid, patch);
   }
 
   async saveScopePreferences(scopeId: string, uid: string, patch: Partial<TPreferences>): Promise<void> {
     assertValidResourceId(scopeId, "scopeId");
     assertValidResourceId(uid, "uid");
-    const existing = await this.getScopeMember(scopeId, uid);
-    if (!existing) {
+    if (!this.scopeMembers.get(scopeId)?.has(uid)) {
       throw new Error(`Member '${uid}' does not exist in scope '${scopeId}'.`);
     }
-    const updated: ScopedMember<TRole, TCapability, TPreferences, TAttributes> = {
-      ...existing,
-      preferences: {
-        ...(existing.preferences || {}),
-        ...sanitizePatch(patch)
-      }
-    };
-    await this.upsertScopeMember(scopeId, updated);
+    this.mergeScopeMemberPreferences(scopeId, uid, patch);
   }
 
   subscribeToUser(
@@ -215,7 +226,7 @@ export class InMemoryLanyardStore<
     if (patch.photoUrl !== undefined) next.photoUrl = sanitizeAvatarUrl(patch.photoUrl);
     next.updatedAt = new Date().toISOString();
     this.users.set(uid, next);
-    this.notifyUserAndPrefListeners(uid);
+    this.notifyUserListeners(uid);
   }
 
   async updateScopeMemberProfile(scopeId: string, uid: string, patch: UserProfilePatch): Promise<void> {
@@ -341,27 +352,34 @@ export class InMemoryLanyardStore<
 
   async getUser(uid: string): Promise<UserRecord<TRole, TCapability, TPreferences, TAttributes> | null> {
     assertValidResourceId(uid, "uid");
-    return this.cloneUser(this.users.get(uid) || null);
+    const user = this.users.get(uid);
+    return user ? this.withUserPreferences(user) : null;
   }
 
   async listUsers(): Promise<UserRecord<TRole, TCapability, TPreferences, TAttributes>[]> {
-    return Array.from(this.users.values()).map((u) => this.cloneUser(u)!);
+    return Array.from(this.users.values()).map((u) => this.withUserPreferences(u));
   }
 
   async deleteUser(uid: string): Promise<void> {
     assertValidResourceId(uid, "uid");
     this.users.delete(uid);
+    this.userPreferences.delete(uid);
     this.userHiddenAttributes.delete(uid);
     this.userSecrets.delete(uid);
-    this.notifyUserAndPrefListeners(uid);
+    this.notifyUserListeners(uid);
+    this.notifyPreferenceListeners(uid);
   }
 
   async upsertUser(user: UserRecord<TRole, TCapability, TPreferences, TAttributes>): Promise<void> {
     assertValidResourceId(user.uid, "uid");
+    const { preferences, ...card } = user;
+    if (preferences !== undefined) {
+      this.mergeUserPreferences(user.uid, preferences);
+    }
     const existing = this.users.get(user.uid);
     const merged: UserRecord<TRole, TCapability, TPreferences, TAttributes> = {
       ...(existing || {}),
-      ...user,
+      ...card,
       uid: user.uid,
       ...(user.photoUrl !== undefined
         ? { photoUrl: sanitizeAvatarUrl(user.photoUrl) }
@@ -373,11 +391,6 @@ export class InMemoryLanyardStore<
         : existing?.roles !== undefined
           ? { roles: [...existing.roles] }
           : {}),
-      ...(user.preferences !== undefined
-        ? { preferences: { ...(existing?.preferences || {}), ...sanitizePatch(user.preferences) } }
-        : existing?.preferences !== undefined
-          ? { preferences: { ...existing.preferences } }
-          : {}),
       ...(user.attributes !== undefined
         ? { attributes: { ...(existing?.attributes || {}), ...sanitizePatch(user.attributes) } }
         : existing?.attributes !== undefined
@@ -385,7 +398,7 @@ export class InMemoryLanyardStore<
           : {})
     };
     this.users.set(user.uid, merged);
-    this.notifyUserAndPrefListeners(user.uid);
+    this.notifyUserListeners(user.uid);
   }
 
   async updateUserAttributes(
@@ -405,8 +418,8 @@ export class InMemoryLanyardStore<
       updatedAt: new Date().toISOString()
     };
     this.users.set(uid, updated);
-    this.notifyUserAndPrefListeners(uid);
-    return this.cloneUser(updated)!;
+    this.notifyUserListeners(uid);
+    return this.withUserPreferences(updated);
   }
 
   async getUserHiddenAttributes(uid: string): Promise<Partial<THiddenAttributes>> {
@@ -523,7 +536,7 @@ export class InMemoryLanyardStore<
       isSystemAdmin: false,
       updatedAt: new Date().toISOString()
     });
-    this.notifyUserAndPrefListeners(uid);
+    this.notifyUserListeners(uid);
   }
 
   // --- Server Store Methods: Scoped Members ---
@@ -535,12 +548,14 @@ export class InMemoryLanyardStore<
     assertValidResourceId(scopeId, "scopeId");
     assertValidResourceId(uid, "uid");
     const member = this.scopeMembers.get(scopeId)?.get(uid);
-    return member ? this.cloneMember(member) : null;
+    return member ? this.withMemberPreferences(scopeId, member) : null;
   }
 
   async listScopeMembers(scopeId: string): Promise<ScopedMember<TRole, TCapability, TPreferences, TAttributes>[]> {
     assertValidResourceId(scopeId, "scopeId");
-    return this.getMembersForScopeSync(scopeId);
+    return Array.from(this.scopeMembers.get(scopeId)?.values() || []).map((m) =>
+      this.withMemberPreferences(scopeId, m)
+    );
   }
 
   async upsertScopeMember(
@@ -549,27 +564,26 @@ export class InMemoryLanyardStore<
   ): Promise<void> {
     assertValidResourceId(scopeId, "scopeId");
     assertValidResourceId(member.uid, "uid");
+    const { preferences, ...card } = member;
+    if (preferences !== undefined) {
+      this.mergeScopeMemberPreferences(scopeId, member.uid, preferences);
+    }
     if (!this.scopeMembers.has(scopeId)) {
       this.scopeMembers.set(scopeId, new Map());
     }
     const existing = this.scopeMembers.get(scopeId)!.get(member.uid);
     const normalized: ScopedMember<TRole, TCapability, TPreferences, TAttributes> = {
       ...(existing || {}),
-      ...member,
-      ...(member.photoUrl !== undefined
-        ? { photoUrl: sanitizeAvatarUrl(member.photoUrl) }
+      ...card,
+      ...(card.photoUrl !== undefined
+        ? { photoUrl: sanitizeAvatarUrl(card.photoUrl) }
         : existing?.photoUrl !== undefined
           ? { photoUrl: existing.photoUrl }
           : {}),
       scopeId,
-      roles: Array.from(new Set(member.roles || [])),
-      ...(member.preferences !== undefined
-        ? { preferences: { ...(existing?.preferences || {}), ...sanitizePatch(member.preferences) } }
-        : existing?.preferences !== undefined
-          ? { preferences: { ...existing.preferences } }
-          : {}),
-      ...(member.attributes !== undefined
-        ? { attributes: { ...(existing?.attributes || {}), ...sanitizePatch(member.attributes) } }
+      roles: Array.from(new Set(card.roles || [])),
+      ...(card.attributes !== undefined
+        ? { attributes: { ...(existing?.attributes || {}), ...sanitizePatch(card.attributes) } }
         : existing?.attributes !== undefined
           ? { attributes: { ...existing.attributes } }
           : {})
@@ -698,9 +712,64 @@ export class InMemoryLanyardStore<
     assertValidResourceId(scopeId, "scopeId");
     assertValidResourceId(uid, "uid");
     this.scopeMembers.get(scopeId)?.delete(uid);
+    this.scopeMemberPreferences.get(scopeId)?.delete(uid);
     this.scopeMemberHiddenAttributes.get(scopeId)?.delete(uid);
     this.scopeMemberSecrets.get(scopeId)?.delete(uid);
     this.notifyMembershipListeners(scopeId, uid);
+    this.notifyScopePreferenceListeners(scopeId, uid);
+  }
+
+  // --- Internal Preferences Tier Helpers ---
+
+  private mergeUserPreferences(uid: string, patch: Partial<TPreferences>): void {
+    const cleanPatch = sanitizePatch(patch);
+    assertNoReservedTierKeys(cleanPatch, "preferences");
+    this.userPreferences.set(uid, { ...(this.userPreferences.get(uid) || {}), ...cleanPatch });
+    this.notifyPreferenceListeners(uid);
+  }
+
+  private mergeScopeMemberPreferences(scopeId: string, uid: string, patch: Partial<TPreferences>): void {
+    const cleanPatch = sanitizePatch(patch);
+    assertNoReservedTierKeys(cleanPatch, "preferences");
+    if (!this.scopeMemberPreferences.has(scopeId)) {
+      this.scopeMemberPreferences.set(scopeId, new Map());
+    }
+    const scoped = this.scopeMemberPreferences.get(scopeId)!;
+    scoped.set(uid, { ...(scoped.get(uid) || {}), ...cleanPatch });
+    this.notifyScopePreferenceListeners(scopeId, uid);
+  }
+
+  private withUserPreferences(
+    user: UserRecord<TRole, TCapability, TPreferences, TAttributes>
+  ): UserRecord<TRole, TCapability, TPreferences, TAttributes> {
+    const preferences = this.userPreferences.get(user.uid);
+    return { ...this.cloneUser(user)!, ...(preferences ? { preferences: { ...preferences } } : {}) };
+  }
+
+  private withMemberPreferences(
+    scopeId: string,
+    member: ScopedMember<TRole, TCapability, TPreferences, TAttributes>
+  ): ScopedMember<TRole, TCapability, TPreferences, TAttributes> {
+    const preferences = this.scopeMemberPreferences.get(scopeId)?.get(member.uid);
+    return { ...this.cloneMember(member), ...(preferences ? { preferences: { ...preferences } } : {}) };
+  }
+
+  private notifyPreferenceListeners(uid: string): void {
+    const callbacks = this.prefListeners.get(uid);
+    if (!callbacks) return;
+    const snapshot = { ...(this.userPreferences.get(uid) || {}) } as Partial<TPreferences>;
+    for (const cb of callbacks) {
+      cb(snapshot);
+    }
+  }
+
+  private notifyScopePreferenceListeners(scopeId: string, uid: string): void {
+    const callbacks = this.scopePrefListeners.get(`${scopeId}/${uid}`);
+    if (!callbacks) return;
+    const snapshot = { ...(this.scopeMemberPreferences.get(scopeId)?.get(uid) || {}) } as Partial<TPreferences>;
+    for (const cb of callbacks) {
+      cb(snapshot);
+    }
   }
 
   // --- Internal Notification & Clone Helpers ---
@@ -728,7 +797,6 @@ export class InMemoryLanyardStore<
     return {
       ...user,
       ...(user.roles ? { roles: [...user.roles] } : {}),
-      ...(user.preferences ? { preferences: { ...user.preferences } } : {}),
       ...(user.attributes ? { attributes: { ...user.attributes } } : {})
     };
   }
@@ -739,7 +807,6 @@ export class InMemoryLanyardStore<
     return {
       ...member,
       roles: [...member.roles],
-      ...(member.preferences ? { preferences: { ...member.preferences } } : {}),
       ...(member.attributes ? { attributes: { ...member.attributes } } : {})
     };
   }
@@ -772,15 +839,8 @@ export class InMemoryLanyardStore<
     return filtered.map((u) => this.cloneUser(u)!);
   }
 
-  private notifyUserAndPrefListeners(uid: string): void {
+  private notifyUserListeners(uid: string): void {
     const user = this.users.get(uid) || null;
-    const prefCallbacks = this.prefListeners.get(uid);
-    if (prefCallbacks) {
-      const snapshot = { ...(user?.preferences || {}) } as Partial<TPreferences>;
-      for (const cb of prefCallbacks) {
-        cb(snapshot);
-      }
-    }
     const userCallbacks = this.userListeners.get(uid);
     if (userCallbacks) {
       for (const cb of userCallbacks) {

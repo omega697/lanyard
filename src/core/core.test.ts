@@ -466,6 +466,91 @@ describe("lanyard/core unit tests", () => {
       expect(updated?.lastSeen).toBe("2026-10-19T12:00:00.000Z");
     });
 
+    it("stores preferences in a separate tier: card subscriptions omit them, server reads merge them, and deletes clear them", async () => {
+      type Prefs = { theme: string; compact: boolean };
+      const store = new InMemoryLanyardStore<TestRole, TestCapability, Prefs>();
+      await store.upsertUser({
+        uid: "u-1",
+        email: "u1@example.com",
+        roles: ["member"],
+        preferences: { theme: "dark" }
+      });
+      await store.upsertScopeMember("ws-1", { uid: "u-1", email: "u1@example.com", roles: ["member"] });
+      await store.saveScopePreferences("ws-1", "u-1", { compact: true });
+
+      // Client-facing card subscriptions never include preferences
+      const userEvents: any[] = [];
+      const directoryEvents: any[][] = [];
+      const membershipEvents: any[][] = [];
+      const rosterEvents: any[][] = [];
+      const unsubs = [
+        store.subscribeToUser("u-1", (u) => userEvents.push(u)),
+        store.subscribeToUsers((users) => directoryEvents.push(users)),
+        store.subscribeToUserMemberships("u-1", (m) => membershipEvents.push(m)),
+        store.subscribeToScopeMembers("ws-1", (m) => rosterEvents.push(m))
+      ];
+      expect(userEvents.at(-1)).not.toHaveProperty("preferences");
+      expect(directoryEvents.at(-1)?.[0]).not.toHaveProperty("preferences");
+      expect(membershipEvents.at(-1)?.[0]).not.toHaveProperty("preferences");
+      expect(rosterEvents.at(-1)?.[0]).not.toHaveProperty("preferences");
+
+      // Server reads merge the preferences tier back in
+      expect((await store.getUser("u-1"))?.preferences).toEqual({ theme: "dark" });
+      expect((await store.listUsers())[0].preferences).toEqual({ theme: "dark" });
+      expect((await store.getScopeMember("ws-1", "u-1"))?.preferences).toEqual({ compact: true });
+      expect((await store.listScopeMembers("ws-1"))[0].preferences).toEqual({ compact: true });
+
+      // Preference writes notify only preference listeners, not card listeners
+      const globalPrefEvents: Partial<Prefs>[] = [];
+      const scopePrefEvents: Partial<Prefs>[] = [];
+      unsubs.push(store.subscribeToPreferences("u-1", (p) => globalPrefEvents.push(p)));
+      unsubs.push(store.subscribeToScopePreferences("ws-1", "u-1", (p) => scopePrefEvents.push(p)));
+      const userEventCount = userEvents.length;
+      const rosterEventCount = rosterEvents.length;
+      await store.savePreferences("u-1", { compact: false });
+      await store.saveScopePreferences("ws-1", "u-1", { theme: "light" });
+      expect(globalPrefEvents).toEqual([{ theme: "dark" }, { theme: "dark", compact: false }]);
+      expect(scopePrefEvents).toEqual([{ compact: true }, { compact: true, theme: "light" }]);
+      expect(userEvents).toHaveLength(userEventCount);
+      expect(rosterEvents).toHaveLength(rosterEventCount);
+
+      // Upserting a card without preferences keeps the existing preferences
+      await store.upsertUser({ uid: "u-1", email: "u1@example.com", firstName: "Uno" });
+      expect((await store.getUser("u-1"))?.preferences).toEqual({ theme: "dark", compact: false });
+
+      // The reserved tier metadata key is rejected on every write path and nothing is written
+      for (const key of ["_lanyard"]) {
+        const bad = { [key]: "x" } as any;
+        await expect(store.savePreferences("u-1", bad)).rejects.toThrow(`Invalid preferences key '${key}'`);
+        await expect(store.saveScopePreferences("ws-1", "u-1", bad)).rejects.toThrow(
+          `Invalid preferences key '${key}'`
+        );
+        await expect(store.upsertUser({ uid: "u-1", email: "u1@example.com", preferences: bad })).rejects.toThrow(
+          `Invalid preferences key '${key}'`
+        );
+        await expect(
+          store.upsertScopeMember("ws-1", { uid: "u-1", email: "u1@example.com", roles: [], preferences: bad })
+        ).rejects.toThrow(`Invalid preferences key '${key}'`);
+      }
+      expect((await store.getUser("u-1"))?.preferences).toEqual({ theme: "dark", compact: false });
+      expect((await store.getScopeMember("ws-1", "u-1"))?.roles).toEqual(["member"]);
+
+      // Scoped preferences require an existing membership
+      await expect(store.saveScopePreferences("ws-2", "u-1", { theme: "x" })).rejects.toThrow(/does not exist/);
+
+      // Deleting the user/member deletes their preferences and notifies listeners with empty preferences
+      await store.deleteScopeMember("ws-1", "u-1");
+      expect(scopePrefEvents.at(-1)).toEqual({});
+      await store.upsertScopeMember("ws-1", { uid: "u-1", email: "u1@example.com", roles: ["member"] });
+      expect((await store.getScopeMember("ws-1", "u-1"))?.preferences).toBeUndefined();
+      await store.deleteUser("u-1");
+      expect(globalPrefEvents.at(-1)).toEqual({});
+      await store.upsertUser({ uid: "u-1", email: "u1@example.com" });
+      expect((await store.getUser("u-1"))?.preferences).toBeUndefined();
+
+      unsubs.forEach((unsub) => unsub());
+    });
+
     it("enforces no-op write guards on syncAvatar when photoUrl already matches or scoped member does not exist", async () => {
       const store = new InMemoryLanyardStore<TestRole, TestCapability>();
       await store.upsertScopeMember("ws-1", {

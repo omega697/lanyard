@@ -627,13 +627,21 @@ describe.skipIf(!emulatorsAvailable)(
       await client.updatePreferences(GLOBAL_SCOPE, { leaderboardOptIn: true, theme: "dark" });
       await client.updateProfile(GLOBAL_SCOPE, { firstName: "UpdatedTesty" });
 
-      const afterSelfUpdate = await waitForStore(
-        client.userRecordStore,
-        (u) => u?.firstName === "UpdatedTesty" && u?.preferences?.leaderboardOptIn === true
-      );
+      const afterSelfUpdate = await waitForStore(client.userRecordStore, (u) => u?.firstName === "UpdatedTesty");
+      await waitForStore(client.preferencesStore, (p) => p.leaderboardOptIn === true && p.theme === "dark");
       expect(afterSelfUpdate?.roles).toEqual(["attendee"]);
       expect(afterSelfUpdate?.attributes?.pointsAllTime).toBe(35);
       expect(afterSelfUpdate?.attributes?.merchCreditBalance).toBe(80);
+      // Preferences never land on the card; they live only in the self-only private/preferences tier doc
+      expect(afterSelfUpdate?.preferences).toBeUndefined();
+      const rawCard = (await adminDb.doc(`users_st/${attendee.uid}`).get()).data();
+      expect(rawCard).not.toHaveProperty("preferences");
+      const rawPrefs = (await adminDb.doc(`users_st/${attendee.uid}/private/preferences`).get()).data();
+      expect(rawPrefs).toEqual({
+        leaderboardOptIn: true,
+        theme: "dark",
+        _lanyard: { tier: "preferences", uid: attendee.uid, scopeId: null, updatedAt: expect.any(String) }
+      });
 
       // 6. Per-user multi-role grant & revocation on real Firestore:
       await server.upsertUserByEmail({
@@ -753,10 +761,16 @@ describe.skipIf(!emulatorsAvailable)(
         })
       ).rejects.toThrow(/Forbidden/);
 
-      // 11. Preferences-only stub created via FirestoreClientStore resolves to `defaultRole` ("attendee") on server
+      // 11. Saving preferences alone never creates a card (they live only in the private/preferences tier doc)...
       await clientStore.savePreferences("prefs-only-uid", { theme: "dark" });
+      expect(await serverStore.getUser("prefs-only-uid")).toBeNull();
+      expect((await adminDb.doc("users_st/prefs-only-uid").get()).exists).toBe(false);
+
+      // ...while a profile-only stub card created via FirestoreClientStore resolves to `defaultRole` ("attendee") on server
+      await clientStore.updateUserProfile("prefs-only-uid", { firstName: "Stubby" });
       const stubUser = await serverStore.getUser("prefs-only-uid");
       expect(stubUser?.roles).toEqual(["attendee"]);
+      expect(stubUser?.preferences).toEqual({ theme: "dark" });
 
       let stubAllowedAsAttendee = false;
       await server.requireCapability("view:schedule", GLOBAL_SCOPE)(
@@ -1017,6 +1031,12 @@ service cloud.firestore {
       );
     }
 
+    function isPreferencesTierDoc(uid, scopeId) {
+      return request.resource.data._lanyard.tier == 'preferences' &&
+        request.resource.data._lanyard.uid == uid &&
+        request.resource.data._lanyard.scopeId == scopeId;
+    }
+
     function hasUserCapability(rolesImplyingCapability) {
       return isAdmin() || (
         isSignedIn() &&
@@ -1030,20 +1050,25 @@ service cloud.firestore {
       allow create: if isAdmin() || (
         isOwner(uid) &&
         request.resource.data.keys().hasOnly([
-          'uid', 'email', 'firstName', 'lastName', 'displayName', 'photoUrl', 'lastSeen', 'preferences', 'createdAt', 'updatedAt'
+          'uid', 'email', 'firstName', 'lastName', 'displayName', 'photoUrl', 'lastSeen', 'createdAt', 'updatedAt'
         ]) &&
         (!('uid' in request.resource.data) || request.resource.data.uid == uid)
       );
       allow update: if isAdmin() || (
         isOwner(uid) &&
         request.resource.data.diff(resource.data).affectedKeys().hasOnly([
-          'uid', 'email', 'firstName', 'lastName', 'displayName', 'photoUrl', 'lastSeen', 'preferences', 'updatedAt'
+          'uid', 'email', 'firstName', 'lastName', 'displayName', 'photoUrl', 'lastSeen', 'updatedAt'
         ]) &&
         (!('uid' in request.resource.data) || request.resource.data.uid == uid)
       );
 
       match /private/{docId} {
         allow read, write: if isAdmin();
+      }
+
+      match /private/preferences {
+        allow read: if isOwner(uid);
+        allow write: if isOwner(uid) && isPreferencesTierDoc(uid, null);
       }
     }
 
@@ -1056,11 +1081,17 @@ service cloud.firestore {
       allow create, delete: if hasScopeCapability(scopeId, ['owner', 'manager']);
       allow update: if hasScopeCapability(scopeId, ['owner', 'manager']) || (
         isOwner(memberUid) &&
-        request.resource.data.diff(resource.data).affectedKeys().hasOnly(['firstName', 'lastName', 'displayName', 'lastSeen', 'photoUrl', 'preferences', 'updatedAt'])
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly(['firstName', 'lastName', 'displayName', 'lastSeen', 'photoUrl', 'updatedAt'])
       );
 
       match /private/hiddenAttributes {
         allow read, write: if hasScopeCapability(scopeId, ['owner', 'manager']);
+      }
+
+      match /private/preferences {
+        allow read: if isOwner(memberUid) || isAdmin();
+        allow write: if (isOwner(memberUid) && isScopeMember(scopeId) || isAdmin()) &&
+          isPreferencesTierDoc(memberUid, scopeId);
       }
 
       match /private/secrets {
@@ -1144,8 +1175,13 @@ service cloud.firestore {
           membersSubcollection: "members"
         });
 
-        // 1. Multiplexed `subscribeToUser` + `subscribeToPreferences` sharing 1 underlying listener
-        await adminDb.doc("users/u-member").set({ uid: "u-member", preferences: { compactMode: true } });
+        // 1. `subscribeToUser` reads the card; `subscribeToPreferences` reads the self-only private/preferences doc.
+        // Legacy inline `preferences` on the card are ignored.
+        await adminDb.doc("users/u-member").set({ uid: "u-member", preferences: { theme: "light" } });
+        await adminDb.doc("users/u-member/private/preferences").set({
+          compactMode: true,
+          _lanyard: { tier: "preferences", uid: "u-member", scopeId: null, updatedAt: "2026-01-01" }
+        });
 
         const userEvents: any[] = [];
         const prefEvents: any[] = [];
@@ -1155,6 +1191,7 @@ service cloud.firestore {
         await new Promise((r) => setTimeout(r, 150));
         expect(userEvents.at(-1)?.uid).toBe("u-member");
         expect(userEvents.at(-1)?.roles).toEqual(["member"]);
+        expect(userEvents.at(-1)?.preferences).toBeUndefined();
         expect(prefEvents.at(-1)).toEqual({ compactMode: true });
 
         // Direct client `savePreferences`, `syncAvatar`, `updateUserProfile`, and `recordPresenceHeartbeat` (global)
@@ -1182,13 +1219,45 @@ service cloud.firestore {
         expect(latestUser?.lastName).toBe("McMember");
         expect(latestUser?.photoUrl).toBe("https://example.com/avatar2.png");
         expect(latestUser?.lastSeen).toBe("2026-10-21T12:00:00.000Z");
+        expect(prefEvents.at(-1)).toEqual({ compactMode: false, theme: "dark" });
 
-        // Unsubscribing one listener keeps the multiplexed subscription alive for the other
+        // Unsubscribing preferences leaves the card subscription untouched, and vice versa
         unsubPrefs();
         await memberStore.savePreferences("u-member", { theme: "light", compactMode: false });
         await new Promise((r) => setTimeout(r, 150));
-        expect(userEvents.at(-1)?.preferences).toEqual({ theme: "light", compactMode: false });
+        expect(prefEvents.at(-1)).toEqual({ compactMode: false, theme: "dark" });
+        expect(userEvents.at(-1)?.preferences).toBeUndefined();
         unsubUser();
+        expect((await serverStore.getUser("u-member"))?.preferences).toEqual({ theme: "light", compactMode: false });
+
+        // Preferences tier security: only the owner (and admins) can read or write it; the card can't hold preferences
+        expect(
+          (await clientGetDoc(clientDoc(memberClient.db, "users", "u-member", "private", "preferences"))).data()
+        ).toMatchObject({ theme: "light", compactMode: false, _lanyard: { tier: "preferences" } });
+        expect(
+          (await clientGetDoc(clientDoc(sysAdminClient.db, "users", "u-member", "private", "preferences"))).data()
+        ).toMatchObject({ theme: "light" });
+        await expect(
+          clientGetDoc(clientDoc(mgrClient.db, "users", "u-member", "private", "preferences"))
+        ).rejects.toMatchObject({ code: "permission-denied" });
+        await expect(
+          clientSetDoc(
+            clientDoc(mgrClient.db, "users", "u-member", "private", "preferences"),
+            { theme: "dark", _lanyard: { tier: "preferences", uid: "u-member", scopeId: null } },
+            { merge: true }
+          )
+        ).rejects.toMatchObject({ code: "permission-denied" });
+        // Owner writes must carry correct tier metadata
+        await expect(
+          clientSetDoc(
+            clientDoc(memberClient.db, "users", "u-member", "private", "preferences"),
+            { theme: "dark", _lanyard: { tier: "attributes", uid: "u-member", scopeId: null } },
+            { merge: true }
+          )
+        ).rejects.toMatchObject({ code: "permission-denied" });
+        await expect(
+          clientUpdateDoc(clientDoc(memberClient.db, "users", "u-member"), { preferences: { theme: "dark" } })
+        ).rejects.toMatchObject({ code: "permission-denied" });
 
         // 2. Provision scoped memberships via serverStore (`org-A` has `u-mgr` as manager and `u-member` as member; `org-B` has another user)
         await serverStore.upsertScopeMember("org-A", {
@@ -1247,13 +1316,50 @@ service cloud.firestore {
         });
         await memberStore.saveScopePreferences("org-A", "u-member", { theme: "dark", compactMode: false });
         await memberStore.saveScopePreferences("org-A", "u-member", { compactMode: true });
+        const scopePrefEvents: any[] = [];
+        const unsubScopePrefs = memberStore.subscribeToScopePreferences("org-A", "u-member", (p) =>
+          scopePrefEvents.push(p)
+        );
         await new Promise((r) => setTimeout(r, 150));
 
         const updatedOrgAMember = rosterList.at(-1)?.find((m: any) => m.uid === "u-member");
         expect(updatedOrgAMember?.photoUrl).toBe("https://example.com/scoped-avatar.png");
         expect(updatedOrgAMember?.displayName).toBe("Scoped Member");
         expect(updatedOrgAMember?.lastSeen).toBe("2026-10-21T12:05:00.000Z");
-        expect(updatedOrgAMember?.preferences).toEqual({ theme: "dark", compactMode: true });
+        // Scoped preferences never appear on the roster card; they come from the member's private/preferences doc
+        expect(updatedOrgAMember?.preferences).toBeUndefined();
+        expect(scopePrefEvents.at(-1)).toEqual({ theme: "dark", compactMode: true });
+        unsubScopePrefs();
+        expect((await serverStore.getScopeMember("org-A", "u-member"))?.preferences).toEqual({
+          theme: "dark",
+          compactMode: true
+        });
+        expect((await adminDb.doc("workspaces/org-A/members/u-member").get()).data()).not.toHaveProperty("preferences");
+        expect((await adminDb.doc("workspaces/org-A/members/u-member/private/preferences").get()).data()).toEqual({
+          theme: "dark",
+          compactMode: true,
+          _lanyard: { tier: "preferences", uid: "u-member", scopeId: "org-A", updatedAt: expect.any(String) }
+        });
+
+        // Scope staff (`u-mgr` is an org-A manager) can't read or write a member's scoped preferences
+        await expect(
+          clientGetDoc(clientDoc(mgrClient.db, "workspaces", "org-A", "members", "u-member", "private", "preferences"))
+        ).rejects.toMatchObject({ code: "permission-denied" });
+        await expect(
+          clientSetDoc(
+            clientDoc(mgrClient.db, "workspaces", "org-A", "members", "u-member", "private", "preferences"),
+            { theme: "light", _lanyard: { tier: "preferences", uid: "u-member", scopeId: "org-A" } },
+            { merge: true }
+          )
+        ).rejects.toMatchObject({ code: "permission-denied" });
+        // A scoped preferences doc can't claim a different scope in its metadata
+        await expect(
+          clientSetDoc(
+            clientDoc(memberClient.db, "workspaces", "org-A", "members", "u-member", "private", "preferences"),
+            { theme: "light", _lanyard: { tier: "preferences", uid: "u-member", scopeId: "org-B" } },
+            { merge: true }
+          )
+        ).rejects.toMatchObject({ code: "permission-denied" });
 
         // Calling scoped `syncAvatar`, `recordPresenceHeartbeat`, or `saveScopePreferences` on a scope where user is NOT a member (`org-B`) must fail and NEVER create a phantom member doc
         await expect(
@@ -1274,6 +1380,7 @@ service cloud.firestore {
           memberStore.saveScopePreferences("org-B", "u-member", { theme: "dark", compactMode: true })
         ).rejects.toThrow();
         expect(await serverStore.getScopeMember("org-B", "u-member")).toBeNull();
+        expect((await adminDb.doc("workspaces/org-B/members/u-member/private/preferences").get()).exists).toBe(false);
 
         // Also verify `grantUserRoles` and `revokeUserRoles` on global `users/u-member` in real Firestore
         await serverStore.grantUserRoles("u-member", ["manager"]);

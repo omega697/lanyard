@@ -8,6 +8,7 @@ import {
   type SystemAdminProfile,
   type UserRecord
 } from "../core/index.js";
+import { assertNoReservedTierKeys, readTierDocValues, tierDocMetadata } from "../core/tierDocs.js";
 import { createSecretCipher, isEncryptedSecretData } from "./encryption.js";
 
 const FORBIDDEN_KEYS = new Set(["__proto__", "constructor", "prototype"]);
@@ -63,9 +64,10 @@ export interface FirestoreServerStoreConfig<TRole extends string = string> {
 /**
  * Firebase Admin Firestore implementation of `LanyardServerStore`.
  *
- * Uses a single canonical `users/{uid}` collection for profile, presence, `isSystemAdmin`,
- * single-tenant `roles`, `preferences`, and `attributes`, plus isolated
- * `private/hiddenAttributes` and AES-256-GCM encrypted `private/secrets` subdocuments.
+ * Uses a single canonical `users/{uid}` card document for profile, presence, `isSystemAdmin`,
+ * single-tenant `roles`, and `attributes`, plus private tier documents in the `private` subcollection:
+ * self-only `private/preferences`, `private/hiddenAttributes`, and AES-256-GCM encrypted `private/secrets`.
+ * Scoped members (`{scopeCollection}/{scopeId}/{membersSubcollection}/{uid}`) use the same layout.
  */
 export class FirestoreServerStore<
   TRole extends string = string,
@@ -120,6 +122,36 @@ export class FirestoreServerStore<
   private userHiddenAttributesDocRef(uid: string) {
     const cleanUid = assertValidFirestoreDocId(uid, "uid");
     return this.db.doc(`${this.usersCollection}/${cleanUid}/private/hiddenAttributes`);
+  }
+
+  private userPreferencesDocRef(uid: string) {
+    const cleanUid = assertValidFirestoreDocId(uid, "uid");
+    return this.db.doc(`${this.usersCollection}/${cleanUid}/private/preferences`);
+  }
+
+  private memberPreferencesDocRef(scopeId: string, uid: string) {
+    const cleanScopeId = assertValidFirestoreDocId(scopeId, "scopeId");
+    const cleanUid = assertValidFirestoreDocId(uid, "uid");
+    return this.db.doc(
+      `${this.scopeCollection}/${cleanScopeId}/${this.membersSubcollection}/${cleanUid}/private/preferences`
+    );
+  }
+
+  /** Merges a preferences patch into a private preferences document, stamping tier metadata. */
+  private async writePreferencesDoc(
+    ref: FirebaseFirestore.DocumentReference,
+    uid: string,
+    scopeId: string | null,
+    preferences: Partial<TPreferences>
+  ): Promise<void> {
+    const cleanPrefs = sanitizeObjectPatch<TPreferences>(preferences);
+    assertNoReservedTierKeys(cleanPrefs, "preferences");
+    await ref.set({ ...cleanPrefs, ...tierDocMetadata("preferences", uid, scopeId) }, { merge: true });
+  }
+
+  private async readPreferencesDoc(ref: FirebaseFirestore.DocumentReference): Promise<Partial<TPreferences> | null> {
+    const snap = await ref.get();
+    return snap.exists ? readTierDocValues<TPreferences>(snap.data()) : null;
   }
 
   private userSecretsDocRef(uid: string) {
@@ -213,9 +245,6 @@ export class FirestoreServerStore<
       ...(typeof data.isSystemAdmin === "boolean" ? { isSystemAdmin: data.isSystemAdmin } : {}),
       ...(data.addedBy !== undefined ? { addedBy: data.addedBy } : {}),
       roles: this.extractRoles(data),
-      ...(data.preferences && typeof data.preferences === "object" && !Array.isArray(data.preferences)
-        ? { preferences: sanitizeObjectPatch<TPreferences>(data.preferences) }
-        : {}),
       ...(data.attributes && typeof data.attributes === "object" && !Array.isArray(data.attributes)
         ? { attributes: sanitizeObjectPatch<TAttributes>(data.attributes) }
         : {}),
@@ -224,15 +253,30 @@ export class FirestoreServerStore<
     };
   }
 
+  /** Reads `users/{uid}` and merges its self-only `private/preferences` tier into the returned record. */
   async getUser(uid: string): Promise<UserRecord<TRole, TCapability, TPreferences, TAttributes> | null> {
-    const snap = await this.userDocRef(uid).get();
+    const [snap, preferences] = await Promise.all([
+      this.userDocRef(uid).get(),
+      this.readPreferencesDoc(this.userPreferencesDocRef(uid))
+    ]);
     if (!snap.exists) return null;
-    return this.parseUserRecord(snap.id, snap.data() || {});
+    return {
+      ...this.parseUserRecord(snap.id, snap.data() || {}),
+      ...(preferences ? { preferences } : {})
+    };
   }
 
   async listUsers(): Promise<UserRecord<TRole, TCapability, TPreferences, TAttributes>[]> {
     const snap = await this.db.collection(this.usersCollection).get();
-    return snap.docs.map((doc) => this.parseUserRecord(doc.id, doc.data() || {}));
+    return Promise.all(
+      snap.docs.map(async (doc) => {
+        const preferences = await this.readPreferencesDoc(this.userPreferencesDocRef(doc.id));
+        return {
+          ...this.parseUserRecord(doc.id, doc.data() || {}),
+          ...(preferences ? { preferences } : {})
+        };
+      })
+    );
   }
 
   async deleteUser(uid: string): Promise<void> {
@@ -240,6 +284,7 @@ export class FirestoreServerStore<
     const userRef = this.userDocRef(cleanUid);
     await Promise.all([
       userRef.delete(),
+      this.userPreferencesDocRef(cleanUid).delete(),
       this.userHiddenAttributesDocRef(cleanUid).delete(),
       this.userSecretsDocRef(cleanUid).delete()
     ]);
@@ -248,15 +293,22 @@ export class FirestoreServerStore<
     }
   }
 
+  /**
+   * Upserts the `users/{uid}` card. If `user.preferences` is provided it is merged into the separate
+   * self-only `private/preferences` tier document (never stored on the card).
+   */
   async upsertUser(user: UserRecord<TRole, TCapability, TPreferences, TAttributes>): Promise<void> {
     const cleanUid = assertValidFirestoreDocId(user.uid, "uid");
+    const { preferences, ...card } = user;
+    if (preferences !== undefined) {
+      await this.writePreferencesDoc(this.userPreferencesDocRef(cleanUid), cleanUid, null, preferences);
+    }
     const payload = stripUndefinedFields({
-      ...user,
+      ...card,
       uid: cleanUid,
-      ...(user.photoUrl !== undefined ? { photoUrl: sanitizeAvatarUrl(user.photoUrl) } : {}),
-      ...(user.roles !== undefined ? { roles: Array.from(new Set(user.roles)) } : {}),
-      ...(user.preferences !== undefined ? { preferences: sanitizeObjectPatch<TPreferences>(user.preferences) } : {}),
-      ...(user.attributes !== undefined ? { attributes: sanitizeObjectPatch<TAttributes>(user.attributes) } : {})
+      ...(card.photoUrl !== undefined ? { photoUrl: sanitizeAvatarUrl(card.photoUrl) } : {}),
+      ...(card.roles !== undefined ? { roles: Array.from(new Set(card.roles)) } : {}),
+      ...(card.attributes !== undefined ? { attributes: sanitizeObjectPatch<TAttributes>(card.attributes) } : {})
     });
     await this.userDocRef(cleanUid).set(payload, { merge: true });
   }
@@ -334,7 +386,7 @@ export class FirestoreServerStore<
         uid: cleanUid,
         roles: initialRoles
       };
-      await ref.set(stripUndefinedFields(created), { merge: true });
+      await this.upsertUser(created);
       return created;
     }
 
@@ -443,47 +495,69 @@ export class FirestoreServerStore<
       scopeId: cleanScopeId,
       ...(data.scopeName !== undefined ? { scopeName: data.scopeName } : {}),
       ...(data.lastSeen !== undefined ? { lastSeen: data.lastSeen } : {}),
-      ...(data.preferences && typeof data.preferences === "object" && !Array.isArray(data.preferences)
-        ? { preferences: sanitizeObjectPatch<TPreferences>(data.preferences) }
-        : {}),
       ...(data.attributes && typeof data.attributes === "object" && !Array.isArray(data.attributes)
         ? { attributes: sanitizeObjectPatch<TAttributes>(data.attributes) }
         : {})
     };
   }
 
+  /** Reads a scoped member card and merges its self-only `private/preferences` tier into the returned member. */
   async getScopeMember(
     scopeId: string,
     uid: string
   ): Promise<ScopedMember<TRole, TCapability, TPreferences, TAttributes> | null> {
     const cleanScopeId = assertValidFirestoreDocId(scopeId, "scopeId");
-    const snap = await this.memberDocRef(cleanScopeId, uid).get();
+    const [snap, preferences] = await Promise.all([
+      this.memberDocRef(cleanScopeId, uid).get(),
+      this.readPreferencesDoc(this.memberPreferencesDocRef(cleanScopeId, uid))
+    ]);
     if (!snap.exists) return null;
-    return this.parseScopedMember(snap.id, cleanScopeId, snap.data() || {});
+    return {
+      ...this.parseScopedMember(snap.id, cleanScopeId, snap.data() || {}),
+      ...(preferences ? { preferences } : {})
+    };
   }
 
   async listScopeMembers(scopeId: string): Promise<ScopedMember<TRole, TCapability, TPreferences, TAttributes>[]> {
     const cleanScopeId = assertValidFirestoreDocId(scopeId, "scopeId");
     const snap = await this.db.collection(`${this.scopeCollection}/${cleanScopeId}/${this.membersSubcollection}`).get();
-    return snap.docs.map((d) => this.parseScopedMember(d.id, cleanScopeId, d.data() || {}));
+    return Promise.all(
+      snap.docs.map(async (d) => {
+        const preferences = await this.readPreferencesDoc(this.memberPreferencesDocRef(cleanScopeId, d.id));
+        return {
+          ...this.parseScopedMember(d.id, cleanScopeId, d.data() || {}),
+          ...(preferences ? { preferences } : {})
+        };
+      })
+    );
   }
 
+  /**
+   * Upserts a scoped member card. If `member.preferences` is provided it is merged into the separate
+   * self-only `private/preferences` tier document (never stored on the card).
+   */
   async upsertScopeMember(
     scopeId: string,
     member: ScopedMember<TRole, TCapability, TPreferences, TAttributes>
   ): Promise<void> {
     const cleanScopeId = assertValidFirestoreDocId(scopeId, "scopeId");
     const cleanUid = assertValidFirestoreDocId(member.uid, "uid");
+    const { preferences, ...card } = member;
+    if (preferences !== undefined) {
+      await this.writePreferencesDoc(
+        this.memberPreferencesDocRef(cleanScopeId, cleanUid),
+        cleanUid,
+        cleanScopeId,
+        preferences
+      );
+    }
     const payload = stripUndefinedFields({
-      ...member,
-      ...(member.photoUrl !== undefined ? { photoUrl: sanitizeAvatarUrl(member.photoUrl) } : {}),
+      ...card,
+      ...(card.photoUrl !== undefined ? { photoUrl: sanitizeAvatarUrl(card.photoUrl) } : {}),
       uid: cleanUid,
       scopeId: cleanScopeId,
-      roles: Array.from(new Set(member.roles || [])),
-      ...(member.preferences !== undefined
-        ? { preferences: sanitizeObjectPatch<TPreferences>(member.preferences) }
-        : {}),
-      ...(member.attributes !== undefined ? { attributes: sanitizeObjectPatch<TAttributes>(member.attributes) } : {})
+      roles: Array.from(new Set(card.roles || [])),
+      ...(card.attributes !== undefined ? { attributes: sanitizeObjectPatch<TAttributes>(card.attributes) } : {})
     });
     await this.memberDocRef(cleanScopeId, cleanUid).set(payload, { merge: true });
   }
@@ -570,7 +644,7 @@ export class FirestoreServerStore<
         scopeId,
         roles: initialRoles
       };
-      await ref.set(stripUndefinedFields(created), { merge: true });
+      await this.upsertScopeMember(scopeId, created);
       return created;
     }
 
@@ -593,6 +667,9 @@ export class FirestoreServerStore<
   }
 
   async deleteScopeMember(scopeId: string, uid: string): Promise<void> {
+    await this.memberPreferencesDocRef(scopeId, uid)
+      .delete()
+      .catch(() => {});
     await this.memberHiddenAttributesDocRef(scopeId, uid)
       .delete()
       .catch(() => {});

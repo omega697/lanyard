@@ -389,26 +389,76 @@ describe("lanyard/client unit tests", () => {
       defaultRoles: ["member"]
     });
 
-    // 1. subscribeToPreferences + savePreferences on unified users/{uid}
-    vi.mocked(firebaseFirestore.onSnapshot).mockImplementationOnce((_ref: any, onNext: any) => {
-      onNext({ exists: () => true, data: () => ({ preferences: { theme: "dark" } }) });
+    // 1. subscribeToPreferences + savePreferences on the self-only users/{uid}/private/preferences tier doc
+    vi.mocked(firebaseFirestore.onSnapshot).mockImplementationOnce((ref: any, onNext: any) => {
+      expect(ref.path).toBe("users/u-1/private/preferences");
+      onNext({
+        exists: () => true,
+        data: () => ({
+          theme: "dark",
+          tier: "gold",
+          _lanyard: { tier: "preferences", uid: "u-1", scopeId: null, updatedAt: "2026-01-01" }
+        })
+      });
       return () => {};
     });
     const prefObserved: Partial<TestPrefs>[] = [];
     const unsubPref1 = store.subscribeToPreferences("u-1", (p) => prefObserved.push(p));
-    expect(prefObserved).toEqual([{ theme: "dark" }]);
+    // Tier metadata (`_lanyard`) is stripped from the emitted preferences; ordinary keys like `tier` are kept
+    expect(prefObserved).toEqual([{ theme: "dark", tier: "gold" }]);
     unsubPref1();
 
+    // A missing preferences doc emits empty preferences
+    vi.mocked(firebaseFirestore.onSnapshot).mockImplementationOnce((_ref: any, onNext: any) => {
+      onNext({ exists: () => false, data: () => undefined });
+      return () => {};
+    });
+    const emptyPrefObserved: Partial<TestPrefs>[] = [];
+    store.subscribeToPreferences("u-1", (p) => emptyPrefObserved.push(p))();
+    expect(emptyPrefObserved).toEqual([{}]);
+
     await store.savePreferences("u-1", { use12h: false });
-    expect(firebaseFirestore.setDoc).toHaveBeenCalledWith(
-      expect.objectContaining({ path: "users/u-1" }),
-      expect.objectContaining({
-        uid: "u-1",
-        preferences: { use12h: false },
-        updatedAt: expect.any(String)
-      }),
+    expect(firebaseFirestore.setDoc).toHaveBeenLastCalledWith(
+      expect.objectContaining({ path: "users/u-1/private/preferences" }),
+      {
+        use12h: false,
+        _lanyard: { tier: "preferences", uid: "u-1", scopeId: null, updatedAt: expect.any(String) }
+      },
       { merge: true }
     );
+
+    // Scoped preferences live in the member's own private/preferences tier doc
+    vi.mocked(firebaseFirestore.onSnapshot).mockImplementationOnce((ref: any, onNext: any) => {
+      expect(ref.path).toBe("workspaces/ws-1/members/u-1/private/preferences");
+      onNext({
+        exists: () => true,
+        data: () => ({ use12h: true, _lanyard: { tier: "preferences", uid: "u-1", scopeId: "ws-1" } })
+      });
+      return () => {};
+    });
+    const scopePrefObserved: Partial<TestPrefs>[] = [];
+    store.subscribeToScopePreferences("ws-1", "u-1", (p) => scopePrefObserved.push(p))();
+    expect(scopePrefObserved).toEqual([{ use12h: true }]);
+
+    await store.saveScopePreferences("ws-1", "u-1", { theme: "light" });
+    expect(firebaseFirestore.setDoc).toHaveBeenLastCalledWith(
+      expect.objectContaining({ path: "workspaces/ws-1/members/u-1/private/preferences" }),
+      {
+        theme: "light",
+        _lanyard: { tier: "preferences", uid: "u-1", scopeId: "ws-1", updatedAt: expect.any(String) }
+      },
+      { merge: true }
+    );
+
+    // The reserved tier metadata key can't be written as a preference, globally or per scope
+    vi.mocked(firebaseFirestore.setDoc).mockClear();
+    await expect(store.savePreferences("u-1", { _lanyard: { tier: "attributes" } } as any)).rejects.toThrow(
+      "Invalid preferences key '_lanyard'"
+    );
+    await expect(store.saveScopePreferences("ws-1", "u-1", { _lanyard: "x" } as any)).rejects.toThrow(
+      "Invalid preferences key '_lanyard'"
+    );
+    expect(firebaseFirestore.setDoc).not.toHaveBeenCalled();
 
     // 2. subscribeToUserMemberships
     vi.mocked(firebaseFirestore.onSnapshot).mockImplementationOnce((_q: any, onNext: any) => {
@@ -1115,12 +1165,10 @@ describe("lanyard/client unit tests", () => {
     });
 
     const userEvents: any[] = [];
-    const prefEvents: any[] = [];
-    const latePrefEvents: any[] = [];
+    const lateUserEvents: any[] = [];
 
-    // 1. Subscribing to BOTH subscribeToUser and subscribeToPreferences on 'u-mux' opens ONLY 1 Firestore listener!
+    // 1. Multiple subscribeToUser calls on 'u-mux' open ONLY 1 Firestore listener on the card
     const unsubUser = fsStore.subscribeToUser("u-mux", (u) => userEvents.push(u));
-    const unsubPref = fsStore.subscribeToPreferences("u-mux", (p) => prefEvents.push(p));
     expect(firebaseFirestore.onSnapshot).toHaveBeenCalledTimes(1);
 
     emitSnapshot({
@@ -1132,6 +1180,7 @@ describe("lanyard/client unit tests", () => {
         lastName: "McTest",
         isSystemAdmin: false,
         roles: ["manager"],
+        // Legacy inline preferences on the card are ignored; preferences only come from private/preferences
         preferences: { theme: "dark", use12h: false },
         attributes: { pointsAllTime: 420 }
       })
@@ -1141,26 +1190,33 @@ describe("lanyard/client unit tests", () => {
     expect(userEvents[0]).toMatchObject({
       uid: "u-mux",
       roles: ["manager"],
-      preferences: { theme: "dark", use12h: false },
       attributes: { pointsAllTime: 420 }
     });
-    expect(prefEvents).toEqual([{ theme: "dark", use12h: false }]);
+    expect(userEvents[0].preferences).toBeUndefined();
 
     // 2. Late subscriber immediately receives the latest cached snapshot without triggering a 2nd Firestore read!
-    const unsubLatePref = fsStore.subscribeToPreferences("u-mux", (p) => latePrefEvents.push(p));
+    const unsubLateUser = fsStore.subscribeToUser("u-mux", (u) => lateUserEvents.push(u));
     expect(firebaseFirestore.onSnapshot).toHaveBeenCalledTimes(1);
-    expect(latePrefEvents).toEqual([{ theme: "dark", use12h: false }]);
+    expect(lateUserEvents).toHaveLength(1);
+    expect(lateUserEvents[0]).toMatchObject({ uid: "u-mux", roles: ["manager"] });
 
     // Non-existent doc snapshot emits null to userCallbacks
     emitSnapshot({ exists: () => false, data: () => undefined });
     expect(userEvents[userEvents.length - 1]).toBeNull();
 
-    // 3. Ref-counted cleanup: underlying Firestore listener stays active until ALL 3 subscribers detach
+    // 3. Ref-counted cleanup: underlying Firestore listener stays active until ALL subscribers detach
     unsubUser();
-    unsubPref();
     expect(underlyingUnsub).not.toHaveBeenCalled();
-    unsubLatePref();
+    unsubLateUser();
     expect(underlyingUnsub).toHaveBeenCalledTimes(1);
+
+    // Preferences use their own listener on the private tier doc, never the card listener
+    vi.mocked(firebaseFirestore.onSnapshot).mockImplementationOnce(() => () => {});
+    fsStore.subscribeToPreferences("u-mux", () => {})();
+    expect(firebaseFirestore.onSnapshot).toHaveBeenCalledTimes(2);
+    expect(vi.mocked(firebaseFirestore.onSnapshot).mock.calls[1][0]).toMatchObject({
+      path: "users/u-mux/private/preferences"
+    });
 
     // 4. updateUserProfile strictly whitelists Tier-1 fields and strips malicious privilege escalation fields
     vi.mocked(firebaseFirestore.setDoc).mockClear();
@@ -1188,6 +1244,75 @@ describe("lanyard/client unit tests", () => {
     expect(writtenPayload.isSystemAdmin).toBeUndefined();
     expect(writtenPayload.role).toBeUndefined();
     expect(writtenPayload.attributes).toBeUndefined();
+  });
+
+  it("opens one scoped preferences listener per membership, closes it when the membership ends, and never leaks across users", async () => {
+    const store = new InMemoryLanyardStore<TestRole, TestCap, TestPrefs>();
+    await store.upsertScopeMember("ws-a", { uid: "u-1", email: "u1@example.com", roles: ["member"] });
+    await store.upsertScopeMember("ws-b", { uid: "u-1", email: "u1@example.com", roles: ["member"] });
+    await store.saveScopePreferences("ws-a", "u-1", { theme: "dark" });
+    await store.upsertScopeMember("ws-a", { uid: "u-2", email: "u2@example.com", roles: ["member"] });
+
+    const unsubs = new Map<string, ReturnType<typeof vi.fn>>();
+    const originalSubscribe = store.subscribeToScopePreferences.bind(store);
+    const subscribeSpy = vi.spyOn(store, "subscribeToScopePreferences").mockImplementation((scopeId, uid, onChange) => {
+      const unsub = vi.fn(originalSubscribe(scopeId, uid, onChange));
+      unsubs.set(`${scopeId}/${uid}`, unsub);
+      return unsub;
+    });
+
+    const client = createLanyardClient<TestRole, TestCap, TestPrefs>({
+      store,
+      defaultPreferences: DEFAULT_PREFS,
+      storageKeyPrefix: "scopeprefs"
+    });
+    const user1 = {
+      uid: "u-1",
+      email: "u1@example.com",
+      emailVerified: true,
+      displayName: null,
+      photoUrl: null,
+      isAdmin: false,
+      providerIds: []
+    };
+    client.setActiveUser(user1);
+
+    expect(subscribeSpy.mock.calls.map(([scopeId, uid]) => `${scopeId}/${uid}`).sort()).toEqual([
+      "ws-a/u-1",
+      "ws-b/u-1"
+    ]);
+    expect(client.getPreferences("ws-a")).toEqual({ ...DEFAULT_PREFS, theme: "dark" });
+    expect(client.getPreferences("ws-b")).toEqual(DEFAULT_PREFS);
+    expect(client.membershipsStore.get().memberships.find((m) => m.scopeId === "ws-a")?.preferences).toEqual({
+      theme: "dark"
+    });
+
+    // Remote changes (e.g. from another device) flow in through the scoped listener
+    await store.saveScopePreferences("ws-b", "u-1", { use12h: false });
+    expect(client.getPreferences("ws-b")).toEqual({ ...DEFAULT_PREFS, use12h: false });
+
+    // Membership card re-emissions (presence, avatar) don't reopen listeners
+    await store.recordPresenceHeartbeat({ uid: "u-1", scopeId: "ws-a", lastSeenIso: "2026-01-01T00:00:00.000Z" });
+    expect(subscribeSpy).toHaveBeenCalledTimes(2);
+
+    // Leaving a scope closes its listener and drops its preferences
+    await store.deleteScopeMember("ws-b", "u-1");
+    expect(unsubs.get("ws-b/u-1")).toHaveBeenCalledTimes(1);
+    expect(unsubs.get("ws-a/u-1")).not.toHaveBeenCalled();
+    expect(client.getPreferences("ws-b")).toEqual(DEFAULT_PREFS);
+
+    // Switching users closes the previous user's listeners and never shows their scoped preferences
+    client.setActiveUser({ ...user1, uid: "u-2", email: "u2@example.com" });
+    expect(unsubs.get("ws-a/u-1")).toHaveBeenCalledTimes(1);
+    expect(client.getPreferences("ws-a")).toEqual(DEFAULT_PREFS);
+    await store.saveScopePreferences("ws-a", "u-1", { theme: "light" });
+    expect(client.getPreferences("ws-a")).toEqual(DEFAULT_PREFS);
+
+    // Sign-out closes everything
+    client.setActiveUser(null);
+    expect(unsubs.get("ws-a/u-2")).toHaveBeenCalledTimes(1);
+    expect(client.membershipsStore.get().memberships).toEqual([]);
+    client.destroy();
   });
 
   it("wires userRecordStore, attributesStore, updateProfile, real-time isSystemAdmin sync, and single-tenant role presence tracking", async () => {

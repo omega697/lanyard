@@ -33,14 +33,14 @@ Like a conference or workplace lanyard, `lanyard` answers two questions everywhe
   - **Storage Tiers for Custom User & Member Properties (`preferences`, `attributes`, `hiddenAttributes`, `secrets`)**:
     - Each tier has one **read audience**, because Firestore security rules grant or deny whole documents (they can't hide individual fields). Reads are therefore configured **per tier**, while writes can still be gated **per key**.
     - **Card** (the `users/{uid}` / `{scope}/{scopeId}/members/{uid}` document itself): profile, avatar, presence, and `roles`, i.e. what anyone allowed to know the user exists may see. Scoped card visibility is configurable with `cardVisibility` (`"members"` by default, `"staff"`, or `{ capability }`); the global card follows `userCapabilities.read` (self + system admins by default).
-    - **`preferences`** (`TPreferences`): readable and writable only by the user themselves (and system admins).
+    - **`preferences`** (`TPreferences`): readable and writable only by the user themselves (and system admins). Stored in a dedicated `users/{uid}/private/preferences` (or `{scope}/{scopeId}/members/{uid}/private/preferences`) document, never on the card. Lanyard stamps each private tier document with a `_lanyard: { tier, uid, scopeId, updatedAt }` metadata field (`scopeId` is `null` for global documents), so `_lanyard` is the one name that can't be used as a preference key (writes using it throw).
     - **`attributes`** (`TAttributes`): readable by the user themselves, scope staff (holders of `staffCapability`), and system admins; writable only by system admins or roles holding the per-key write capability in `attributeCapabilities` (e.g., points, badges, quotas). Keys listed in `cardFields.attributes` are placed on the card instead (opt-in exposure to every card reader; moved, never copied).
     - **`hiddenAttributes`** (`THiddenAttributes`): properties _about_ a user that **not even the user themselves can read or write**, readable only by scope staff and system admins, writable per key via `hiddenAttributeCapabilities` (stored in isolated `users/{uid}/private/hiddenAttributes` and `{scope}/{scopeId}/members/{uid}/private/hiddenAttributes` subdocuments).
     - **`secrets`** (`TSecrets`): **Write-only AES-256-GCM encrypted user secrets** (e.g., BYOK AI API keys or personal OAuth tokens). Stored encrypted at rest (`{ ciphertext, iv, tag }`) in `private/secrets`, never readable back out to any client, with boolean status checks (`getUserSecretsStatus`) for the UI and server-only decryption (`getDecryptedUserSecrets(scopeId, uid)`) for backend API calls.
     - **Custom private documents** (`customDocs`): app-defined documents with their own read/write audiences (`self`, `staff`, or a `capability`) for cases the built-in tiers don't cover.
     - > [!WARNING]
-      > In this version, `preferences` and `attributes` are still stored **inline** on the card document (`users/{uid}.preferences` / `.attributes`, `members/{uid}.preferences` / `.attributes`). The tier rules above are enforced by Lanyard's policy and server APIs, but **any client that can read the card document directly can read those fields**. Until they move to dedicated tier documents, restrict direct reads of user/member documents to the owner and system admins, and serve other readers through the server APIs.
-  - **Single-Listener Multiplexing**: `FirestoreClientStore` multiplexes `onSnapshot` listeners on `users/{uid}` so subscribing to user profile, `attributes`, `preferences`, and admin status only ever opens **1 Firestore document listener**.
+      > In this version, `attributes` are still stored **inline** on the card document (`users/{uid}.attributes`, `members/{uid}.attributes`). The tier rules above are enforced by Lanyard's policy and server APIs, but **any client that can read the card document directly can read them**. Until they move to a dedicated tier document, restrict direct reads of user/member documents to the owner and system admins, and serve other readers through the server APIs.
+  - **Single-Listener Multiplexing**: `FirestoreClientStore` multiplexes `onSnapshot` listeners on `users/{uid}` so repeated subscriptions to the user profile, `attributes`, and admin status only ever open **1 Firestore document listener**. Preferences use one more listener on the user's own `private/preferences` document, plus one per scope membership for scoped preferences.
 - **Smart Avatar Tracking & Fallback Resolution**:
   - **Provider Fallback**: When a user signs up via Magic Email Link (`user.photoURL === null`) and later links Google or GitHub, `normalizeFirebaseUser` automatically extracts their avatar from `user.providerData[].photoURL` and sanitizes the URL.
   - **Pre-Provisioned Member & Admin Sync**: When a user who was pre-provisioned by email (`photoUrl: null`) later signs in with OAuth, both the client (`createLanyardClient`) and server middleware (`requireAdmin`, `requireRole`, `requireCapability`) automatically sync their `photoUrl` to their existing member/admin record (deduplicated per session).
@@ -589,7 +589,7 @@ For unit tests, use the built-in **`InMemoryLanyardStore<TRole, TCapability, TPr
 When using `FirestoreClientStore` and `FirestoreServerStore`, use the following helper functions in `firestore.rules`. Note that `hasScopeRole` and `hasUserRole` use `get()` without a preceding `exists()` call so Firestore caches the single document read across an entire query:
 
 > [!WARNING]
-> Firestore rules grant or deny **whole documents**. Because `preferences` and `attributes` are currently stored inline on user/member documents, any `allow read` below that admits someone other than the owner (e.g. `isScopeMember(scopeId)` on member documents, or `hasUserRole(['owner', 'manager'])` on `users/{uid}`) also exposes those fields to that reader, regardless of the tier rules in your policy. Narrow those reads to the owner and system admins if that matters for your app, and serve other readers through `lanyardServer.getUser` / `listUsers` / `readUserAttributes`.
+> Firestore rules grant or deny **whole documents**. Because `attributes` are currently stored inline on user/member documents, any `allow read` below that admits someone other than the owner (e.g. `isScopeMember(scopeId)` on member documents, or `hasUserRole(['owner', 'manager'])` on `users/{uid}`) also exposes them to that reader, regardless of the tier rules in your policy. Narrow those reads to the owner and system admins if that matters for your app, and serve other readers through `lanyardServer.getUser` / `listUsers` / `readUserAttributes`.
 
 ```javascript
 function isSignedIn() {
@@ -623,6 +623,13 @@ function hasScopeRole(scopeId, allowedRoles) {
   );
 }
 
+// Lanyard stamps every private tier document with its tier, owner, and scope (null for global).
+function isPreferencesTierDoc(uid, scopeId) {
+  return request.resource.data._lanyard.tier == 'preferences' &&
+    request.resource.data._lanyard.uid == uid &&
+    request.resource.data._lanyard.scopeId == scopeId;
+}
+
 function hasUserRole(allowedRoles) {
   return isAdmin() || (
     isSignedIn() &&
@@ -637,20 +644,26 @@ match /users/{uid} {
   allow create: if isAdmin() || (
     isOwner(uid) &&
     request.resource.data.keys().hasOnly([
-      'uid', 'email', 'firstName', 'lastName', 'displayName', 'photoUrl', 'lastSeen', 'preferences', 'createdAt', 'updatedAt'
+      'uid', 'email', 'firstName', 'lastName', 'displayName', 'photoUrl', 'lastSeen', 'createdAt', 'updatedAt'
     ]) &&
     (!('uid' in request.resource.data) || request.resource.data.uid == uid)
   );
   allow update: if isAdmin() || (
     isOwner(uid) &&
     request.resource.data.diff(resource.data).affectedKeys().hasOnly([
-      'uid', 'email', 'firstName', 'lastName', 'displayName', 'photoUrl', 'lastSeen', 'preferences', 'updatedAt'
+      'uid', 'email', 'firstName', 'lastName', 'displayName', 'photoUrl', 'lastSeen', 'updatedAt'
     ]) &&
     (!('uid' in request.resource.data) || request.resource.data.uid == uid)
   );
 
   match /private/{docId} {
     allow read, write: if isAdmin();
+  }
+
+  // Self-only preferences tier
+  match /private/preferences {
+    allow read: if isOwner(uid);
+    allow write: if isOwner(uid) && isPreferencesTierDoc(uid, null);
   }
 }
 
@@ -665,11 +678,18 @@ match /workspaces/{scopeId}/members/{memberUid} {
   allow create, delete: if hasScopeRole(scopeId, ['owner', 'manager']);
   allow update: if hasScopeRole(scopeId, ['owner', 'manager']) || (
     isOwner(memberUid) &&
-    request.resource.data.diff(resource.data).affectedKeys().hasOnly(['firstName', 'lastName', 'displayName', 'lastSeen', 'photoUrl', 'preferences', 'updatedAt'])
+    request.resource.data.diff(resource.data).affectedKeys().hasOnly(['firstName', 'lastName', 'displayName', 'lastSeen', 'photoUrl', 'updatedAt'])
   );
 
   match /private/hiddenAttributes {
     allow read, write: if hasScopeRole(scopeId, ['owner', 'manager']);
+  }
+
+  // Self-only scoped preferences tier (writable only while the user is a member of the scope)
+  match /private/preferences {
+    allow read: if isOwner(memberUid) || isAdmin();
+    allow write: if (isOwner(memberUid) && isScopeMember(scopeId) || isAdmin()) &&
+      isPreferencesTierDoc(memberUid, scopeId);
   }
 
   match /private/secrets {

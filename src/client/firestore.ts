@@ -7,6 +7,7 @@ import {
   setDoc,
   updateDoc,
   where,
+  type DocumentReference,
   type Firestore
 } from "firebase/firestore";
 import {
@@ -18,6 +19,7 @@ import {
   type UserProfilePatch,
   type UserRecord
 } from "../core/index.js";
+import { assertNoReservedTierKeys, readTierDocValues, tierDocMetadata } from "../core/tierDocs.js";
 
 const FORBIDDEN_KEYS = new Set(["__proto__", "constructor", "prototype"]);
 
@@ -61,16 +63,18 @@ interface MultiplexedUserWatcher<
   unsubFirestore: () => void;
   latestSnapshot: { exists: boolean; user: UserRecord<TRole, TCapability, TPreferences, TAttributes> | null } | null;
   userCallbacks: Set<(user: UserRecord<TRole, TCapability, TPreferences, TAttributes> | null) => void>;
-  prefCallbacks: Set<(prefs: Partial<TPreferences>) => void>;
 }
 
 /**
  * Firestore implementation of `LanyardClientStore`.
  *
- * Uses a single canonical `users/{uid}` collection for profile, presence, `isSystemAdmin`,
- * single-tenant `roles`, `preferences`, and `attributes`, and multiplexes
- * `onSnapshot` listeners per UID so subscribing to both user state and preferences only
- * ever opens **1 Firestore document listener**.
+ * Uses a single canonical `users/{uid}` card for profile, presence, `isSystemAdmin`,
+ * single-tenant `roles`, and `attributes`, and multiplexes `onSnapshot` listeners per UID so
+ * repeated `subscribeToUser` calls only ever open **1 Firestore document listener**.
+ *
+ * Preferences live in the self-only `preferences` tier document, `users/{uid}/private/preferences`
+ * (or `{scope}/{scopeId}/members/{uid}/private/preferences` for scoped preferences), so other
+ * readers of the card never see them.
  */
 export class FirestoreClientStore<
   TRole extends string = string,
@@ -107,18 +111,10 @@ export class FirestoreClientStore<
     return [...this.defaultRoles];
   }
 
-  private extractPreferencesFromDocData(data: Record<string, any>): Partial<TPreferences> {
-    if (data.preferences && typeof data.preferences === "object" && !Array.isArray(data.preferences)) {
-      return sanitizeObjectPatch<TPreferences>(data.preferences);
-    }
-    return {} as Partial<TPreferences>;
-  }
-
   private parseUserRecord(
     uid: string,
     data: Record<string, any>
   ): UserRecord<TRole, TCapability, TPreferences, TAttributes> {
-    const prefs = this.extractPreferencesFromDocData(data);
     const attrs =
       data.attributes && typeof data.attributes === "object" && !Array.isArray(data.attributes)
         ? sanitizeObjectPatch<TAttributes>(data.attributes)
@@ -135,7 +131,6 @@ export class FirestoreClientStore<
       ...(typeof data.isSystemAdmin === "boolean" ? { isSystemAdmin: data.isSystemAdmin } : {}),
       ...(data.addedBy !== undefined ? { addedBy: data.addedBy } : {}),
       roles: this.extractRoles(data),
-      preferences: prefs,
       attributes: attrs,
       ...(data.createdAt !== undefined ? { createdAt: data.createdAt } : {}),
       ...(data.updatedAt !== undefined ? { updatedAt: data.updatedAt } : {})
@@ -149,8 +144,7 @@ export class FirestoreClientStore<
     const watcher: MultiplexedUserWatcher<TRole, TCapability, TPreferences, TAttributes> = {
       unsubFirestore: () => {},
       latestSnapshot: null,
-      userCallbacks: new Set(),
-      prefCallbacks: new Set()
+      userCallbacks: new Set()
     };
     this.userWatchers.set(cleanUid, watcher);
 
@@ -162,14 +156,7 @@ export class FirestoreClientStore<
           const parsed = this.parseUserRecord(cleanUid, snap.data() || {});
           watcher.latestSnapshot = { exists: true, user: parsed };
           for (const cb of watcher.userCallbacks) {
-            cb({
-              ...parsed,
-              preferences: { ...(parsed.preferences || {}) } as Partial<TPreferences>,
-              attributes: { ...(parsed.attributes || {}) } as Partial<TAttributes>
-            });
-          }
-          for (const cb of watcher.prefCallbacks) {
-            cb({ ...(parsed.preferences || {}) } as Partial<TPreferences>);
+            cb({ ...parsed, attributes: { ...(parsed.attributes || {}) } as Partial<TAttributes> });
           }
         } else {
           watcher.latestSnapshot = { exists: false, user: null };
@@ -192,7 +179,7 @@ export class FirestoreClientStore<
   private releaseWatcherIfUnused(cleanUid: string): void {
     const watcher = this.userWatchers.get(cleanUid);
     if (!watcher) return;
-    if (watcher.userCallbacks.size === 0 && watcher.prefCallbacks.size === 0) {
+    if (watcher.userCallbacks.size === 0) {
       this.userWatchers.delete(cleanUid);
       watcher.unsubFirestore();
     }
@@ -207,15 +194,7 @@ export class FirestoreClientStore<
     watcher.userCallbacks.add(onChange);
     if (watcher.latestSnapshot) {
       const u = watcher.latestSnapshot.user;
-      onChange(
-        u
-          ? {
-              ...u,
-              preferences: { ...(u.preferences || {}) } as Partial<TPreferences>,
-              attributes: { ...(u.attributes || {}) } as Partial<TAttributes>
-            }
-          : null
-      );
+      onChange(u ? { ...u, attributes: { ...(u.attributes || {}) } as Partial<TAttributes> } : null);
     }
     return () => {
       watcher.userCallbacks.delete(onChange);
@@ -247,46 +226,74 @@ export class FirestoreClientStore<
     );
   }
 
-  subscribeToPreferences(uid: string, onChange: (prefs: Partial<TPreferences>) => void): () => void {
+  private userPreferencesDocRef(uid: string) {
     const cleanUid = assertValidFirestoreDocId(uid, "uid");
-    const watcher = this.ensureUserWatcher(cleanUid);
-    watcher.prefCallbacks.add(onChange);
-    if (watcher.latestSnapshot?.exists && watcher.latestSnapshot.user) {
-      onChange({ ...(watcher.latestSnapshot.user.preferences || {}) } as Partial<TPreferences>);
-    }
-    return () => {
-      watcher.prefCallbacks.delete(onChange);
-      this.releaseWatcherIfUnused(cleanUid);
-    };
+    return doc(this.db, this.usersCollection, cleanUid, "private", "preferences");
+  }
+
+  private memberPreferencesDocRef(scopeId: string, uid: string) {
+    const cleanScopeId = assertValidFirestoreDocId(scopeId, "scopeId");
+    const cleanUid = assertValidFirestoreDocId(uid, "uid");
+    return doc(
+      this.db,
+      this.scopeCollection,
+      cleanScopeId,
+      this.membersSubcollection,
+      cleanUid,
+      "private",
+      "preferences"
+    );
+  }
+
+  /**
+   * Listens to a private preferences document, emitting `{}` when it doesn't exist. Permission or offline
+   * errors are ignored so cached preferences stay in place.
+   */
+  private subscribeToPreferencesDoc(
+    ref: DocumentReference,
+    onChange: (prefs: Partial<TPreferences>) => void
+  ): () => void {
+    return onSnapshot(
+      ref,
+      (snap) => onChange(snap.exists() ? readTierDocValues<TPreferences>(snap.data()) : {}),
+      () => {}
+    );
+  }
+
+  /** Merges a preferences patch into a private preferences document, stamping tier metadata. */
+  private async writePreferencesDoc(
+    ref: DocumentReference,
+    uid: string,
+    scopeId: string | null,
+    patch: Partial<TPreferences>
+  ): Promise<void> {
+    const cleanPatch = sanitizeObjectPatch<TPreferences>(patch);
+    assertNoReservedTierKeys(cleanPatch, "preferences");
+    await setDoc(ref, { ...cleanPatch, ...tierDocMetadata("preferences", uid, scopeId) }, { merge: true });
+  }
+
+  subscribeToPreferences(uid: string, onChange: (prefs: Partial<TPreferences>) => void): () => void {
+    return this.subscribeToPreferencesDoc(this.userPreferencesDocRef(uid), onChange);
+  }
+
+  subscribeToScopePreferences(
+    scopeId: string,
+    uid: string,
+    onChange: (prefs: Partial<TPreferences>) => void
+  ): () => void {
+    return this.subscribeToPreferencesDoc(this.memberPreferencesDocRef(scopeId, uid), onChange);
   }
 
   async savePreferences(uid: string, patch: Partial<TPreferences>): Promise<void> {
     const cleanUid = assertValidFirestoreDocId(uid, "uid");
-    const userRef = doc(this.db, this.usersCollection, cleanUid);
-    const cleanPatch = sanitizeObjectPatch<TPreferences>(patch);
-    await setDoc(
-      userRef,
-      {
-        uid: cleanUid,
-        preferences: cleanPatch,
-        updatedAt: new Date().toISOString()
-      },
-      { merge: true }
-    );
+    await this.writePreferencesDoc(this.userPreferencesDocRef(cleanUid), cleanUid, null, patch);
   }
 
   async saveScopePreferences(scopeId: string, uid: string, patch: Partial<TPreferences>): Promise<void> {
     const cleanScopeId = assertValidFirestoreDocId(scopeId, "scopeId");
     const cleanUid = assertValidFirestoreDocId(uid, "uid");
-    const cleanPatch = sanitizeObjectPatch<TPreferences>(patch);
-    if (Object.keys(cleanPatch).length === 0) return;
-
-    const memberRef = doc(this.db, this.scopeCollection, cleanScopeId, this.membersSubcollection, cleanUid);
-    const dotPayload: Record<string, any> = {};
-    for (const [k, v] of Object.entries(cleanPatch)) {
-      dotPayload[`preferences.${k}`] = v;
-    }
-    await updateDoc(memberRef, dotPayload);
+    if (Object.keys(sanitizeObjectPatch<TPreferences>(patch)).length === 0) return;
+    await this.writePreferencesDoc(this.memberPreferencesDocRef(cleanScopeId, cleanUid), cleanUid, cleanScopeId, patch);
   }
 
   async updateUserProfile(uid: string, patch: UserProfilePatch): Promise<void> {
@@ -385,9 +392,6 @@ export class FirestoreClientStore<
       scopeId,
       scopeName: data.scopeName,
       lastSeen: data.lastSeen,
-      ...(data.preferences && typeof data.preferences === "object" && !Array.isArray(data.preferences)
-        ? { preferences: sanitizeObjectPatch<TPreferences>(data.preferences) }
-        : {}),
       ...(data.attributes && typeof data.attributes === "object" && !Array.isArray(data.attributes)
         ? { attributes: sanitizeObjectPatch<TAttributes>(data.attributes) }
         : {})
