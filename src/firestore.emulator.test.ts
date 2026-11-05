@@ -1,5 +1,5 @@
 import { spawn, type ChildProcess } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, readdirSync } from "node:fs";
 import { type Server as HttpServer } from "node:http";
 import { createRequire } from "node:module";
 import { createServer } from "node:net";
@@ -37,7 +37,28 @@ import { createPermissionPolicy, GLOBAL_SCOPE, type LanyardReadable } from "./co
 import { FirestoreServerStore } from "./server/firestore.js";
 import { createLanyardServer, isEncryptedSecretData } from "./server/index.js";
 
-const EMULATOR_JAR = join(homedir(), ".cache", "firebase", "emulators", "cloud-firestore-emulator-v1.21.0.jar");
+/**
+ * Resolves the Cloud Firestore Emulator jar: `FIRESTORE_EMULATOR_JAR` if set, otherwise the newest
+ * `cloud-firestore-emulator-v*.jar` downloaded by firebase-tools into `~/.cache/firebase/emulators`.
+ */
+function resolveFirestoreEmulatorJar(): string {
+  if (process.env.FIRESTORE_EMULATOR_JAR) return process.env.FIRESTORE_EMULATOR_JAR;
+  const emulatorsDir = join(homedir(), ".cache", "firebase", "emulators");
+  if (!existsSync(emulatorsDir)) return "";
+  const jars = readdirSync(emulatorsDir)
+    .map((name) => ({ name, match: /^cloud-firestore-emulator-v(\d+)\.(\d+)\.(\d+)\.jar$/.exec(name) }))
+    .filter((entry): entry is { name: string; match: RegExpExecArray } => entry.match !== null)
+    .sort((a, b) => {
+      for (let i = 1; i <= 3; i++) {
+        const diff = Number(b.match[i]) - Number(a.match[i]);
+        if (diff !== 0) return diff;
+      }
+      return 0;
+    });
+  return jars.length > 0 ? join(emulatorsDir, jars[0].name) : "";
+}
+
+const EMULATOR_JAR = resolveFirestoreEmulatorJar();
 const AUTH_EMULATOR_SERVER_JS = join(
   dirname(process.execPath),
   "..",
@@ -67,10 +88,29 @@ function getFreePort(): Promise<number> {
 }
 
 async function startFirestoreEmulator(port: number): Promise<ChildProcess> {
+  // Newer emulator jars also start WebChannel/WebSocket servers on fixed default ports; pick free ones so the
+  // tests don't collide with any other Firestore emulator already running on this machine.
+  const webchannelPort = await getFreePort();
+  const websocketPort = await getFreePort();
   return new Promise((resolve, reject) => {
-    const proc = spawn("java", ["-jar", EMULATOR_JAR, "--host", "127.0.0.1", "--port", String(port)], {
-      stdio: ["ignore", "pipe", "pipe"]
-    });
+    const proc = spawn(
+      "java",
+      [
+        "-jar",
+        EMULATOR_JAR,
+        "--host",
+        "127.0.0.1",
+        "--port",
+        String(port),
+        "--webchannel_port",
+        String(webchannelPort),
+        "--websocket_port",
+        String(websocketPort)
+      ],
+      {
+        stdio: ["ignore", "pipe", "pipe"]
+      }
+    );
 
     let settled = false;
     const timeout = setTimeout(() => {
@@ -153,7 +193,19 @@ function createMockRes() {
   return res;
 }
 
-describe.skipIf(!existsSync(EMULATOR_JAR) || !existsSync(AUTH_EMULATOR_SERVER_JS))(
+const emulatorsAvailable = existsSync(EMULATOR_JAR) && existsSync(AUTH_EMULATOR_SERVER_JS);
+if (!emulatorsAvailable) {
+  const message =
+    `Firestore/Auth emulator integration tests cannot run (Firestore jar: '${EMULATOR_JAR || "not found"}', ` +
+    `Auth emulator: '${AUTH_EMULATOR_SERVER_JS}'). Install firebase-tools and run 'firebase setup:emulators:firestore'.`;
+  // Set LANYARD_REQUIRE_EMULATORS=1 (e.g. in CI) to fail instead of silently skipping these security-critical tests
+  if (process.env.LANYARD_REQUIRE_EMULATORS === "1") {
+    throw new Error(message);
+  }
+  console.warn(`[lanyard] SKIPPING: ${message}`);
+}
+
+describe.skipIf(!emulatorsAvailable)(
   "Real Cloud Firestore & Firebase Auth Emulator integration tests (FirestoreServerStore + FirestoreClientStore)",
   () => {
     let emulatorProc: ChildProcess | null = null;
@@ -171,21 +223,20 @@ describe.skipIf(!existsSync(EMULATOR_JAR) || !existsSync(AUTH_EMULATOR_SERVER_JS
     let clientAuth: ClientAuth;
 
     beforeAll(async () => {
-      emulatorPort = await getFreePort();
-      authEmulatorPort = await getFreePort();
       projectId = `lanyard-emu-test-${Date.now()}`;
-
       origEmulatorHost = process.env.FIRESTORE_EMULATOR_HOST;
       origAuthEmulatorHost = process.env.FIREBASE_AUTH_EMULATOR_HOST;
-      process.env.FIRESTORE_EMULATOR_HOST = `127.0.0.1:${emulatorPort}`;
-      process.env.FIREBASE_AUTH_EMULATOR_HOST = `127.0.0.1:${authEmulatorPort}`;
 
-      const [fsProc, authSrv] = await Promise.all([
-        startFirestoreEmulator(emulatorPort),
-        startAuthEmulator(authEmulatorPort, projectId)
-      ]);
-      emulatorProc = fsProc;
-      authEmulatorServer = authSrv;
+      // Start the in-process Auth emulator first so its port is bound before the Firestore emulator launches:
+      // newer Firestore emulator jars bind additional ports during/after startup, which can otherwise steal a
+      // pre-selected port.
+      authEmulatorPort = await getFreePort();
+      process.env.FIREBASE_AUTH_EMULATOR_HOST = `127.0.0.1:${authEmulatorPort}`;
+      authEmulatorServer = await startAuthEmulator(authEmulatorPort, projectId);
+
+      emulatorPort = await getFreePort();
+      process.env.FIRESTORE_EMULATOR_HOST = `127.0.0.1:${emulatorPort}`;
+      emulatorProc = await startFirestoreEmulator(emulatorPort);
 
       adminApp = initializeAdminApp({ projectId }, "lanyard-admin-emu");
       adminDb = getAdminFirestore(adminApp);
