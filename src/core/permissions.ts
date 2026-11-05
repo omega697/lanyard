@@ -264,6 +264,9 @@ export function createPermissionPolicy<TRole extends string = string, TCapabilit
   const cardAttributeKeys = Array.isArray(config.cardFields?.attributes)
     ? Array.from(new Set(config.cardFields!.attributes.filter(isSafeKey)))
     : [];
+  if (cardAttributeKeys.includes("email")) {
+    throw new Error("Invalid cardFields.attributes: 'email' is not an attribute; use cardFields.email instead.");
+  }
   const cardFields = Object.freeze({
     email: Boolean(config.cardFields?.email),
     attributes: Object.freeze(cardAttributeKeys)

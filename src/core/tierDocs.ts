@@ -22,6 +22,29 @@ export function assertNoReservedTierKeys(patch: Record<string, any>, label: stri
 }
 
 /**
+ * Throws if an `attributes` patch uses a reserved key: `_lanyard`, or `email` (stored alongside attributes in the
+ * `attributes` tier document and written only through profile/email APIs).
+ * @internal Shared by the Lanyard stores; not part of the public API.
+ */
+export function assertNoReservedAttributeKeys(patch: Record<string, any>): void {
+  assertNoReservedTierKeys(patch, "attributes");
+  if (Object.prototype.hasOwnProperty.call(patch, "email")) {
+    throw new Error("Invalid attributes key 'email': reserved for the user's email address");
+  }
+}
+
+/**
+ * Splits the values of an `attributes` tier document into its attributes and the stored `email`, if any.
+ * @internal Shared by the Lanyard stores; not part of the public API.
+ */
+export function splitAttributesTierValues<T extends Record<string, any>>(
+  values: Record<string, any>
+): { attributes: Partial<T>; email: string | undefined } {
+  const { email, ...attributes } = values;
+  return { attributes: attributes as Partial<T>, email: typeof email === "string" && email ? email : undefined };
+}
+
+/**
  * Builds the metadata field Lanyard stamps on a private tier document write.
  * @internal Shared by the Lanyard stores; not part of the public API.
  */

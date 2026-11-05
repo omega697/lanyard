@@ -246,6 +246,7 @@ export function createLanyardClient<
   let latestMemberships: ScopedMember<TRole, TCapability, TPreferences, TAttributes>[] = [];
   const scopePreferences = new Map<string, Partial<TPreferences>>();
   const scopeAttributes = new Map<string, Partial<TAttributes>>();
+  const scopeEmails = new Map<string, string>();
   const scopeTierUnsubs = new Map<string, Array<() => void>>();
 
   function publishMemberships(isLoading: boolean): void {
@@ -254,8 +255,10 @@ export function createLanyardClient<
         if (!m.scopeId) return m;
         const prefs = scopePreferences.get(m.scopeId);
         const attrs = scopeAttributes.get(m.scopeId);
+        const email = scopeEmails.get(m.scopeId);
         return {
           ...m,
+          ...(email ? { email } : {}),
           ...(prefs ? { preferences: { ...prefs } } : {}),
           ...(attrs ? { attributes: { ...(m.attributes || {}), ...attrs } } : {})
         };
@@ -273,6 +276,7 @@ export function createLanyardClient<
       scopeTierUnsubs.delete(scopeId);
       scopePreferences.delete(scopeId);
       scopeAttributes.delete(scopeId);
+      scopeEmails.delete(scopeId);
     }
     for (const scopeId of activeScopeIds) {
       if (scopeTierUnsubs.has(scopeId)) continue;
@@ -288,8 +292,10 @@ export function createLanyardClient<
       }
       if (typeof store.subscribeToScopeAttributes === "function") {
         unsubs.push(
-          store.subscribeToScopeAttributes(scopeId, uid, (attrs) => {
+          store.subscribeToScopeAttributes(scopeId, uid, (attrs, email) => {
             scopeAttributes.set(scopeId, sanitizePreferencesObject<TAttributes>(attrs));
+            if (email) scopeEmails.set(scopeId, email);
+            else scopeEmails.delete(scopeId);
             publishMemberships(membershipsStoreInternal.get().isLoading);
           })
         );
@@ -318,6 +324,7 @@ export function createLanyardClient<
     scopeTierUnsubs.clear();
     scopePreferences.clear();
     scopeAttributes.clear();
+    scopeEmails.clear();
     latestMemberships = [];
     cardAttributes = {};
     tierAttributes = {};
@@ -376,96 +383,108 @@ export function createLanyardClient<
       }
     }
 
+    // userRecordStore combines the card with the user's own attributes tier, which holds a private email.
+    type OwnRecord = UserRecord<TRole, TCapability, TPreferences, TAttributes>;
+    let latestCard: OwnRecord | null = null;
+    let tierEmail: string | undefined;
+    const withTierEmail = (record: OwnRecord | null): OwnRecord | null =>
+      record && tierEmail ? { ...record, email: tierEmail } : record;
+
+    const handleUserRecord = (record: OwnRecord | null): void => {
+      userRecordStoreInternal.set(record);
+      if (record) {
+        cardAttributes = record.attributes || {};
+        publishAttributes();
+
+        // If a provisioned global user record exists with a stale/missing photoUrl, sync it once
+        const isProvisionedProfile = Boolean(
+          record.email || record.isSystemAdmin || record.firstName || record.lastName
+        );
+        if (
+          isProvisionedProfile &&
+          user.photoUrl &&
+          record.photoUrl !== user.photoUrl &&
+          typeof store.syncAvatar === "function"
+        ) {
+          if (syncedAvatars.get(globalUserSyncKey) !== user.photoUrl) {
+            syncedAvatars.set(globalUserSyncKey, user.photoUrl);
+            store
+              .syncAvatar({
+                uid: user.uid,
+                photoUrl: user.photoUrl,
+                email: user.email,
+                displayName: user.displayName
+              })
+              .catch(() => {
+                syncedAvatars.delete(globalUserSyncKey);
+              });
+          }
+        }
+
+        // If a verified email change occurred on Firebase Auth, invoke onVerifiedEmailChange and sync the new email to users/{uid}
+        const emailSyncKey = `email:${user.uid}`;
+        if (
+          user.email &&
+          user.emailVerified &&
+          record.email &&
+          record.email.toLowerCase() !== user.email.toLowerCase() &&
+          (typeof store.updateUserProfile === "function" || typeof onVerifiedEmailChange === "function")
+        ) {
+          if (syncedAvatars.get(emailSyncKey) !== user.email) {
+            const previousEmail = record.email;
+            const nextEmail = user.email;
+            syncedAvatars.set(emailSyncKey, nextEmail);
+            Promise.resolve()
+              .then(async () => {
+                if (typeof onVerifiedEmailChange === "function") {
+                  await onVerifiedEmailChange({
+                    uid: user.uid,
+                    email: nextEmail,
+                    previousEmail
+                  });
+                }
+                if (typeof store.updateUserProfile === "function") {
+                  await store.updateUserProfile(user.uid, { email: nextEmail });
+                }
+              })
+              .catch(() => {
+                syncedAvatars.delete(emailSyncKey);
+              });
+          }
+        }
+
+        // Real-time system admin promotion/demotion sync from users/{uid}
+        if (typeof record.isSystemAdmin === "boolean") {
+          const currentAuth = authStoreInternal.get();
+          if (
+            currentAuth.user &&
+            currentAuth.user.uid === user.uid &&
+            currentAuth.user.isAdmin !== record.isSystemAdmin
+          ) {
+            authStoreInternal.set({
+              ...currentAuth,
+              user: { ...currentAuth.user, isAdmin: record.isSystemAdmin }
+            });
+            // Force-refresh the Firebase Auth ID token in the background so custom claims update immediately
+            if (
+              auth?.currentUser &&
+              auth.currentUser.uid === user.uid &&
+              typeof auth.currentUser.getIdTokenResult === "function"
+            ) {
+              auth.currentUser.getIdTokenResult(true).catch(() => {});
+            }
+          }
+        }
+      } else {
+        cardAttributes = {};
+        publishAttributes();
+      }
+    };
+
     if (typeof store.subscribeToUser === "function") {
       unsubUser = store.subscribeToUser(user.uid, (record) => {
-        userRecordStoreInternal.set(record);
-        if (record) {
-          cardAttributes = record.attributes || {};
-          publishAttributes();
-
-          // If a provisioned global user record exists with a stale/missing photoUrl, sync it once
-          const isProvisionedProfile = Boolean(
-            record.email || record.isSystemAdmin || record.firstName || record.lastName
-          );
-          if (
-            isProvisionedProfile &&
-            user.photoUrl &&
-            record.photoUrl !== user.photoUrl &&
-            typeof store.syncAvatar === "function"
-          ) {
-            if (syncedAvatars.get(globalUserSyncKey) !== user.photoUrl) {
-              syncedAvatars.set(globalUserSyncKey, user.photoUrl);
-              store
-                .syncAvatar({
-                  uid: user.uid,
-                  photoUrl: user.photoUrl,
-                  email: user.email,
-                  displayName: user.displayName
-                })
-                .catch(() => {
-                  syncedAvatars.delete(globalUserSyncKey);
-                });
-            }
-          }
-
-          // If a verified email change occurred on Firebase Auth, invoke onVerifiedEmailChange and sync the new email to users/{uid}
-          const emailSyncKey = `email:${user.uid}`;
-          if (
-            user.email &&
-            user.emailVerified &&
-            record.email &&
-            record.email.toLowerCase() !== user.email.toLowerCase() &&
-            (typeof store.updateUserProfile === "function" || typeof onVerifiedEmailChange === "function")
-          ) {
-            if (syncedAvatars.get(emailSyncKey) !== user.email) {
-              const previousEmail = record.email;
-              const nextEmail = user.email;
-              syncedAvatars.set(emailSyncKey, nextEmail);
-              Promise.resolve()
-                .then(async () => {
-                  if (typeof onVerifiedEmailChange === "function") {
-                    await onVerifiedEmailChange({
-                      uid: user.uid,
-                      email: nextEmail,
-                      previousEmail
-                    });
-                  }
-                  if (typeof store.updateUserProfile === "function") {
-                    await store.updateUserProfile(user.uid, { email: nextEmail });
-                  }
-                })
-                .catch(() => {
-                  syncedAvatars.delete(emailSyncKey);
-                });
-            }
-          }
-
-          // Real-time system admin promotion/demotion sync from users/{uid}
-          if (typeof record.isSystemAdmin === "boolean") {
-            const currentAuth = authStoreInternal.get();
-            if (
-              currentAuth.user &&
-              currentAuth.user.uid === user.uid &&
-              currentAuth.user.isAdmin !== record.isSystemAdmin
-            ) {
-              authStoreInternal.set({
-                ...currentAuth,
-                user: { ...currentAuth.user, isAdmin: record.isSystemAdmin }
-              });
-              // Force-refresh the Firebase Auth ID token in the background so custom claims update immediately
-              if (
-                auth?.currentUser &&
-                auth.currentUser.uid === user.uid &&
-                typeof auth.currentUser.getIdTokenResult === "function"
-              ) {
-                auth.currentUser.getIdTokenResult(true).catch(() => {});
-              }
-            }
-          }
-        } else {
-          cardAttributes = {};
-          publishAttributes();
-        }
+        latestCard = record;
+        handleUserRecord(withTierEmail(record));
       });
     }
 
@@ -474,9 +493,13 @@ export function createLanyardClient<
     });
 
     if (typeof store.subscribeToAttributes === "function") {
-      unsubAttributes = store.subscribeToAttributes(user.uid, (attrs) => {
+      unsubAttributes = store.subscribeToAttributes(user.uid, (attrs, email) => {
         tierAttributes = attrs;
         publishAttributes();
+        if (email !== tierEmail) {
+          tierEmail = email;
+          if (latestCard) handleUserRecord(withTierEmail(latestCard));
+        }
       });
     }
 

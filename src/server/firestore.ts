@@ -11,10 +11,12 @@ import {
   type UserRecord
 } from "../core/index.js";
 import {
+  assertNoReservedAttributeKeys,
   assertNoReservedTierKeys,
   readTierDocValues,
   resolveCardFields,
   splitAttributesByPlacement,
+  splitAttributesTierValues,
   tierDocMetadata
 } from "../core/tierDocs.js";
 import { createSecretCipher, isEncryptedSecretData } from "./encryption.js";
@@ -81,8 +83,9 @@ type MergedTier = "preferences" | "attributes";
  * Firebase Admin Firestore implementation of `LanyardServerStore`.
  *
  * Uses a single canonical `users/{uid}` card document for profile, presence, `isSystemAdmin`,
- * single-tenant `roles`, and card-placed `attributes` (`cardFields.attributes`), plus private tier documents
- * in the `private` subcollection: self-only `private/preferences`, self + staff `private/attributes`,
+ * single-tenant `roles`, and card-placed fields (`cardFields`), plus private tier documents in the `private`
+ * subcollection: self-only `private/preferences`, self + staff `private/attributes` (including `email` unless
+ * `cardFields.email` is set),
  * `private/hiddenAttributes`, and AES-256-GCM encrypted `private/secrets`.
  * Scoped members (`{scopeCollection}/{scopeId}/{membersSubcollection}/{uid}`) use the same layout.
  * Reads merge the tiers back together, so records keep the same shape regardless of placement.
@@ -167,33 +170,52 @@ export class FirestoreServerStore<
     );
   }
 
-  /** Sanitizes and validates a patch for a tier document (throws on reserved metadata keys). */
+  /** Sanitizes and validates a patch for a tier document (throws on reserved keys). */
   private cleanTierPatch<T extends Record<string, any>>(patch: Partial<T>, tier: MergedTier): Partial<T> {
     const clean = sanitizeObjectPatch<T>(patch);
-    assertNoReservedTierKeys(clean, tier);
+    if (tier === "attributes") assertNoReservedAttributeKeys(clean);
+    else assertNoReservedTierKeys(clean, tier);
     return clean;
   }
 
   /**
-   * Splits `attributes` into card-placed keys and `attributes`-tier keys, writing the tier keys to their
-   * private document. Returns the card-placed keys for the caller to store on the card.
+   * Splits `attributes` into card-placed keys and `attributes`-tier keys, writing the tier keys (plus `email`,
+   * when it belongs in the tier and is non-empty) to their private document. Returns the card-placed keys for
+   * the caller to store on the card.
    */
   private async writeAttributesTier(
     uid: string,
     scopeId: string | null,
-    attributes: Partial<TAttributes>
+    attributes: Partial<TAttributes> | undefined,
+    email?: string
   ): Promise<Partial<TAttributes>> {
-    const { card, tier } = splitAttributesByPlacement(this.cleanTierPatch(attributes, "attributes"), this.cardFields);
-    if (Object.keys(tier).length > 0) await this.writeTierDoc("attributes", uid, scopeId, tier);
+    const { card, tier } = splitAttributesByPlacement(
+      this.cleanTierPatch(attributes || {}, "attributes"),
+      this.cardFields
+    );
+    const tierEmail = this.tierEmail(email);
+    const tierValues: Record<string, any> = { ...tier, ...(tierEmail ? { email: tierEmail } : {}) };
+    if (Object.keys(tierValues).length > 0) await this.writeTierDoc("attributes", uid, scopeId, tierValues);
     return card;
   }
 
+  /**
+   * Returns the email to store in the `attributes` tier, or `undefined` if email lives on the card or none was
+   * given. Empty emails are never written, so records read without their tier can't erase a stored address.
+   */
+  private tierEmail(email: string | undefined): string | undefined {
+    return !this.cardFields.email && typeof email === "string" && email ? email : undefined;
+  }
+
+  /** Card fields for `email`: kept on the card only when `cardFields.email` places it there. */
+  private cardEmailField(email: string | undefined): { email?: string } {
+    return this.cardFields.email && email !== undefined ? { email } : {};
+  }
+
   /** Reads the private tiers of a user/member and merges them into its parsed card. */
-  private async mergePrivateTiers<R extends { attributes?: Partial<TAttributes>; preferences?: Partial<TPreferences> }>(
-    card: R,
-    uid: string,
-    scopeId: string | null
-  ): Promise<R> {
+  private async mergePrivateTiers<
+    R extends { email: string; attributes?: Partial<TAttributes>; preferences?: Partial<TPreferences> }
+  >(card: R, uid: string, scopeId: string | null): Promise<R> {
     const [prefsSnap, attrsSnap] = await Promise.all([
       this.tierDocRef("preferences", uid, scopeId).get(),
       this.tierDocRef("attributes", uid, scopeId).get()
@@ -201,9 +223,18 @@ export class FirestoreServerStore<
     const merged = { ...card };
     if (prefsSnap.exists) merged.preferences = readTierDocValues<TPreferences>(prefsSnap.data());
     if (attrsSnap.exists) {
-      merged.attributes = { ...(card.attributes || {}), ...readTierDocValues<TAttributes>(attrsSnap.data()) };
+      const { attributes, email } = splitAttributesTierValues<TAttributes>(readTierDocValues(attrsSnap.data()));
+      merged.attributes = { ...(card.attributes || {}), ...attributes };
+      if (!this.cardFields.email) merged.email = email || "";
     }
     return merged;
+  }
+
+  /** Reads a user's email from wherever `cardFields.email` places it. */
+  private async readEmail(cardData: Record<string, any>, uid: string): Promise<string> {
+    if (this.cardFields.email) return cardData.email || "";
+    const snap = await this.tierDocRef("attributes", uid, null).get();
+    return snap.exists ? splitAttributesTierValues(readTierDocValues(snap.data())).email || "" : "";
   }
 
   /** Deletes the private tier documents merged into user/member records. */
@@ -296,7 +327,8 @@ export class FirestoreServerStore<
   ): UserRecord<TRole, TCapability, TPreferences, TAttributes> {
     return {
       uid: data.uid || docId,
-      email: data.email || "",
+      // Private emails are merged from the attributes tier by mergePrivateTiers
+      email: this.cardFields.email ? data.email || "" : "",
       ...(data.displayName !== undefined ? { displayName: data.displayName } : {}),
       ...(data.firstName !== undefined ? { firstName: data.firstName } : {}),
       ...(data.lastName !== undefined ? { lastName: data.lastName } : {}),
@@ -348,14 +380,15 @@ export class FirestoreServerStore<
    */
   async upsertUser(user: UserRecord<TRole, TCapability, TPreferences, TAttributes>): Promise<void> {
     const cleanUid = assertValidFirestoreDocId(user.uid, "uid");
-    const { preferences, attributes, ...card } = user;
+    const { preferences, attributes, email, ...card } = user;
     // Validate both tier patches before writing anything
     const cleanPrefs = preferences !== undefined ? this.cleanTierPatch(preferences, "preferences") : undefined;
     if (attributes !== undefined) this.cleanTierPatch(attributes, "attributes");
     if (cleanPrefs !== undefined) await this.writeTierDoc("preferences", cleanUid, null, cleanPrefs);
-    const cardAttributes = attributes !== undefined ? await this.writeAttributesTier(cleanUid, null, attributes) : {};
+    const cardAttributes = await this.writeAttributesTier(cleanUid, null, attributes, email);
     const payload = stripUndefinedFields({
       ...card,
+      ...this.cardEmailField(email),
       uid: cleanUid,
       ...(card.photoUrl !== undefined ? { photoUrl: sanitizeAvatarUrl(card.photoUrl) } : {}),
       ...(card.roles !== undefined ? { roles: Array.from(new Set(card.roles)) } : {}),
@@ -466,7 +499,7 @@ export class FirestoreServerStore<
     if (!data.isSystemAdmin) return null;
     return {
       uid: snap.id,
-      email: data.email || "",
+      email: await this.readEmail(data, snap.id),
       displayName: data.displayName,
       firstName: data.firstName,
       lastName: data.lastName,
@@ -489,7 +522,7 @@ export class FirestoreServerStore<
       if (!data.isSystemAdmin) continue;
       results.push({
         uid: d.id,
-        email: data.email || "",
+        email: await this.readEmail(data, d.id),
         displayName: data.displayName,
         firstName: data.firstName,
         lastName: data.lastName,
@@ -506,8 +539,11 @@ export class FirestoreServerStore<
 
   async upsertSystemAdmin(profile: SystemAdminProfile): Promise<void> {
     const cleanUid = assertValidFirestoreDocId(profile.uid, "uid");
+    const { email, ...card } = profile;
+    await this.writeAttributesTier(cleanUid, null, undefined, email);
     const payload = stripUndefinedFields({
-      ...profile,
+      ...card,
+      ...this.cardEmailField(email),
       uid: cleanUid,
       isSystemAdmin: profile.isSystemAdmin ?? true,
       ...(profile.photoUrl !== undefined ? { photoUrl: sanitizeAvatarUrl(profile.photoUrl) } : {})
@@ -536,7 +572,8 @@ export class FirestoreServerStore<
   ): ScopedMember<TRole, TCapability, TPreferences, TAttributes> {
     return {
       uid: data.uid || docId,
-      email: data.email || "",
+      // Private emails are merged from the attributes tier by mergePrivateTiers
+      email: this.cardFields.email ? data.email || "" : "",
       ...(data.firstName !== undefined ? { firstName: data.firstName } : {}),
       ...(data.lastName !== undefined ? { lastName: data.lastName } : {}),
       ...(data.displayName !== undefined ? { displayName: data.displayName } : {}),
@@ -587,15 +624,15 @@ export class FirestoreServerStore<
   ): Promise<void> {
     const cleanScopeId = assertValidFirestoreDocId(scopeId, "scopeId");
     const cleanUid = assertValidFirestoreDocId(member.uid, "uid");
-    const { preferences, attributes, ...card } = member;
+    const { preferences, attributes, email, ...card } = member;
     // Validate both tier patches before writing anything
     const cleanPrefs = preferences !== undefined ? this.cleanTierPatch(preferences, "preferences") : undefined;
     if (attributes !== undefined) this.cleanTierPatch(attributes, "attributes");
     if (cleanPrefs !== undefined) await this.writeTierDoc("preferences", cleanUid, cleanScopeId, cleanPrefs);
-    const cardAttributes =
-      attributes !== undefined ? await this.writeAttributesTier(cleanUid, cleanScopeId, attributes) : {};
+    const cardAttributes = await this.writeAttributesTier(cleanUid, cleanScopeId, attributes, email);
     const payload = stripUndefinedFields({
       ...card,
+      ...this.cardEmailField(email),
       ...(card.photoUrl !== undefined ? { photoUrl: sanitizeAvatarUrl(card.photoUrl) } : {}),
       uid: cleanUid,
       scopeId: cleanScopeId,

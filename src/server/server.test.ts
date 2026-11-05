@@ -1611,11 +1611,14 @@ describe("lanyard/server unit tests", () => {
 
     // Attributes live in the private attributes tier, never on the card (no cardFields configured)
     expect(docs.get("users/u-1")?.attributes).toBeUndefined();
+    // ...and so does the (private by default) email
+    expect(docs.get("users/u-1")?.email).toBeUndefined();
     expect(docs.get("users/u-1/private/attributes")).toEqual({
       pointsAllTime: 250,
+      email: "u1@example.com",
       _lanyard: { tier: "attributes", uid: "u-1", scopeId: null, updatedAt: expect.any(String) }
     });
-    expect((await fsStore.getUser("u-1"))?.attributes).toEqual({ pointsAllTime: 250 });
+    expect(await fsStore.getUser("u-1")).toMatchObject({ email: "u1@example.com", attributes: { pointsAllTime: 250 } });
     expect(docs.get("users/u-1")?.note).toBeUndefined();
     expect(docs.get("users/u-1")?.geminiKey).toBeUndefined();
     expect(docs.get("users/u-1/private/hiddenAttributes")).toEqual({ note: "Top secret" });
@@ -1659,6 +1662,7 @@ describe("lanyard/server unit tests", () => {
     expect(docs.get("workspaces/ws-1/members/u-1")?.attributes).toBeUndefined();
     expect(docs.get("workspaces/ws-1/members/u-1/private/attributes")).toEqual({
       pointsAllTime: 77,
+      email: "u1@example.com",
       _lanyard: { tier: "attributes", uid: "u-1", scopeId: "ws-1", updatedAt: expect.any(String) }
     });
     expect((await fsStore.getScopeMember("ws-1", "u-1"))?.attributes).toEqual({ pointsAllTime: 77 });

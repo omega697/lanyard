@@ -18,6 +18,7 @@ import {
   getAuth as getClientAuth,
   GoogleAuthProvider,
   signInWithCredential,
+  signInWithEmailAndPassword,
   type Auth as ClientAuth
 } from "firebase/auth";
 import {
@@ -1046,6 +1047,18 @@ service cloud.firestore {
         request.resource.data._lanyard.scopeId == scopeId;
     }
 
+    // Owners may write only their own verified Firebase Auth email (plus Lanyard metadata) to their attributes tier
+    function isOwnVerifiedEmailWrite(uid, scopeId) {
+      return request.auth.token.email_verified == true &&
+        request.resource.data.email == request.auth.token.email.lower() &&
+        request.resource.data._lanyard.tier == 'attributes' &&
+        request.resource.data._lanyard.uid == uid &&
+        request.resource.data._lanyard.scopeId == scopeId &&
+        (resource == null
+          ? request.resource.data.keys().hasOnly(['email', '_lanyard'])
+          : request.resource.data.diff(resource.data).affectedKeys().hasOnly(['email', '_lanyard']));
+    }
+
     function hasUserCapability(rolesImplyingCapability) {
       return isAdmin() || (
         isSignedIn() &&
@@ -1080,9 +1093,10 @@ service cloud.firestore {
         allow write: if isOwner(uid) && isPreferencesTierDoc(uid, null);
       }
 
-      // Self + staff attributes tier; written only by the server (Admin SDK)
+      // Self + staff attributes tier; written by the server (Admin SDK), except owners syncing their verified email
       match /private/attributes {
         allow read: if isOwner(uid) || hasUserCapability(['manager', 'owner']);
+        allow write: if isOwner(uid) && isOwnVerifiedEmailWrite(uid, null);
       }
     }
 
@@ -1104,7 +1118,7 @@ service cloud.firestore {
 
       match /private/attributes {
         allow read: if isOwner(memberUid) || hasScopeCapability(scopeId, ['owner', 'manager']);
-        allow write: if false;
+        allow write: if isOwner(memberUid) && isScopeMember(scopeId) && isOwnVerifiedEmailWrite(memberUid, scopeId);
       }
 
       match /private/preferences {
@@ -1132,8 +1146,10 @@ service cloud.firestore {
       });
       expect(rulesRes.status).toBe(200);
 
-      async function createAuthedClient(uid: string, email: string, isAdmin = false) {
-        await adminAuth.createUser({ uid, email, emailVerified: true });
+      async function createAuthedClient(uid: string, email: string, isAdmin = false, emailVerified = true) {
+        // Unverified users sign in with a password: Google sign-in won't attach to an unverified-email account
+        const password = emailVerified ? undefined : "emulator-test-password";
+        await adminAuth.createUser({ uid, email, emailVerified, ...(password ? { password } : {}) });
         if (isAdmin) {
           await adminAuth.setCustomUserClaims(uid, { admin: true });
         }
@@ -1143,16 +1159,20 @@ service cloud.firestore {
         );
         const auth = getClientAuth(app);
         connectAuthEmulator(auth, `http://127.0.0.1:${authEmulatorPort}`, { disableWarnings: true });
-        await signInWithCredential(
-          auth,
-          GoogleAuthProvider.credential(
-            JSON.stringify({
-              sub: uid,
-              email,
-              email_verified: true
-            })
-          )
-        );
+        if (password) {
+          await signInWithEmailAndPassword(auth, email, password);
+        } else {
+          await signInWithCredential(
+            auth,
+            GoogleAuthProvider.credential(
+              JSON.stringify({
+                sub: uid,
+                email,
+                email_verified: true
+              })
+            )
+          );
+        }
         const db = getClientFirestore(app);
         connectFirestoreEmulator(db, "127.0.0.1", emulatorPort);
         return { app, auth, db };
@@ -1535,6 +1555,86 @@ service cloud.firestore {
         await expect(
           clientGetDoc(clientDoc(mgrClient.db, "workspaces", "org-B", "members", "u-other", "private", "attributes"))
         ).rejects.toMatchObject({ code: "permission-denied" });
+
+        // Attack G: Email is private (stored in the attributes tier, never on cards), and owners can only write
+        // their own verified Firebase Auth email there
+        expect((await adminDb.doc("workspaces/org-A/members/u-mgr").get()).data()).not.toHaveProperty("email");
+        expect((await adminDb.doc("workspaces/org-A/members/u-mgr/private/attributes").get()).data()).toMatchObject({
+          email: "mgr@example.com"
+        });
+        expect((await serverStore.getScopeMember("org-A", "u-mgr"))?.email).toBe("mgr@example.com");
+        const rosterEmails: any[][] = [];
+        const unsubRosterEmails = memberStore.subscribeToScopeMembers("org-A", (m) => rosterEmails.push(m));
+        await new Promise((r) => setTimeout(r, 150));
+        unsubRosterEmails();
+        expect(rosterEmails.at(-1)?.map((m: any) => m.email)).toEqual(["", ""]);
+
+        await memberStore.updateUserProfile("u-member", { email: "Member@Example.com" });
+        await memberStore.updateScopeMemberProfile("org-A", "u-member", { email: "member@example.com" });
+        expect((await adminDb.doc("users/u-member/private/attributes").get()).data()).toMatchObject({
+          email: "member@example.com",
+          badge: "global-badge",
+          _lanyard: { tier: "attributes", uid: "u-member", scopeId: null }
+        });
+        expect((await serverStore.getScopeMember("org-A", "u-member"))?.email).toBe("member@example.com");
+        const ownEmailEvents: any[] = [];
+        const unsubOwnEmail = memberStore.subscribeToAttributes("u-member", (attrs, email) =>
+          ownEmailEvents.push({ attrs, email })
+        );
+        await new Promise((r) => setTimeout(r, 150));
+        expect(ownEmailEvents.at(-1)).toEqual({ attrs: { badge: "global-badge" }, email: "member@example.com" });
+        unsubOwnEmail();
+
+        const ownAttrsRef = clientDoc(memberClient.db, "users", "u-member", "private", "attributes");
+        const lanyardMeta = { tier: "attributes", uid: "u-member", scopeId: null };
+        // Claiming someone else's address
+        await expect(
+          clientSetDoc(ownAttrsRef, { email: "ceo@example.com", _lanyard: lanyardMeta }, { merge: true })
+        ).rejects.toMatchObject({ code: "permission-denied" });
+        // Sneaking another key in alongside the verified email
+        await expect(
+          clientSetDoc(
+            ownAttrsRef,
+            { email: "member@example.com", badge: "forged", _lanyard: lanyardMeta },
+            { merge: true }
+          )
+        ).rejects.toMatchObject({ code: "permission-denied" });
+        // Wrong tier metadata
+        await expect(
+          clientSetDoc(
+            ownAttrsRef,
+            { email: "member@example.com", _lanyard: { ...lanyardMeta, scopeId: "org-A" } },
+            { merge: true }
+          )
+        ).rejects.toMatchObject({ code: "permission-denied" });
+        // Writing another user's email, even their real one
+        await expect(
+          clientSetDoc(
+            clientDoc(mgrClient.db, "users", "u-member", "private", "attributes"),
+            { email: "member@example.com", _lanyard: lanyardMeta },
+            { merge: true }
+          )
+        ).rejects.toMatchObject({ code: "permission-denied" });
+        // Writing a scoped email in a scope the user isn't a member of (no phantom docs)
+        await expect(
+          memberStore.updateScopeMemberProfile("org-B", "u-member", { email: "member@example.com" })
+        ).rejects.toMatchObject({ code: "permission-denied" });
+        expect((await adminDb.doc("workspaces/org-B/members/u-member/private/attributes").get()).exists).toBe(false);
+
+        // A user whose sign-in email isn't verified can't write it, even to their own attributes tier
+        const unverifiedClient = await createAuthedClient("u-unverified", "unverified@example.com", false, false);
+        try {
+          expect((await unverifiedClient.auth.currentUser!.getIdTokenResult()).claims.email_verified).toBe(false);
+          await expect(
+            clientSetDoc(
+              clientDoc(unverifiedClient.db, "users", "u-unverified", "private", "attributes"),
+              { email: "unverified@example.com", _lanyard: { tier: "attributes", uid: "u-unverified", scopeId: null } },
+              { merge: true }
+            )
+          ).rejects.toMatchObject({ code: "permission-denied" });
+        } finally {
+          await deleteClientApp(unverifiedClient.app);
+        }
 
         // Positive Verification:
         // - Non-admin user with global `manager` role on `users/u-mgr` CAN read another user's profile (`users/u-member`) via `hasUserCapability(['manager', 'owner'])`!

@@ -12,7 +12,13 @@ import type {
   UserProfilePatch,
   UserRecord
 } from "./models.js";
-import { assertNoReservedTierKeys, resolveCardFields, splitAttributesByPlacement } from "./tierDocs.js";
+import {
+  assertNoReservedAttributeKeys,
+  assertNoReservedTierKeys,
+  resolveCardFields,
+  splitAttributesByPlacement,
+  splitAttributesTierValues
+} from "./tierDocs.js";
 
 /** Private tier documents whose values are merged into user/member records. */
 type MergedTier = "preferences" | "attributes";
@@ -173,19 +179,19 @@ export class InMemoryLanyardStore<
     return this.subscribeToTier("preferences", scopeId, uid, onChange);
   }
 
-  subscribeToAttributes(uid: string, onChange: (attrs: Partial<TAttributes>) => void): () => void {
+  subscribeToAttributes(uid: string, onChange: (attrs: Partial<TAttributes>, email?: string) => void): () => void {
     assertValidResourceId(uid, "uid");
-    return this.subscribeToTier("attributes", null, uid, onChange);
+    return this.subscribeToAttributesTier(null, uid, onChange);
   }
 
   subscribeToScopeAttributes(
     scopeId: string,
     uid: string,
-    onChange: (attrs: Partial<TAttributes>) => void
+    onChange: (attrs: Partial<TAttributes>, email?: string) => void
   ): () => void {
     assertValidResourceId(scopeId, "scopeId");
     assertValidResourceId(uid, "uid");
-    return this.subscribeToTier("attributes", scopeId, uid, onChange);
+    return this.subscribeToAttributesTier(scopeId, uid, onChange);
   }
 
   async savePreferences(uid: string, patch: Partial<TPreferences>): Promise<void> {
@@ -239,7 +245,9 @@ export class InMemoryLanyardStore<
       ...existing,
       uid
     };
-    if (typeof patch.email === "string" && patch.email.trim()) next.email = patch.email.toLowerCase().trim();
+    const email = typeof patch.email === "string" && patch.email.trim() ? patch.email.toLowerCase().trim() : "";
+    if (email && this.cardFields.email) next.email = email;
+    if (email && !this.cardFields.email) this.writeAttributesTier(null, uid, {}, email);
     if (typeof patch.firstName === "string") next.firstName = patch.firstName.trim();
     if (typeof patch.lastName === "string") next.lastName = patch.lastName.trim();
     if (typeof patch.displayName === "string") next.displayName = patch.displayName.trim();
@@ -391,16 +399,17 @@ export class InMemoryLanyardStore<
 
   async upsertUser(user: UserRecord<TRole, TCapability, TPreferences, TAttributes>): Promise<void> {
     assertValidResourceId(user.uid, "uid");
-    const { preferences, attributes, ...card } = user;
+    const { preferences, attributes, email, ...card } = user;
     // Validate both tier patches before writing anything
     const cleanPrefs = preferences !== undefined ? this.cleanTierPatch(preferences, "preferences") : undefined;
     const cleanAttrs = attributes !== undefined ? this.cleanTierPatch(attributes, "attributes") : undefined;
     if (cleanPrefs !== undefined) this.mergeTier("preferences", null, user.uid, cleanPrefs);
-    const cardAttributes = cleanAttrs !== undefined ? this.writeAttributesTier(null, user.uid, cleanAttrs) : undefined;
+    const cardAttributes = this.writeAttributesTier(null, user.uid, cleanAttrs || {}, email);
     const existing = this.users.get(user.uid);
     const merged: UserRecord<TRole, TCapability, TPreferences, TAttributes> = {
       ...(existing || {}),
       ...card,
+      email: this.cardEmail(email, existing?.email),
       uid: user.uid,
       ...(user.photoUrl !== undefined
         ? { photoUrl: sanitizeAvatarUrl(user.photoUrl) }
@@ -412,7 +421,7 @@ export class InMemoryLanyardStore<
         : existing?.roles !== undefined
           ? { roles: [...existing.roles] }
           : {}),
-      ...(cardAttributes !== undefined && Object.keys(cardAttributes).length > 0
+      ...(Object.keys(cardAttributes).length > 0
         ? { attributes: { ...(existing?.attributes || {}), ...cardAttributes } }
         : existing?.attributes !== undefined
           ? { attributes: { ...existing.attributes } }
@@ -522,14 +531,14 @@ export class InMemoryLanyardStore<
     assertValidResourceId(uid, "uid");
     const user = this.users.get(uid);
     if (!user || !user.isSystemAdmin) return null;
-    return this.toAdminProfile(user);
+    return this.toAdminProfile(this.withPrivateTiers(user, null));
   }
 
   async listSystemAdmins(): Promise<SystemAdminProfile[]> {
     const result: SystemAdminProfile[] = [];
     for (const user of this.users.values()) {
       if (user.isSystemAdmin) {
-        result.push(this.toAdminProfile(user));
+        result.push(this.toAdminProfile(this.withPrivateTiers(user, null)));
       }
     }
     return result;
@@ -582,13 +591,12 @@ export class InMemoryLanyardStore<
   ): Promise<void> {
     assertValidResourceId(scopeId, "scopeId");
     assertValidResourceId(member.uid, "uid");
-    const { preferences, attributes, ...card } = member;
+    const { preferences, attributes, email, ...card } = member;
     // Validate both tier patches before writing anything
     const cleanPrefs = preferences !== undefined ? this.cleanTierPatch(preferences, "preferences") : undefined;
     const cleanAttrs = attributes !== undefined ? this.cleanTierPatch(attributes, "attributes") : undefined;
     if (cleanPrefs !== undefined) this.mergeTier("preferences", scopeId, member.uid, cleanPrefs);
-    const cardAttributes =
-      cleanAttrs !== undefined ? this.writeAttributesTier(scopeId, member.uid, cleanAttrs) : undefined;
+    const cardAttributes = this.writeAttributesTier(scopeId, member.uid, cleanAttrs || {}, email);
     if (!this.scopeMembers.has(scopeId)) {
       this.scopeMembers.set(scopeId, new Map());
     }
@@ -596,6 +604,7 @@ export class InMemoryLanyardStore<
     const normalized: ScopedMember<TRole, TCapability, TPreferences, TAttributes> = {
       ...(existing || {}),
       ...card,
+      email: this.cardEmail(email, existing?.email),
       ...(card.photoUrl !== undefined
         ? { photoUrl: sanitizeAvatarUrl(card.photoUrl) }
         : existing?.photoUrl !== undefined
@@ -603,7 +612,7 @@ export class InMemoryLanyardStore<
           : {}),
       scopeId,
       roles: Array.from(new Set(card.roles || [])),
-      ...(cardAttributes !== undefined && Object.keys(cardAttributes).length > 0
+      ...(Object.keys(cardAttributes).length > 0
         ? { attributes: { ...(existing?.attributes || {}), ...cardAttributes } }
         : existing?.attributes !== undefined
           ? { attributes: { ...existing.attributes } }
@@ -736,8 +745,26 @@ export class InMemoryLanyardStore<
 
   private cleanTierPatch<T extends Record<string, any>>(patch: Partial<T>, tier: MergedTier): Partial<T> {
     const clean = sanitizePatch(patch);
-    assertNoReservedTierKeys(clean, tier);
+    if (tier === "attributes") assertNoReservedAttributeKeys(clean);
+    else assertNoReservedTierKeys(clean, tier);
     return clean;
+  }
+
+  /** The card's `email`: the given one when `cardFields.email` places it on the card, otherwise always empty. */
+  private cardEmail(email: string | undefined, existingCardEmail: string | undefined): string {
+    if (!this.cardFields.email) return "";
+    return email !== undefined ? email : existingCardEmail || "";
+  }
+
+  private subscribeToAttributesTier(
+    scopeId: string | null,
+    uid: string,
+    onChange: (attrs: Partial<TAttributes>, email?: string) => void
+  ): () => void {
+    return this.subscribeToTier("attributes", scopeId, uid, (values) => {
+      const { attributes, email } = splitAttributesTierValues<TAttributes>(values);
+      onChange(attributes, email);
+    });
   }
 
   private subscribeToTier<T extends Record<string, any>>(
@@ -764,14 +791,22 @@ export class InMemoryLanyardStore<
     this.notifyTierListeners(tier, scopeId, uid);
   }
 
-  /** Writes the `attributes`-tier keys of a validated patch and returns its card-placed keys. */
+  /**
+   * Writes the `attributes`-tier keys of a validated patch (plus `email`, when it's private and non-empty, so
+   * records read without their tier can't erase a stored address) and returns its card-placed keys.
+   */
   private writeAttributesTier(
     scopeId: string | null,
     uid: string,
-    attributes: Partial<TAttributes>
+    attributes: Partial<TAttributes>,
+    email?: string
   ): Partial<TAttributes> {
     const { card, tier } = splitAttributesByPlacement(attributes, this.cardFields);
-    if (Object.keys(tier).length > 0) this.mergeTier("attributes", scopeId, uid, tier);
+    const tierValues: Record<string, any> = {
+      ...tier,
+      ...(!this.cardFields.email && typeof email === "string" && email ? { email } : {})
+    };
+    if (Object.keys(tierValues).length > 0) this.mergeTier("attributes", scopeId, uid, tierValues);
     return card;
   }
 
@@ -799,13 +834,15 @@ export class InMemoryLanyardStore<
   >(record: R, scopeId: string | null): R {
     const key = tierKey(scopeId, record.uid);
     const preferences = this.tierValues.preferences.get(key);
-    const tierAttributes = this.tierValues.attributes.get(key);
+    const tierValues = this.tierValues.attributes.get(key);
+    const tier = tierValues ? splitAttributesTierValues<TAttributes>(tierValues) : undefined;
     return {
       ...record,
       ...(record.roles ? { roles: [...record.roles] } : {}),
       ...(record.attributes ? { attributes: { ...record.attributes } } : {}),
       ...(preferences ? { preferences: { ...preferences } } : {}),
-      ...(tierAttributes ? { attributes: { ...(record.attributes || {}), ...tierAttributes } } : {})
+      ...(tier ? { attributes: { ...(record.attributes || {}), ...tier.attributes } } : {}),
+      ...(tier && !this.cardFields.email ? { email: tier.email || "" } : {})
     };
   }
 

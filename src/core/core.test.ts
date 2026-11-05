@@ -627,6 +627,64 @@ describe("lanyard/core unit tests", () => {
       unsubs.forEach((unsub) => unsub());
     });
 
+    it("keeps email private in the attributes tier by default, or on the card with cardFields.email", async () => {
+      expect(() => createPermissionPolicy({ cardFields: { attributes: ["email"] } })).toThrow(/use cardFields.email/);
+
+      // Default: email is private
+      const store = new InMemoryLanyardStore<TestRole, TestCapability>();
+      await store.upsertUser({ uid: "u-1", email: "u1@example.com", attributes: { points: 1 } });
+      await store.upsertScopeMember("ws-1", { uid: "u-1", email: "u1-ws@example.com", roles: ["member"] });
+      await store.upsertSystemAdmin({ uid: "admin-1", email: "admin@example.com", isSystemAdmin: true });
+
+      const cards: any[] = [];
+      const rosters: any[][] = [];
+      const attrs: Array<{ attrs: any; email?: string }> = [];
+      const scopeAttrs: Array<{ attrs: any; email?: string }> = [];
+      const unsubs = [
+        store.subscribeToUser("u-1", (u) => cards.push(u)),
+        store.subscribeToScopeMembers("ws-1", (m) => rosters.push(m)),
+        store.subscribeToAttributes("u-1", (a, email) => attrs.push({ attrs: a, email })),
+        store.subscribeToScopeAttributes("ws-1", "u-1", (a, email) => scopeAttrs.push({ attrs: a, email }))
+      ];
+      expect(cards.at(-1)?.email).toBe("");
+      expect(rosters.at(-1)?.[0].email).toBe("");
+      expect(attrs.at(-1)).toEqual({ attrs: { points: 1 }, email: "u1@example.com" });
+      expect(scopeAttrs.at(-1)).toEqual({ attrs: {}, email: "u1-ws@example.com" });
+      expect((await store.getUser("u-1"))?.email).toBe("u1@example.com");
+      expect((await store.getUser("u-1"))?.attributes).toEqual({ points: 1 });
+      expect((await store.getScopeMember("ws-1", "u-1"))?.email).toBe("u1-ws@example.com");
+      expect((await store.getSystemAdmin("admin-1"))?.email).toBe("admin@example.com");
+      expect((await store.listSystemAdmins()).map((a) => a.email)).toEqual(["admin@example.com"]);
+
+      // Self-service email updates route to the tier; card-only read-modify-write paths can't erase it
+      await store.updateUserProfile("u-1", { email: "New@Example.com" });
+      expect(attrs.at(-1)?.email).toBe("new@example.com");
+      await store.recordPresenceHeartbeat({ uid: "u-1", lastSeenIso: "2026-01-01T00:00:00.000Z" });
+      await store.upsertUser({ uid: "u-1", email: "" });
+      await store.grantScopeRoles("ws-1", "u-1", ["manager"]);
+      expect((await store.getUser("u-1"))?.email).toBe("new@example.com");
+      expect((await store.getScopeMember("ws-1", "u-1"))?.email).toBe("u1-ws@example.com");
+
+      // `email` is reserved as an attribute key
+      await expect(store.updateUserAttributes("u-1", { email: "x@example.com" } as any)).rejects.toThrow(
+        "Invalid attributes key 'email'"
+      );
+      unsubs.forEach((unsub) => unsub());
+
+      // cardFields.email: email lives on the card and never in the tier
+      const cardPolicy = createPermissionPolicy<TestRole, TestCapability>({ cardFields: { email: true } });
+      const cardStore = new InMemoryLanyardStore<TestRole, TestCapability>({ policy: cardPolicy });
+      await cardStore.upsertUser({ uid: "u-2", email: "u2@example.com", attributes: { points: 2 } });
+      await cardStore.updateUserProfile("u-2", { email: "u2-new@example.com" });
+      const cardEvents: any[] = [];
+      const cardAttrEvents: Array<{ attrs: any; email?: string }> = [];
+      cardStore.subscribeToUser("u-2", (u) => cardEvents.push(u))();
+      cardStore.subscribeToAttributes("u-2", (a, email) => cardAttrEvents.push({ attrs: a, email }))();
+      expect(cardEvents.at(-1)?.email).toBe("u2-new@example.com");
+      expect(cardAttrEvents.at(-1)).toEqual({ attrs: { points: 2 }, email: undefined });
+      expect((await cardStore.getUser("u-2"))?.email).toBe("u2-new@example.com");
+    });
+
     it("enforces no-op write guards on syncAvatar when photoUrl already matches or scoped member does not exist", async () => {
       const store = new InMemoryLanyardStore<TestRole, TestCapability>();
       await store.upsertScopeMember("ws-1", {

@@ -127,9 +127,12 @@ export type CardVisibilityRule<TCapability extends string = string> = "members" 
  * A field always lives in exactly one location: placing it on the card moves it (it is never copied).
  */
 export interface CardFieldsConfig {
-  /** Store `email` on the card instead of the `attributes` tier (default: `false`). */
+  /**
+   * Store `email` on the card instead of the `attributes` tier (default: `false`). When private, `email` is a
+   * reserved key in the `attributes` tier document.
+   */
   email?: boolean;
-  /** `attributes` keys stored on the card instead of the `attributes` tier (default: none). */
+  /** `attributes` keys stored on the card instead of the `attributes` tier (default: none; `email` is not allowed). */
   attributes?: readonly string[];
 }
 
@@ -725,14 +728,15 @@ export interface LanyardClientStore<
   /**
    * Optional: Subscribe to a user's global `attributes` tier (`users/{uid}/private/attributes`), readable by the
    * user, staff, and system admins. Emits only the keys stored there; keys placed on the card via
-   * `cardFields.attributes` arrive with the card. Returns an unsubscribe function.
+   * `cardFields.attributes` arrive with the card. Also emits the user's `email` stored in this tier
+   * (`undefined` when `cardFields.email` places it on the card or none is stored). Returns an unsubscribe function.
    */
-  subscribeToAttributes?(uid: string, onChange: (attrs: Partial<TAttributes>) => void): () => void;
+  subscribeToAttributes?(uid: string, onChange: (attrs: Partial<TAttributes>, email?: string) => void): () => void;
   /** Optional: Like `subscribeToAttributes`, for a member's `attributes` tier within `scopeId`. */
   subscribeToScopeAttributes?(
     scopeId: string,
     uid: string,
-    onChange: (attrs: Partial<TAttributes>) => void
+    onChange: (attrs: Partial<TAttributes>, email?: string) => void
   ): () => void;
   /** Optional: The card field placement this store routes reads by; must match the client's policy. */
   readonly cardFields?: CardFieldsPlacement;

@@ -519,13 +519,21 @@ describe("lanyard/client unit tests", () => {
       displayName: "Admin",
       photoUrl: "https://example.com/admin.png"
     });
+    // The card never gets the (private) email; it goes to the user's own attributes tier document
     expect(firebaseFirestore.setDoc).toHaveBeenCalledWith(
       expect.objectContaining({ path: "users/u-admin" }),
       {
         uid: "u-admin",
-        email: "admin@example.com",
         displayName: "Admin",
         photoUrl: "https://example.com/admin.png"
+      },
+      { merge: true }
+    );
+    expect(firebaseFirestore.setDoc).toHaveBeenCalledWith(
+      expect.objectContaining({ path: "users/u-admin/private/attributes" }),
+      {
+        email: "admin@example.com",
+        _lanyard: { tier: "attributes", uid: "u-admin", scopeId: null, updatedAt: expect.any(String) }
       },
       { merge: true }
     );
@@ -1372,6 +1380,45 @@ describe("lanyard/client unit tests", () => {
     client.destroy();
   });
 
+  it("merges a private email into userRecordStore and memberships, and syncs a verified email change to the attributes tier", async () => {
+    const store = new InMemoryLanyardStore<TestRole, TestCap, TestPrefs>();
+    await store.upsertUser({ uid: "u-1", email: "old@example.com", firstName: "Uno" });
+    await store.upsertScopeMember("ws-a", { uid: "u-1", email: "old@example.com", roles: ["member"] });
+    const onVerifiedEmailChange = vi.fn().mockResolvedValue(undefined);
+    const client = createLanyardClient<TestRole, TestCap, TestPrefs>({
+      store,
+      defaultPreferences: DEFAULT_PREFS,
+      storageKeyPrefix: "privateemail",
+      onVerifiedEmailChange
+    });
+
+    client.setActiveUser({
+      uid: "u-1",
+      email: "new@example.com",
+      emailVerified: true,
+      displayName: null,
+      photoUrl: null,
+      isAdmin: false,
+      providerIds: []
+    });
+
+    // The card holds no email, but userRecordStore merges the user's own tier email in
+    await vi.waitFor(() => expect(onVerifiedEmailChange).toHaveBeenCalledTimes(1));
+    expect(onVerifiedEmailChange).toHaveBeenCalledWith({
+      uid: "u-1",
+      email: "new@example.com",
+      previousEmail: "old@example.com"
+    });
+    await vi.waitFor(() => expect(client.userRecordStore.get()?.email).toBe("new@example.com"));
+    expect((await store.getUser("u-1"))?.email).toBe("new@example.com");
+    expect(client.userRecordStore.get()?.firstName).toBe("Uno");
+    expect(client.membershipsStore.get().memberships[0].email).toBe("old@example.com");
+
+    client.setActiveUser(null);
+    expect(client.userRecordStore.get()).toBeNull();
+    client.destroy();
+  });
+
   it("wires userRecordStore, attributesStore, updateProfile, real-time isSystemAdmin sync, and single-tenant role presence tracking", async () => {
     interface CheckinAttrs {
       pointsAllTime: number;
@@ -1867,10 +1914,11 @@ describe("lanyard/client unit tests", () => {
     });
 
     expect(adminsList).toHaveLength(1);
+    // Email is private by default, so a legacy email left on the card isn't exposed through card subscriptions
     expect(adminsList[0]).toEqual([
       expect.objectContaining({
         uid: "u-admin-1",
-        email: "admin1@example.com",
+        email: "",
         displayName: "Admin One",
         isSystemAdmin: true,
         roles: []

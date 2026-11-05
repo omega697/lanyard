@@ -21,7 +21,13 @@ import {
   type UserProfilePatch,
   type UserRecord
 } from "../core/index.js";
-import { assertNoReservedTierKeys, readTierDocValues, resolveCardFields, tierDocMetadata } from "../core/tierDocs.js";
+import {
+  assertNoReservedTierKeys,
+  readTierDocValues,
+  resolveCardFields,
+  splitAttributesTierValues,
+  tierDocMetadata
+} from "../core/tierDocs.js";
 
 const FORBIDDEN_KEYS = new Set(["__proto__", "constructor", "prototype"]);
 
@@ -83,8 +89,9 @@ interface MultiplexedUserWatcher<
  * `onSnapshot` listeners per UID so repeated `subscribeToUser` calls only ever open
  * **1 Firestore document listener**.
  *
- * Preferences live in the self-only `users/{uid}/private/preferences` document and other attributes in the
- * self + staff `users/{uid}/private/attributes` document (or the same paths under
+ * Preferences live in the self-only `users/{uid}/private/preferences` document and other attributes (plus
+ * `email`, unless `cardFields.email` is set) in the self + staff `users/{uid}/private/attributes` document
+ * (or the same paths under
  * `{scope}/{scopeId}/members/{uid}` when scoped), so other readers of the card never see them.
  */
 export class FirestoreClientStore<
@@ -135,7 +142,8 @@ export class FirestoreClientStore<
 
     return {
       uid: data.uid || uid,
-      email: data.email || "",
+      // Private emails arrive through subscribeToAttributes
+      email: this.cardFields.email ? data.email || "" : "",
       ...(data.displayName !== undefined ? { displayName: data.displayName } : {}),
       ...(data.firstName !== undefined ? { firstName: data.firstName } : {}),
       ...(data.lastName !== undefined ? { lastName: data.lastName } : {}),
@@ -286,16 +294,39 @@ export class FirestoreClientStore<
     return this.subscribeToTierDoc(this.tierDocRef("preferences", uid, scopeId), onChange);
   }
 
-  subscribeToAttributes(uid: string, onChange: (attrs: Partial<TAttributes>) => void): () => void {
-    return this.subscribeToTierDoc(this.tierDocRef("attributes", uid, null), onChange);
+  subscribeToAttributes(uid: string, onChange: (attrs: Partial<TAttributes>, email?: string) => void): () => void {
+    return this.subscribeToAttributesDoc(this.tierDocRef("attributes", uid, null), onChange);
   }
 
   subscribeToScopeAttributes(
     scopeId: string,
     uid: string,
-    onChange: (attrs: Partial<TAttributes>) => void
+    onChange: (attrs: Partial<TAttributes>, email?: string) => void
   ): () => void {
-    return this.subscribeToTierDoc(this.tierDocRef("attributes", uid, scopeId), onChange);
+    return this.subscribeToAttributesDoc(this.tierDocRef("attributes", uid, scopeId), onChange);
+  }
+
+  /** Listens to an `attributes` tier document, emitting its attributes and stored `email` separately. */
+  private subscribeToAttributesDoc(
+    ref: DocumentReference,
+    onChange: (attrs: Partial<TAttributes>, email?: string) => void
+  ): () => void {
+    return this.subscribeToTierDoc(ref, (values) => {
+      const { attributes, email } = splitAttributesTierValues<TAttributes>(values);
+      onChange(attributes, this.cardFields.email ? undefined : email);
+    });
+  }
+
+  /**
+   * Writes the user's own `email` to their `attributes` tier document (when `cardFields.email` doesn't place it
+   * on the card). Security rules accept this only for the owner's verified Firebase Auth email.
+   */
+  private async writeOwnEmailToTier(uid: string, scopeId: string | null, email: string): Promise<void> {
+    await setDoc(
+      this.tierDocRef("attributes", uid, scopeId),
+      { email, ...tierDocMetadata("attributes", uid, scopeId) },
+      { merge: true }
+    );
   }
 
   async savePreferences(uid: string, patch: Partial<TPreferences>): Promise<void> {
@@ -323,12 +354,14 @@ export class FirestoreClientStore<
       uid: cleanUid,
       updatedAt: new Date().toISOString()
     };
-    if (typeof patch.email === "string" && patch.email.trim()) safePayload.email = patch.email.toLowerCase().trim();
+    const email = typeof patch.email === "string" && patch.email.trim() ? patch.email.toLowerCase().trim() : "";
+    if (email && this.cardFields.email) safePayload.email = email;
     if (typeof patch.firstName === "string") safePayload.firstName = patch.firstName.trim();
     if (typeof patch.lastName === "string") safePayload.lastName = patch.lastName.trim();
     if (typeof patch.displayName === "string") safePayload.displayName = patch.displayName.trim();
     if (patch.photoUrl !== undefined) safePayload.photoUrl = sanitizeAvatarUrl(patch.photoUrl);
 
+    if (email && !this.cardFields.email) await this.writeOwnEmailToTier(cleanUid, null, email);
     const userRef = doc(this.db, this.usersCollection, cleanUid);
     await setDoc(userRef, safePayload, { merge: true });
   }
@@ -339,11 +372,13 @@ export class FirestoreClientStore<
     if (!patch || typeof patch !== "object" || Array.isArray(patch)) return;
     // Strictly allow ONLY Tier-1 self-editable profile fields on the existing scoped member doc
     const safePayload: Record<string, any> = {};
-    if (typeof patch.email === "string" && patch.email.trim()) safePayload.email = patch.email.toLowerCase().trim();
+    const email = typeof patch.email === "string" && patch.email.trim() ? patch.email.toLowerCase().trim() : "";
+    if (email && this.cardFields.email) safePayload.email = email;
     if (typeof patch.firstName === "string") safePayload.firstName = patch.firstName.trim();
     if (typeof patch.lastName === "string") safePayload.lastName = patch.lastName.trim();
     if (typeof patch.displayName === "string") safePayload.displayName = patch.displayName.trim();
     if (patch.photoUrl !== undefined) safePayload.photoUrl = sanitizeAvatarUrl(patch.photoUrl);
+    if (email && !this.cardFields.email) await this.writeOwnEmailToTier(cleanUid, cleanScopeId, email);
     if (Object.keys(safePayload).length === 0) return;
 
     const memberRef = doc(this.db, this.scopeCollection, cleanScopeId, this.membersSubcollection, cleanUid);
@@ -402,7 +437,8 @@ export class FirestoreClientStore<
   ): ScopedMember<TRole, TCapability, TPreferences, TAttributes> {
     return {
       uid: data.uid || docId,
-      email: data.email || "",
+      // Private emails arrive through subscribeToAttributes
+      email: this.cardFields.email ? data.email || "" : "",
       firstName: data.firstName,
       lastName: data.lastName,
       displayName: data.displayName,
@@ -436,9 +472,13 @@ export class FirestoreClientStore<
     } else {
       const userRef = doc(this.db, this.usersCollection, cleanUid);
       const payload: Record<string, any> = { uid: cleanUid, photoUrl: cleanPhotoUrl };
-      if (email) payload.email = email;
+      if (email && this.cardFields.email) payload.email = email;
       if (displayName) payload.displayName = displayName;
       await setDoc(userRef, payload, { merge: true });
+      // A private email goes to the attributes tier after the avatar. It's best-effort, like the rest of this sync:
+      // rules accept it only for the owner's verified email (or an admin), and the verified-email flow and the
+      // server keep it current otherwise.
+      if (email && !this.cardFields.email) await this.writeOwnEmailToTier(cleanUid, null, email).catch(() => {});
     }
   }
 
