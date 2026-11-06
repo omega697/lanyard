@@ -7,6 +7,10 @@ Like a conference or workplace lanyard, `lanyard` answers two questions everywhe
 1. **Identity & Presence**: _Who is this user, what is their avatar, and when were they last active?_
 2. **Access Passes**: _What roles (`TRole[]`) and role-derived capabilities (`TCapability[]`) do they hold in the current scope (`GLOBAL_SCOPE` or tenant `scopeId`)?_
 
+> [!IMPORTANT]
+> **Upgrading from 0.1.x?** 0.2.0 moves preferences, attributes, and email into per-audience tier documents and
+> generates your security rules. Existing data must be migrated; see [CHANGELOG.md](./CHANGELOG.md).
+
 ---
 
 ## Key Features

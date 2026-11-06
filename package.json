@@ -1,6 +1,6 @@
 {
   "name": "lanyard",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "UID-first, storage-agnostic authentication, presence tracking, and role/capability authorization library.",
   "type": "module",
   "main": "./dist/index.js",
@@ -39,7 +39,8 @@
     "lanyard-rules": "./dist/rules/bin.js"
   },
   "files": [
-    "dist"
+    "dist",
+    "CHANGELOG.md"
   ],
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
