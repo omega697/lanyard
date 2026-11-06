@@ -49,7 +49,7 @@ export function splitAttributesTierValues<T extends Record<string, any>>(
  * @internal Shared by the Lanyard stores; not part of the public API.
  */
 export function tierDocMetadata(
-  tier: LanyardTier,
+  tier: LanyardTier | (string & {}),
   uid: string,
   scopeId: string | null
 ): { [TIER_METADATA_KEY]: TierDocMetadata } {
@@ -93,6 +93,22 @@ export function splitAttributesByPlacement<T extends Record<string, any>>(
     else tier[k] = v;
   }
   return { card: card as Partial<T>, tier: tier as Partial<T> };
+}
+
+const BUILT_IN_TIER_DOCS = new Set(["preferences", "attributes", "hiddenAttributes", "secrets"]);
+
+/**
+ * Throws unless `name` is a valid custom document name (letters, digits, `_` or `-`, and not a built-in tier).
+ * @internal Shared by the Lanyard stores; not part of the public API.
+ */
+export function assertCustomDocName(name: unknown): string {
+  if (typeof name !== "string" || !/^[A-Za-z0-9_-]+$/.test(name) || FORBIDDEN_KEYS.has(name)) {
+    throw new Error(`Invalid custom doc name '${String(name)}'`);
+  }
+  if (BUILT_IN_TIER_DOCS.has(name) || name === "card") {
+    throw new Error(`Invalid custom doc name '${name}': reserved for a built-in storage tier`);
+  }
+  return name;
 }
 
 /**

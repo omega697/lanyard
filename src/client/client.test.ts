@@ -1538,6 +1538,62 @@ describe("lanyard/client unit tests", () => {
     [staff, peer, admin].forEach((c) => c.destroy());
   });
 
+  it("reads and writes policy custom documents only for the audiences in customDocs", async () => {
+    const policy = createPermissionPolicy<TestRole, TestCap>({
+      roles: { owner: { capabilities: ["invite_members"] }, manager: { capabilities: ["invite_members"] }, member: {} },
+      staffCapability: "invite_members",
+      customDocs: { shiftNotes: { read: { self: true, staff: true }, write: { staff: true } } }
+    });
+    const store = new InMemoryLanyardStore<TestRole, TestCap, TestPrefs>({ policy });
+    await store.upsertScopeMember("ws-a", { uid: "u-staff", email: "staff@example.com", roles: ["manager"] });
+    await store.upsertScopeMember("ws-a", { uid: "u-peer", email: "peer@example.com", roles: ["member"] });
+    await store.upsertScopeMember("ws-a", { uid: "u-other", email: "other@example.com", roles: ["member"] });
+    const makeClient = (uid: string, email: string) => {
+      const client = createLanyardClient<TestRole, TestCap, TestPrefs>({
+        store,
+        policy,
+        defaultPreferences: DEFAULT_PREFS,
+        storageKeyPrefix: `customdocs-${uid}`
+      });
+      client.setActiveUser({
+        uid,
+        email,
+        emailVerified: true,
+        displayName: null,
+        photoUrl: null,
+        isAdmin: false,
+        providerIds: []
+      });
+      return client;
+    };
+    const staff = makeClient("u-staff", "staff@example.com");
+    const peer = makeClient("u-peer", "peer@example.com");
+
+    // Staff write, the owner reads (default target is the signed-in user) and subscribes
+    await staff.updateCustomDoc("ws-a", "shiftNotes", "u-peer", { note: "great shift" });
+    expect(await peer.readCustomDoc("ws-a", "shiftNotes")).toEqual({ note: "great shift" });
+    const events: Record<string, any>[] = [];
+    const unsub = peer.subscribeToCustomDoc("ws-a", "shiftNotes", "u-peer", (v) => events.push(v));
+    await staff.updateCustomDoc("ws-a", "shiftNotes", "u-peer", { rating: 5 });
+    expect(events.at(-1)).toEqual({ note: "great shift", rating: 5 });
+    unsub();
+
+    // The owner can't write their own notes, nor read another member's; outsiders and unknown docs are rejected
+    await expect(peer.updateCustomDoc("ws-a", "shiftNotes", "u-peer", { note: "self-praise" })).rejects.toThrow(
+      /Forbidden: cannot write custom doc 'shiftNotes'/
+    );
+    await expect(peer.readCustomDoc("ws-a", "shiftNotes", "u-other")).rejects.toThrow(
+      /Forbidden: cannot read custom doc 'shiftNotes'/
+    );
+    await expect(staff.readCustomDoc("ws-b", "shiftNotes", "u-peer")).rejects.toThrow(/not a member of scope 'ws-b'/);
+    await expect(staff.readCustomDoc("ws-a", "unknownDoc", "u-peer")).rejects.toThrow(
+      /Unknown custom doc 'unknownDoc'/
+    );
+    expect(await store.getCustomDoc("shiftNotes", "u-peer", "ws-a")).toEqual({ note: "great shift", rating: 5 });
+
+    [staff, peer].forEach((c) => c.destroy());
+  });
+
   it("wires userRecordStore, attributesStore, updateProfile, real-time isSystemAdmin sync, and single-tenant role presence tracking", async () => {
     interface CheckinAttrs {
       pointsAllTime: number;

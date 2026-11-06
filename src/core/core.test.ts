@@ -764,6 +764,39 @@ describe("lanyard/core unit tests", () => {
       await expect(store.queryMemberUids("ws-1", { level: undefined })).rejects.toThrow(/'level' is undefined/);
     });
 
+    it("stores custom documents per user and scope, with live updates, validation, and delete cleanup", async () => {
+      const store = new InMemoryLanyardStore<TestRole, TestCapability>();
+      await store.upsertScopeMember("ws-1", { uid: "u-1", email: "u1@example.com", roles: ["member"] });
+      await store.upsertUser({ uid: "u-1", email: "u1@example.com" });
+
+      const events: Record<string, any>[] = [];
+      const unsub = store.subscribeToCustomDoc("shiftNotes", "u-1", "ws-1", (v) => events.push(v));
+      expect(events).toEqual([{}]);
+      await store.updateCustomDoc("shiftNotes", "u-1", "ws-1", { note: "great" });
+      await store.updateCustomDoc("shiftNotes", "u-1", "ws-1", { rating: 5 });
+      expect(events.at(-1)).toEqual({ note: "great", rating: 5 });
+      expect(await store.getCustomDoc("shiftNotes", "u-1", "ws-1")).toEqual({ note: "great", rating: 5 });
+      // Global and other scopes are separate documents
+      expect(await store.getCustomDoc("shiftNotes", "u-1", null)).toEqual({});
+      expect(await store.getCustomDoc("shiftNotes", "u-1", "ws-2")).toEqual({});
+
+      await expect(store.updateCustomDoc("shiftNotes", "u-1", "ws-1", { _lanyard: {} })).rejects.toThrow(
+        "Invalid shiftNotes key '_lanyard'"
+      );
+      await expect(store.getCustomDoc("attributes", "u-1", "ws-1")).rejects.toThrow(/reserved for a built-in/);
+      await expect(store.getCustomDoc("bad/name", "u-1", "ws-1")).rejects.toThrow(/Invalid custom doc name/);
+
+      // Deleting the member deletes their custom documents in that scope only
+      await store.updateCustomDoc("shiftNotes", "u-1", null, { note: "global" });
+      await store.deleteScopeMember("ws-1", "u-1");
+      expect(events.at(-1)).toEqual({});
+      expect(await store.getCustomDoc("shiftNotes", "u-1", "ws-1")).toEqual({});
+      expect(await store.getCustomDoc("shiftNotes", "u-1", null)).toEqual({ note: "global" });
+      await store.deleteUser("u-1");
+      expect(await store.getCustomDoc("shiftNotes", "u-1", null)).toEqual({});
+      unsub();
+    });
+
     it("enforces no-op write guards on syncAvatar when photoUrl already matches or scoped member does not exist", async () => {
       const store = new InMemoryLanyardStore<TestRole, TestCapability>();
       await store.upsertScopeMember("ws-1", {

@@ -1379,6 +1379,70 @@ export function createLanyardServer<
   }
 
   /**
+   * Verifies `actor` may `mode` the policy's custom document `name` of an existing user/member `targetUid` in
+   * `scopeId` (per `customDocs[name].read` / `.write`), returning the store's `scopeId` (`null` for global).
+   */
+  async function authorizeCustomDoc(
+    params: { scopeId: ScopeId; actor: LanyardActor; targetUid: string; name: string },
+    mode: "read" | "write"
+  ): Promise<string | null> {
+    assertValidScopeId(params.scopeId);
+    assertValidResourceId(params.targetUid, "targetUid");
+    if (!Object.hasOwn(policy.customDocs, params.name)) throw new Error(`Unknown custom doc '${params.name}'`);
+    const { isAdmin, userRecord: actorGlobalRecord } = await resolveEffectiveAdminStatus(params.actor);
+    const scopeId = params.scopeId === GLOBAL_SCOPE ? null : params.scopeId;
+    let actorRecord:
+      | UserRecord<TRole, TCapability, TPreferences, TAttributes>
+      | ScopedMember<TRole, TCapability, TPreferences, TAttributes>
+      | null = actorGlobalRecord;
+    if (scopeId === null) {
+      if (typeof store.getUser !== "function") throw new Error("Backing store does not implement getUser");
+      if (!(await store.getUser(params.targetUid))) throw new Error(`Target user '${params.targetUid}' not found`);
+    } else {
+      actorRecord = await store.getScopeMember(scopeId, params.actor.uid);
+      if (!isAdmin && !actorRecord) throw new Error(`Forbidden: Caller is not a member of scope '${scopeId}'`);
+      if (!(await store.getScopeMember(scopeId, params.targetUid))) {
+        throw new Error(`Target member '${params.targetUid}' not found in scope '${scopeId}'`);
+      }
+    }
+    const options = { isSystemAdmin: isAdmin, isSelf: params.actor.uid === params.targetUid };
+    const allowed =
+      mode === "read"
+        ? policy.canReadCustomDoc(actorRecord, params.name, options)
+        : policy.canWriteCustomDoc(actorRecord, params.name, options);
+    if (!allowed) throw new Error(`Forbidden: Insufficient permissions to ${mode} custom doc '${params.name}'`);
+    return scopeId;
+  }
+
+  /** Reads the policy's custom document `name` of `targetUid` in `scopeId` after verifying `actor` may read it. */
+  async function getCustomDoc(params: {
+    scopeId: ScopeId;
+    actor: LanyardActor;
+    targetUid: string;
+    name: string;
+  }): Promise<Record<string, any>> {
+    if (typeof store.getCustomDoc !== "function") throw new Error("Backing store does not implement getCustomDoc");
+    const scopeId = await authorizeCustomDoc(params, "read");
+    return store.getCustomDoc(params.name, params.targetUid, scopeId);
+  }
+
+  /** Merges `patch` into the policy's custom document `name` of `targetUid` after verifying `actor` may write it. */
+  async function updateCustomDoc(params: {
+    scopeId: ScopeId;
+    actor: LanyardActor;
+    targetUid: string;
+    name: string;
+    patch: Record<string, any>;
+  }): Promise<Record<string, any>> {
+    if (typeof store.updateCustomDoc !== "function" || typeof store.getCustomDoc !== "function") {
+      throw new Error("Backing store does not implement updateCustomDoc/getCustomDoc");
+    }
+    const scopeId = await authorizeCustomDoc(params, "write");
+    await store.updateCustomDoc(params.name, params.targetUid, scopeId, params.patch);
+    return store.getCustomDoc(params.name, params.targetUid, scopeId);
+  }
+
+  /**
    * Updates a user's `attributes` in `GLOBAL_SCOPE` (`users/{targetUid}`) or a specific tenant `scopeId`
    * after verifying the caller (`actor`) holds the required write capability for every key in `patch`
    * within that exact `scopeId` (or is an active system admin).
@@ -1687,6 +1751,8 @@ export function createLanyardServer<
     deleteUser,
     readUserAttributes,
     queryMembers,
+    getCustomDoc,
+    updateCustomDoc,
     updateUserAttributes,
     readUserHiddenAttributes,
     updateUserHiddenAttributes,

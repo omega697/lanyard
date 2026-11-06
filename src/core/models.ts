@@ -103,7 +103,8 @@ export const TIER_METADATA_KEY = "_lanyard";
 
 /** Metadata Lanyard stamps on every private tier document under `TIER_METADATA_KEY`. */
 export interface TierDocMetadata {
-  tier: LanyardTier;
+  /** Built-in tier name, or the `customDocs` name for app-defined custom documents. */
+  tier: LanyardTier | (string & {});
   uid: string;
   /** Owning scope, or `null` for global (`users/{uid}`) documents. */
   scopeId: string | null;
@@ -149,7 +150,7 @@ export interface LanyardStorePlacementSource {
 }
 
 /**
- * Access rule for one side (read or write) of an app-defined custom document (`…/{uid}/{name}/data`).
+ * Access rule for one side (read or write) of an app-defined custom document (`…/{uid}/private/{name}`).
  * Access is granted if any listed condition matches; system admins always have access.
  * An empty rule (`{}`) means system admins and trusted server code only.
  */
@@ -758,6 +759,20 @@ export interface LanyardClientStore<
    * be allowed to read that location for other users (security rules enforce this in Firestore).
    */
   queryMemberUids?(scopeId: string | null, attributes: Partial<TAttributes>): Promise<string[]>;
+  /**
+   * Optional: Reads an app-defined custom document (`…/{uid}/private/{name}`, global when `scopeId` is `null`),
+   * returning `{}` if it doesn't exist. Security rules decide who may read it.
+   */
+  getCustomDoc?(name: string, uid: string, scopeId: string | null): Promise<Record<string, any>>;
+  /** Optional: Subscribes to an app-defined custom document, emitting `{}` while it doesn't exist. */
+  subscribeToCustomDoc?(
+    name: string,
+    uid: string,
+    scopeId: string | null,
+    onChange: (values: Record<string, any>) => void
+  ): () => void;
+  /** Optional: Merges `patch` into an app-defined custom document (security rules decide who may write it). */
+  updateCustomDoc?(name: string, uid: string, scopeId: string | null, patch: Record<string, any>): Promise<void>;
 
   /**
    * Optional: Subscribe to the global `UserRecord` card (`users/{uid}`) including `roles` and any card-placed
@@ -834,6 +849,10 @@ export interface LanyardServerStore<
    * equal every value in `attributes`. Keys must be all card-placed or all in the `attributes` tier.
    */
   queryMemberUids?(scopeId: string | null, attributes: Partial<TAttributes>): Promise<string[]>;
+  /** Optional: Reads an app-defined custom document (`…/{uid}/private/{name}`), returning `{}` if it doesn't exist. */
+  getCustomDoc?(name: string, uid: string, scopeId: string | null): Promise<Record<string, any>>;
+  /** Optional: Merges `patch` into an app-defined custom document. */
+  updateCustomDoc?(name: string, uid: string, scopeId: string | null, patch: Record<string, any>): Promise<void>;
 
   // --- Global User (`users/{uid}`) & System Admin Operations ---
   getUser?(uid: string): Promise<UserRecord<TRole, TCapability, TPreferences, TAttributes> | null>;

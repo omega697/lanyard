@@ -1133,6 +1133,15 @@ service cloud.firestore {
         allow write: if isOwner(memberUid) && isScopeMember(scopeId) && isOwnVerifiedEmailWrite(memberUid, scopeId);
       }
 
+      // App-defined custom doc: readable by the member and staff, writable by staff
+      match /private/shiftNotes {
+        allow read: if isOwner(memberUid) || hasScopeCapability(scopeId, ['owner', 'manager']);
+        allow write: if hasScopeCapability(scopeId, ['owner', 'manager']) &&
+          request.resource.data._lanyard.tier == 'shiftNotes' &&
+          request.resource.data._lanyard.uid == memberUid &&
+          request.resource.data._lanyard.scopeId == scopeId;
+      }
+
       match /private/preferences {
         allow read: if isOwner(memberUid) || isAdmin();
         allow write: if (isOwner(memberUid) && isScopeMember(scopeId) || isAdmin()) &&
@@ -1704,6 +1713,23 @@ service cloud.firestore {
         await expect(memberTeamStore.queryMemberUids("org-B", { team: "blue" })).rejects.toMatchObject({
           code: "permission-denied"
         });
+
+        // Custom documents: org-A staff write a member's shiftNotes, the member reads them, and nobody else gets in
+        await mgrStore.updateCustomDoc("shiftNotes", "u-member", "org-A", { note: "great shift" });
+        expect((await adminDb.doc("workspaces/org-A/members/u-member/private/shiftNotes").get()).data()).toEqual({
+          note: "great shift",
+          _lanyard: { tier: "shiftNotes", uid: "u-member", scopeId: "org-A", updatedAt: expect.any(String) }
+        });
+        expect(await memberStore.getCustomDoc("shiftNotes", "u-member", "org-A")).toEqual({ note: "great shift" });
+        await expect(
+          memberStore.updateCustomDoc("shiftNotes", "u-member", "org-A", { note: "self-praise" })
+        ).rejects.toMatchObject({ code: "permission-denied" });
+        await expect(memberStore.getCustomDoc("shiftNotes", "u-mgr", "org-A")).rejects.toMatchObject({
+          code: "permission-denied"
+        });
+        await expect(
+          mgrStore.updateCustomDoc("shiftNotes", "u-other", "org-B", { note: "cross-tenant" })
+        ).rejects.toMatchObject({ code: "permission-denied" });
 
         // A non-staff member's include fails (the store reports an empty list), and raw queries are denied
         const memberRoster: any[][] = [];

@@ -14,6 +14,7 @@ import type {
   UserRecord
 } from "./models.js";
 import {
+  assertCustomDocName,
   assertNoReservedAttributeKeys,
   assertNoReservedTierKeys,
   resolveAttributeQueryLocation,
@@ -148,6 +149,9 @@ export class InMemoryLanyardStore<
     return out as Partial<Record<keyof TSecrets & string, boolean>>;
   }
 
+  // JSON.stringify([name, scopeId, uid]) -> custom document values / listeners
+  private customDocValues = new Map<string, Record<string, any>>();
+  private customDocListeners = new Map<string, Set<(values: Record<string, any>) => void>>();
   // tier -> (tierKey(scopeId, uid) -> listeners)
   private tierListeners: Record<MergedTier, Map<string, Set<(values: Record<string, any>) => void>>> = {
     preferences: new Map(),
@@ -414,6 +418,33 @@ export class InMemoryLanyardStore<
         return Object.entries(attributes).every(([key, value]) => firestoreValuesEqual(values[key], value));
       })
       .map((record) => record.uid);
+  }
+
+  async getCustomDoc(name: string, uid: string, scopeId: string | null): Promise<Record<string, any>> {
+    return { ...(this.customDocValues.get(this.customDocKey(name, uid, scopeId)) || {}) };
+  }
+
+  subscribeToCustomDoc(
+    name: string,
+    uid: string,
+    scopeId: string | null,
+    onChange: (values: Record<string, any>) => void
+  ): () => void {
+    const key = this.customDocKey(name, uid, scopeId);
+    if (!this.customDocListeners.has(key)) this.customDocListeners.set(key, new Set());
+    this.customDocListeners.get(key)!.add(onChange);
+    onChange({ ...(this.customDocValues.get(key) || {}) });
+    return () => {
+      this.customDocListeners.get(key)?.delete(onChange);
+    };
+  }
+
+  async updateCustomDoc(name: string, uid: string, scopeId: string | null, patch: Record<string, any>): Promise<void> {
+    const key = this.customDocKey(name, uid, scopeId);
+    const cleanPatch = sanitizePatch(patch);
+    assertNoReservedTierKeys(cleanPatch, name);
+    this.customDocValues.set(key, { ...(this.customDocValues.get(key) || {}), ...cleanPatch });
+    this.notifyCustomDocListeners(key);
   }
 
   // --- Server Store Methods: Global Users & System Admins ---
@@ -854,6 +885,27 @@ export class InMemoryLanyardStore<
     for (const tier of ["preferences", "attributes"] as const) {
       this.tierValues[tier].delete(tierKey(scopeId, uid));
       this.notifyTierListeners(tier, scopeId, uid);
+    }
+    // Custom documents live in the same private subcollection, so they're deleted with the user/member too
+    for (const key of Array.from(this.customDocValues.keys())) {
+      const [, keyScopeId, keyUid] = JSON.parse(key) as [string, string | null, string];
+      if (keyScopeId === scopeId && keyUid === uid) {
+        this.customDocValues.delete(key);
+        this.notifyCustomDocListeners(key);
+      }
+    }
+  }
+
+  private customDocKey(name: string, uid: string, scopeId: string | null): string {
+    assertCustomDocName(name);
+    assertValidResourceId(uid, "uid");
+    if (scopeId !== null) assertValidResourceId(scopeId, "scopeId");
+    return JSON.stringify([name, scopeId, uid]);
+  }
+
+  private notifyCustomDocListeners(key: string): void {
+    for (const cb of this.customDocListeners.get(key) || []) {
+      cb({ ...(this.customDocValues.get(key) || {}) });
     }
   }
 

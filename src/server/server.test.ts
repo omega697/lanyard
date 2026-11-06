@@ -417,6 +417,12 @@ describe("lanyard/server unit tests", () => {
     const docs = new Map<string, Record<string, any>>();
 
     const fakeDb: any = {
+      // Mirrors Admin SDK recursiveDelete: removes the document and everything nested under it
+      async recursiveDelete(ref: { path: string }) {
+        for (const key of Array.from(docs.keys())) {
+          if (key === ref.path || key.startsWith(`${ref.path}/`)) docs.delete(key);
+        }
+      },
       doc(path: string) {
         return {
           path,
@@ -935,6 +941,12 @@ describe("lanyard/server unit tests", () => {
     // 5. FirestoreServerStore custom collection names and photoUrl sanitization on write & read
     const docs = new Map<string, Record<string, any>>();
     const fakeDb: any = {
+      // Mirrors Admin SDK recursiveDelete: removes the document and everything nested under it
+      async recursiveDelete(ref: { path: string }) {
+        for (const key of Array.from(docs.keys())) {
+          if (key === ref.path || key.startsWith(`${ref.path}/`)) docs.delete(key);
+        }
+      },
       doc(path: string) {
         return {
           path,
@@ -1504,6 +1516,12 @@ describe("lanyard/server unit tests", () => {
   it("tests FirestoreServerStore unified users/{uid}, private/hiddenAttributes, AES-256-GCM encrypted private/secrets, and admin demotion preservation", async () => {
     const docs = new Map<string, Record<string, any>>();
     const fakeDb: any = {
+      // Mirrors Admin SDK recursiveDelete: removes the document and everything nested under it
+      async recursiveDelete(ref: { path: string }) {
+        for (const key of Array.from(docs.keys())) {
+          if (key === ref.path || key.startsWith(`${ref.path}/`)) docs.delete(key);
+        }
+      },
       doc(path: string) {
         return {
           path,
@@ -3042,6 +3060,66 @@ describe("lanyard/server unit tests", () => {
     expect((await store.getUser(provisioned.uid))?.roles).toEqual([]);
   });
 
+  it("authorizes custom document reads and writes against customDocs audiences", async () => {
+    type Role = "volunteer" | "lead";
+    type Cap = "manage_members" | "view_notes";
+    const policy = createPermissionPolicy<Role, Cap>({
+      roles: {
+        volunteer: { capabilities: [] },
+        lead: { inherits: ["volunteer"], capabilities: ["manage_members", "view_notes"] }
+      },
+      staffCapability: "manage_members",
+      customDocs: { shiftNotes: { read: { self: true, capability: "view_notes" }, write: { staff: true } } }
+    });
+    const adminAuth = createFakeAdminAuth();
+    const store = new InMemoryLanyardStore<Role, Cap>({ policy });
+    const server = createLanyardServer<Role, Cap>({ adminAuth, store, policy });
+    const vol = await server.upsertUserByEmail({ scopeId: "camp-1", email: "vol@example.com", roles: ["volunteer"] });
+    const vol2 = await server.upsertUserByEmail({ scopeId: "camp-1", email: "vol2@example.com", roles: ["volunteer"] });
+    const lead = await server.upsertUserByEmail({ scopeId: "camp-1", email: "lead@example.com", roles: ["lead"] });
+
+    expect(
+      await server.updateCustomDoc({
+        scopeId: "camp-1",
+        actor: lead,
+        targetUid: vol.uid,
+        name: "shiftNotes",
+        patch: { note: "solid" }
+      })
+    ).toEqual({ note: "solid" });
+    expect(
+      await server.getCustomDoc({ scopeId: "camp-1", actor: vol, targetUid: vol.uid, name: "shiftNotes" })
+    ).toEqual({
+      note: "solid"
+    });
+    await expect(
+      server.getCustomDoc({ scopeId: "camp-1", actor: vol2, targetUid: vol.uid, name: "shiftNotes" })
+    ).rejects.toThrow(/Insufficient permissions to read custom doc 'shiftNotes'/);
+    await expect(
+      server.updateCustomDoc({
+        scopeId: "camp-1",
+        actor: vol,
+        targetUid: vol.uid,
+        name: "shiftNotes",
+        patch: { note: "x" }
+      })
+    ).rejects.toThrow(/Insufficient permissions to write custom doc 'shiftNotes'/);
+    await expect(
+      server.getCustomDoc({ scopeId: "camp-1", actor: { uid: "outsider" }, targetUid: vol.uid, name: "shiftNotes" })
+    ).rejects.toThrow(/not a member of scope 'camp-1'/);
+    // No phantom documents for users who aren't members
+    await expect(
+      server.updateCustomDoc({
+        scopeId: "camp-1",
+        actor: lead,
+        targetUid: "ghost",
+        name: "shiftNotes",
+        patch: { note: "x" }
+      })
+    ).rejects.toThrow(/Target member 'ghost' not found/);
+    expect(await store.getCustomDoc("shiftNotes", "ghost", "camp-1")).toEqual({});
+  });
+
   it("returns the full attributes tier to self/staff and only card-placed attribute keys to other card readers", async () => {
     type Role = "volunteer" | "lead";
     type Cap = "manage_members" | "view_directory";
@@ -3113,6 +3191,11 @@ describe("lanyard/server unit tests", () => {
       badges: ["early-bird"],
       points: 42
     });
+
+    // Custom documents: the policy has none, so any name is rejected
+    await expect(
+      server.getCustomDoc({ scopeId: "camp-1", actor: lead, targetUid: target.uid, name: "shiftNotes" })
+    ).rejects.toThrow(/Unknown custom doc 'shiftNotes'/);
 
     // queryMembers: staff look up by attributes-tier keys; any card reader by card-placed keys
     expect(await server.queryMembers({ scopeId: "camp-1", actor: lead, attributes: { points: 42 } })).toEqual([

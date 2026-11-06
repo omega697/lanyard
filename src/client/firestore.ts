@@ -2,6 +2,7 @@ import {
   collection,
   collectionGroup,
   doc,
+  getDoc,
   getDocs,
   onSnapshot,
   query,
@@ -25,6 +26,7 @@ import {
   type UserRecord
 } from "../core/index.js";
 import {
+  assertCustomDocName,
   assertNoReservedTierKeys,
   readTierDocValues,
   resolveAttributeQueryLocation,
@@ -341,10 +343,42 @@ export class FirestoreClientStore<
 
   /** `users/{uid}/private/{tier}` (global, `scopeId === null`) or `{scope}/{scopeId}/members/{uid}/private/{tier}`. */
   private tierDocRef(tier: ClientTier, uid: string, scopeId: string | null) {
+    return this.privateDocRef(tier, uid, scopeId);
+  }
+
+  /** `users/{uid}/private/{name}` (global, `scopeId === null`) or `{scope}/{scopeId}/members/{uid}/private/{name}`. */
+  private privateDocRef(name: string, uid: string, scopeId: string | null) {
     const cleanUid = assertValidFirestoreDocId(uid, "uid");
-    if (scopeId === null) return doc(this.db, this.usersCollection, cleanUid, "private", tier);
+    if (scopeId === null) return doc(this.db, this.usersCollection, cleanUid, "private", name);
     const cleanScopeId = assertValidFirestoreDocId(scopeId, "scopeId");
-    return doc(this.db, this.scopeCollection, cleanScopeId, this.membersSubcollection, cleanUid, "private", tier);
+    return doc(this.db, this.scopeCollection, cleanScopeId, this.membersSubcollection, cleanUid, "private", name);
+  }
+
+  async getCustomDoc(name: string, uid: string, scopeId: string | null): Promise<Record<string, any>> {
+    const snap = await getDoc(this.privateDocRef(assertCustomDocName(name), uid, scopeId));
+    return snap.exists() ? readTierDocValues<Record<string, any>>(snap.data()) : {};
+  }
+
+  subscribeToCustomDoc(
+    name: string,
+    uid: string,
+    scopeId: string | null,
+    onChange: (values: Record<string, any>) => void
+  ): () => void {
+    return this.subscribeToTierDoc(this.privateDocRef(assertCustomDocName(name), uid, scopeId), onChange);
+  }
+
+  async updateCustomDoc(name: string, uid: string, scopeId: string | null, patch: Record<string, any>): Promise<void> {
+    const cleanName = assertCustomDocName(name);
+    const cleanUid = assertValidFirestoreDocId(uid, "uid");
+    const cleanScopeId = scopeId === null ? null : assertValidFirestoreDocId(scopeId, "scopeId");
+    const cleanPatch = sanitizeObjectPatch<Record<string, any>>(patch);
+    assertNoReservedTierKeys(cleanPatch, cleanName);
+    await setDoc(
+      this.privateDocRef(cleanName, cleanUid, cleanScopeId),
+      { ...cleanPatch, ...tierDocMetadata(cleanName, cleanUid, cleanScopeId) },
+      { merge: true }
+    );
   }
 
   /**

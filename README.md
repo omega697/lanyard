@@ -37,7 +37,7 @@ Like a conference or workplace lanyard, `lanyard` answers two questions everywhe
     - **`attributes`** (`TAttributes`): readable by the user themselves, scope staff (holders of `staffCapability`), and system admins; writable only by system admins or roles holding the per-key write capability in `attributeCapabilities` (e.g., points, badges, quotas). Stored in a dedicated `users/{uid}/private/attributes` (or `{scope}/{scopeId}/members/{uid}/private/attributes`) document. Keys listed in `cardFields.attributes` are placed on the card instead (opt-in exposure to every card reader; moved, never copied). Reads merge both locations, so `getAttributes`, `attributesStore`, and server records have the same shape either way. Pass the same policy to the store (`new FirestoreServerStore({ db, policy })`, `new FirestoreClientStore({ db, policy })`, `new InMemoryLanyardStore({ policy })`) so it knows the placement; `createLanyardServer`/`createLanyardClient` throw if the store and policy disagree.
     - **`hiddenAttributes`** (`THiddenAttributes`): properties _about_ a user that **not even the user themselves can read or write**, readable only by scope staff and system admins, writable per key via `hiddenAttributeCapabilities` (stored in isolated `users/{uid}/private/hiddenAttributes` and `{scope}/{scopeId}/members/{uid}/private/hiddenAttributes` subdocuments).
     - **`secrets`** (`TSecrets`): **Write-only AES-256-GCM encrypted user secrets** (e.g., BYOK AI API keys or personal OAuth tokens). Stored encrypted at rest (`{ ciphertext, iv, tag }`) in `private/secrets`, never readable back out to any client, with boolean status checks (`getUserSecretsStatus`) for the UI and server-only decryption (`getDecryptedUserSecrets(scopeId, uid)`) for backend API calls.
-    - **Custom private documents** (`customDocs`): app-defined documents with their own read/write audiences (`self`, `staff`, or a `capability`) for cases the built-in tiers don't cover.
+    - **Custom private documents** (`customDocs`): app-defined documents with their own read/write audiences (`self`, `staff`, or a `capability`) for cases the built-in tiers don't cover. Each lives at `…/{uid}/private/{name}` (stamped with `_lanyard: { tier: name, … }`), is read and written through `readCustomDoc` / `subscribeToCustomDoc` / `updateCustomDoc` (client) and `getCustomDoc` / `updateCustomDoc` (server), and is deleted with its user/member.
     - > [!WARNING]
     - **`email`** is private by default: it's stored in the `attributes` tier document (so `email` is a reserved attribute key) and merged back into `UserRecord.email` / `ScopedMember.email` for readers of that tier (the user, staff, admins, and the server). Other readers see `email: ""`. Set `cardFields.email: true` to store it on the card instead. Users change their email through Firebase Auth (`sendEmailUpdateVerification`); once verified, Lanyard syncs the stored copy from the client and the server, and the reference rules accept a client write only for the owner's own verified email.
   - **Single-Listener Multiplexing**: `FirestoreClientStore` multiplexes `onSnapshot` listeners on `users/{uid}` so repeated subscriptions to the user profile, `attributes`, and admin status only ever open **1 Firestore document listener**. Preferences and private attributes use one more listener each on the user's own `private/preferences` and `private/attributes` documents, plus one of each per scope membership.
@@ -286,6 +286,16 @@ const uids = await lanyard.queryMembers(activeWorkspaceId, { attributes: { canva
 
 With Firestore, each combination of filtered attributes-tier keys needs a collection-group index on `private`
 over `_lanyard.tier`, `_lanyard.scopeId`, and the filtered keys (Firestore's error message links to create it).
+
+App-defined custom documents (`customDocs`) are read and written with the audiences their policy entry grants
+(the client checks them up front; security rules must enforce the same audiences):
+
+```typescript
+// customDocs: { shiftNotes: { read: { self: true, staff: true }, write: { staff: true } } }
+await lanyard.updateCustomDoc(activeWorkspaceId, "shiftNotes", memberUid, { note: "Great shift!" }); // staff
+const myNotes = await lanyard.readCustomDoc(activeWorkspaceId, "shiftNotes"); // the member themselves
+const unsubNotes = lanyard.subscribeToCustomDoc(activeWorkspaceId, "shiftNotes", memberUid, (notes) => {});
+```
 
 > [!NOTE]
 > With `FirestoreClientStore`, `include: ["attributes"]` adds a single collection-group listener on `private`
@@ -756,6 +766,15 @@ match /workspaces/{scopeId}/members/{memberUid} {
   match /private/attributes {
     allow read: if isOwner(memberUid) || hasScopeRole(scopeId, ['owner', 'manager']);
     allow write: if isOwner(memberUid) && isScopeMember(scopeId) && isOwnVerifiedEmailWrite(memberUid, scopeId);
+  }
+
+  // Example custom doc (customDocs.shiftNotes: read self + staff, write staff)
+  match /private/shiftNotes {
+    allow read: if isOwner(memberUid) || hasScopeRole(scopeId, ['owner', 'manager']);
+    allow write: if hasScopeRole(scopeId, ['owner', 'manager']) &&
+      request.resource.data._lanyard.tier == 'shiftNotes' &&
+      request.resource.data._lanyard.uid == memberUid &&
+      request.resource.data._lanyard.scopeId == scopeId;
   }
 
   // Self-only scoped preferences tier (writable only while the user is a member of the scope)

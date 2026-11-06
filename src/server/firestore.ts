@@ -12,6 +12,7 @@ import {
   type UserRecord
 } from "../core/index.js";
 import {
+  assertCustomDocName,
   assertNoReservedAttributeKeys,
   assertNoReservedTierKeys,
   readTierDocValues,
@@ -151,11 +152,33 @@ export class FirestoreServerStore<
 
   /** `users/{uid}/private/{tier}` (global, `scopeId === null`) or `{scope}/{scopeId}/members/{uid}/private/{tier}`. */
   private tierDocRef(tier: MergedTier, uid: string, scopeId: string | null) {
+    return this.privateDocRef(tier, uid, scopeId);
+  }
+
+  /** `users/{uid}/private/{name}` (global, `scopeId === null`) or `{scope}/{scopeId}/members/{uid}/private/{name}`. */
+  private privateDocRef(name: string, uid: string, scopeId: string | null) {
     const cleanUid = assertValidFirestoreDocId(uid, "uid");
-    if (scopeId === null) return this.db.doc(`${this.usersCollection}/${cleanUid}/private/${tier}`);
+    if (scopeId === null) return this.db.doc(`${this.usersCollection}/${cleanUid}/private/${name}`);
     const cleanScopeId = assertValidFirestoreDocId(scopeId, "scopeId");
     return this.db.doc(
-      `${this.scopeCollection}/${cleanScopeId}/${this.membersSubcollection}/${cleanUid}/private/${tier}`
+      `${this.scopeCollection}/${cleanScopeId}/${this.membersSubcollection}/${cleanUid}/private/${name}`
+    );
+  }
+
+  async getCustomDoc(name: string, uid: string, scopeId: string | null): Promise<Record<string, any>> {
+    const snap = await this.privateDocRef(assertCustomDocName(name), uid, scopeId).get();
+    return snap.exists ? readTierDocValues<Record<string, any>>(snap.data()) : {};
+  }
+
+  async updateCustomDoc(name: string, uid: string, scopeId: string | null, patch: Record<string, any>): Promise<void> {
+    const cleanName = assertCustomDocName(name);
+    const cleanUid = assertValidFirestoreDocId(uid, "uid");
+    const cleanScopeId = scopeId === null ? null : assertValidFirestoreDocId(scopeId, "scopeId");
+    const cleanPatch = sanitizeObjectPatch<Record<string, any>>(patch);
+    assertNoReservedTierKeys(cleanPatch, cleanName);
+    await this.privateDocRef(cleanName, cleanUid, cleanScopeId).set(
+      { ...cleanPatch, ...tierDocMetadata(cleanName, cleanUid, cleanScopeId) },
+      { merge: true }
     );
   }
 
@@ -778,6 +801,9 @@ export class FirestoreServerStore<
     await this.memberSecretsDocRef(scopeId, uid)
       .delete()
       .catch(() => {});
-    await this.memberDocRef(scopeId, uid).delete();
+    const memberRef = this.memberDocRef(scopeId, uid);
+    await memberRef.delete();
+    // Also remove any remaining private documents (e.g. custom docs) under the member
+    await this.db.recursiveDelete(memberRef);
   }
 }

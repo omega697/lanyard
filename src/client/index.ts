@@ -1337,6 +1337,70 @@ export function createLanyardClient<
   }
 
   /**
+   * Throws unless the signed-in user may `mode` the policy's custom document `name` belonging to `targetUid` in
+   * `scopeId` (per `customDocs[name].read` / `.write`). Scoped access also requires membership (or system admin).
+   */
+  function assertCustomDocAccess(scopeId: ScopeId, name: string, targetUid: string, mode: "read" | "write"): void {
+    if (!policy || !Object.hasOwn(policy.customDocs, name)) throw new Error(`Unknown custom doc '${name}'`);
+    if (scopeId !== GLOBAL_SCOPE && !isValidResourceId(scopeId)) throw new Error("Invalid scopeId");
+    if (!isValidResourceId(targetUid)) throw new Error("Invalid targetUid");
+    const currentUser = authStoreInternal.get().user;
+    if (!currentUser?.uid) throw new Error("No authenticated user.");
+    const actor = currentActorRecord(scopeId);
+    const isSystemAdmin = Boolean(currentUser.isAdmin);
+    if (scopeId !== GLOBAL_SCOPE && !actor && !isSystemAdmin) {
+      throw new Error(`Forbidden: not a member of ${scopeLabel(scopeId)}`);
+    }
+    const options = { isSystemAdmin, isSelf: currentUser.uid === targetUid };
+    const allowed =
+      mode === "read" ? policy.canReadCustomDoc(actor, name, options) : policy.canWriteCustomDoc(actor, name, options);
+    if (!allowed)
+      throw new Error(`Forbidden: cannot ${mode} custom doc '${name}' of this user in ${scopeLabel(scopeId)}`);
+  }
+
+  function requireCustomDocStore<K extends "getCustomDoc" | "subscribeToCustomDoc" | "updateCustomDoc">(
+    method: K
+  ): NonNullable<LanyardClientStore<TRole, TCapability, TPreferences, TAttributes>[K]> {
+    const fn = store[method];
+    if (typeof fn !== "function") throw new Error(`Backing store does not implement ${method}`);
+    return fn.bind(store) as NonNullable<LanyardClientStore<TRole, TCapability, TPreferences, TAttributes>[K]>;
+  }
+
+  /** Reads the policy's custom document `name` of `targetUid` (default: the signed-in user) in `scopeId`. */
+  async function readCustomDoc(scopeId: ScopeId, name: string, targetUid?: string): Promise<Record<string, any>> {
+    const uid = targetUid ?? authStoreInternal.get().user?.uid ?? "";
+    assertCustomDocAccess(scopeId, name, uid, "read");
+    return requireCustomDocStore("getCustomDoc")(name, uid, scopeId === GLOBAL_SCOPE ? null : scopeId);
+  }
+
+  /** Subscribes to the policy's custom document `name` of `targetUid` in `scopeId` (emits `{}` while missing). */
+  function subscribeToCustomDoc(
+    scopeId: ScopeId,
+    name: string,
+    targetUid: string,
+    cb: (values: Record<string, any>) => void
+  ): () => void {
+    assertCustomDocAccess(scopeId, name, targetUid, "read");
+    return requireCustomDocStore("subscribeToCustomDoc")(
+      name,
+      targetUid,
+      scopeId === GLOBAL_SCOPE ? null : scopeId,
+      cb
+    );
+  }
+
+  /** Merges `patch` into the policy's custom document `name` of `targetUid` in `scopeId`. */
+  async function updateCustomDoc(
+    scopeId: ScopeId,
+    name: string,
+    targetUid: string,
+    patch: Record<string, any>
+  ): Promise<void> {
+    assertCustomDocAccess(scopeId, name, targetUid, "write");
+    await requireCustomDocStore("updateCustomDoc")(name, targetUid, scopeId === GLOBAL_SCOPE ? null : scopeId, patch);
+  }
+
+  /**
    * Returns the uids of members of `scopeId` (or global users for `GLOBAL_SCOPE`) whose attributes equal every
    * value in `filter.attributes`. Filters on `attributes`-tier keys require staff access; filters on keys placed
    * on the card (`cardFields.attributes`) require card access. Keys from both locations can't be combined.
@@ -1411,6 +1475,9 @@ export function createLanyardClient<
     subscribeToUsers,
     subscribeToSystemAdmins,
     queryMembers,
+    readCustomDoc,
+    subscribeToCustomDoc,
+    updateCustomDoc,
     loginWithSocialProvider,
     sendPasswordlessEmailLink,
     completePasswordlessSignIn,
