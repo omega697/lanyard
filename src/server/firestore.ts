@@ -5,6 +5,7 @@ import {
   type CardFieldsPlacement,
   type LanyardServerStore,
   type LanyardStorePlacementSource,
+  TIER_METADATA_KEY,
   type ScopedMember,
   type SecretCipher,
   type SystemAdminProfile,
@@ -14,6 +15,7 @@ import {
   assertNoReservedAttributeKeys,
   assertNoReservedTierKeys,
   readTierDocValues,
+  resolveAttributeQueryLocation,
   resolveCardFields,
   splitAttributesByPlacement,
   splitAttributesTierValues,
@@ -742,6 +744,30 @@ export class FirestoreServerStore<
     await ref.update({
       roles: FieldValue.arrayRemove(...roles)
     });
+  }
+
+  async queryMemberUids(scopeId: string | null, attributes: Partial<TAttributes>): Promise<string[]> {
+    const cleanScopeId = scopeId === null ? null : assertValidFirestoreDocId(scopeId, "scopeId");
+    const location = resolveAttributeQueryLocation(attributes, this.cardFields);
+    let target: FirebaseFirestore.Query =
+      location === "card"
+        ? this.db.collection(
+            cleanScopeId === null
+              ? this.usersCollection
+              : `${this.scopeCollection}/${cleanScopeId}/${this.membersSubcollection}`
+          )
+        : this.db
+            .collectionGroup("private")
+            .where(`${TIER_METADATA_KEY}.tier`, "==", "attributes")
+            .where(`${TIER_METADATA_KEY}.scopeId`, "==", cleanScopeId);
+    for (const [key, value] of Object.entries(attributes)) {
+      target = target.where(location === "card" ? `attributes.${key}` : key, "==", value);
+    }
+    const snap = await target.get();
+    if (location === "card") return snap.docs.map((d) => (typeof d.data()?.uid === "string" ? d.data().uid : d.id));
+    return snap.docs
+      .map((d) => d.data()?.[TIER_METADATA_KEY]?.uid)
+      .filter((uid): uid is string => typeof uid === "string");
   }
 
   async deleteScopeMember(scopeId: string, uid: string): Promise<void> {

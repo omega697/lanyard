@@ -17,7 +17,7 @@ import {
   type UserRecord,
   type VerifiedEmailChangeEvent
 } from "../core/index.js";
-import { assertStoreMatchesPolicyPlacement } from "../core/tierDocs.js";
+import { assertStoreMatchesPolicyPlacement, resolveAttributeQueryLocation } from "../core/tierDocs.js";
 
 export { GLOBAL_SCOPE, type GlobalScope, type LanyardActor, type ScopeId, type VerifiedEmailChangeEvent };
 export * from "./encryption.js";
@@ -1338,6 +1338,47 @@ export function createLanyardServer<
   }
 
   /**
+   * Returns the uids of members of `scopeId` (or global users for `GLOBAL_SCOPE`) whose attributes equal every value
+   * in `attributes`, after verifying the caller (`actor`) may read that location for other users: staff (or system
+   * admins) for `attributes`-tier keys, card readers for keys placed on the card. Keys from both locations can't be
+   * combined.
+   */
+  async function queryMembers(params: {
+    scopeId: ScopeId;
+    actor: LanyardActor;
+    attributes: Partial<TAttributes>;
+  }): Promise<string[]> {
+    assertValidScopeId(params.scopeId);
+    if (typeof store.queryMemberUids !== "function") {
+      throw new Error("Backing store does not implement queryMemberUids");
+    }
+    const location = resolveAttributeQueryLocation(params.attributes, policy.cardFields);
+    const { isAdmin, userRecord: actorGlobalRecord } = await resolveEffectiveAdminStatus(params.actor);
+    const scopeId = params.scopeId === GLOBAL_SCOPE ? null : params.scopeId;
+    const isGlobal = scopeId === null;
+    const actorRecord = scopeId === null ? actorGlobalRecord : await store.getScopeMember(scopeId, params.actor.uid);
+    if (scopeId !== null && !isAdmin && !actorRecord) {
+      throw new Error(`Forbidden: Caller is not a member of scope '${scopeId}'`);
+    }
+    const allowed =
+      location === "attributes"
+        ? policy.canReadTier(actorRecord, "attributes", { isSystemAdmin: isAdmin })
+        : policy.canReadTier(actorRecord, "card", {
+            isSystemAdmin: isAdmin,
+            isGlobal,
+            isScopeMember: Boolean(actorRecord)
+          });
+    if (!allowed) {
+      throw new Error(
+        location === "attributes"
+          ? "Forbidden: queryMembers on attributes-tier keys requires staff access"
+          : "Forbidden: queryMembers on card-placed keys requires card access"
+      );
+    }
+    return store.queryMemberUids(scopeId, params.attributes);
+  }
+
+  /**
    * Updates a user's `attributes` in `GLOBAL_SCOPE` (`users/{targetUid}`) or a specific tenant `scopeId`
    * after verifying the caller (`actor`) holds the required write capability for every key in `patch`
    * within that exact `scopeId` (or is an active system admin).
@@ -1645,6 +1686,7 @@ export function createLanyardServer<
     updateUserRoles,
     deleteUser,
     readUserAttributes,
+    queryMembers,
     updateUserAttributes,
     readUserHiddenAttributes,
     updateUserHiddenAttributes,

@@ -276,6 +276,17 @@ const unsubRoster = lanyard.subscribeToUsers(
 );
 ```
 
+Staff can also look members up by attribute values without loading the roster. Filters on `attributes`-tier keys
+require staff access; filters on card-placed keys (`cardFields.attributes`) require card access, and the two
+can't be mixed in one query. The server has the same API (`lanyardServer.queryMembers({ scopeId, actor, attributes })`):
+
+```typescript
+const uids = await lanyard.queryMembers(activeWorkspaceId, { attributes: { canvasserId: "c-123" } });
+```
+
+With Firestore, each combination of filtered attributes-tier keys needs a collection-group index on `private`
+over `_lanyard.tier`, `_lanyard.scopeId`, and the filtered keys (Firestore's error message links to create it).
+
 > [!NOTE]
 > With `FirestoreClientStore`, `include: ["attributes"]` adds a single collection-group listener on `private`
 > (`_lanyard.tier == "attributes"` and `_lanyard.scopeId == scopeId`, or `null` for global users). It needs this

@@ -16,6 +16,7 @@ import type {
 import {
   assertNoReservedAttributeKeys,
   assertNoReservedTierKeys,
+  resolveAttributeQueryLocation,
   resolveCardFields,
   splitAttributesByPlacement,
   splitAttributesTierValues
@@ -23,6 +24,12 @@ import {
 
 /** Private tier documents whose values are merged into user/member records. */
 type MergedTier = "preferences" | "attributes";
+
+/** Equality matching Firestore `==` filters for the JSON-like values Lanyard stores. */
+function firestoreValuesEqual(a: unknown, b: unknown): boolean {
+  if (a === null || b === null || typeof a !== "object" || typeof b !== "object") return Object.is(a, b);
+  return JSON.stringify(a) === JSON.stringify(b);
+}
 
 /** Map key for a tier document: global (`scopeId === null`) or scoped. */
 function tierKey(scopeId: string | null, uid: string): string {
@@ -391,6 +398,22 @@ export class InMemoryLanyardStore<
         });
       }
     }
+  }
+
+  async queryMemberUids(scopeId: string | null, attributes: Partial<TAttributes>): Promise<string[]> {
+    if (scopeId !== null) assertValidResourceId(scopeId, "scopeId");
+    const location = resolveAttributeQueryLocation(attributes, this.cardFields);
+    const records: Array<{ uid: string; attributes?: Partial<TAttributes> }> =
+      scopeId === null ? Array.from(this.users.values()) : Array.from(this.scopeMembers.get(scopeId)?.values() || []);
+    return records
+      .filter((record) => {
+        const values: Record<string, any> =
+          location === "card"
+            ? record.attributes || {}
+            : splitAttributesTierValues(this.tierValues.attributes.get(tierKey(scopeId, record.uid)) || {}).attributes;
+        return Object.entries(attributes).every(([key, value]) => firestoreValuesEqual(values[key], value));
+      })
+      .map((record) => record.uid);
   }
 
   // --- Server Store Methods: Global Users & System Admins ---

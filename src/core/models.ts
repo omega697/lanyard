@@ -752,6 +752,12 @@ export interface LanyardClientStore<
   ): () => void;
   /** Optional: The card field placement this store routes reads by; must match the client's policy. */
   readonly cardFields?: CardFieldsPlacement;
+  /**
+   * Optional: Returns the uids of members of `scopeId` (or global users when `scopeId` is `null`) whose attributes
+   * equal every value in `attributes`. Keys must be all card-placed or all in the `attributes` tier. Callers must
+   * be allowed to read that location for other users (security rules enforce this in Firestore).
+   */
+  queryMemberUids?(scopeId: string | null, attributes: Partial<TAttributes>): Promise<string[]>;
 
   /**
    * Optional: Subscribe to the global `UserRecord` card (`users/{uid}`) including `roles` and any card-placed
@@ -823,6 +829,11 @@ export interface LanyardServerStore<
 > {
   /** Optional: The card field placement this store routes writes by; must match the server's policy. */
   readonly cardFields?: CardFieldsPlacement;
+  /**
+   * Optional: Returns the uids of members of `scopeId` (or global users when `scopeId` is `null`) whose attributes
+   * equal every value in `attributes`. Keys must be all card-placed or all in the `attributes` tier.
+   */
+  queryMemberUids?(scopeId: string | null, attributes: Partial<TAttributes>): Promise<string[]>;
 
   // --- Global User (`users/{uid}`) & System Admin Operations ---
   getUser?(uid: string): Promise<UserRecord<TRole, TCapability, TPreferences, TAttributes> | null>;

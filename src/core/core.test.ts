@@ -725,6 +725,45 @@ describe("lanyard/core unit tests", () => {
       expect(included).toHaveLength(includedCount);
     });
 
+    it("queries member uids by card-placed or attributes-tier values, and validates filters", async () => {
+      const policy = createPermissionPolicy<TestRole, TestCapability>({ cardFields: { attributes: ["team"] } });
+      const store = new InMemoryLanyardStore<TestRole, TestCapability, Record<string, any>, Record<string, any>>({
+        policy
+      });
+      await store.upsertScopeMember("ws-1", {
+        uid: "a",
+        email: "a@example.com",
+        roles: [],
+        attributes: { team: "blue", level: 2, tags: ["x"] }
+      });
+      await store.upsertScopeMember("ws-1", {
+        uid: "b",
+        email: "b@example.com",
+        roles: [],
+        attributes: { team: "red", level: 2 }
+      });
+      await store.upsertScopeMember("ws-2", {
+        uid: "c",
+        email: "c@example.com",
+        roles: [],
+        attributes: { team: "blue", level: 2 }
+      });
+      await store.upsertUser({ uid: "g", email: "g@example.com", attributes: { level: 9 } });
+
+      expect(await store.queryMemberUids("ws-1", { team: "blue" })).toEqual(["a"]);
+      expect((await store.queryMemberUids("ws-1", { level: 2 })).sort()).toEqual(["a", "b"]);
+      expect(await store.queryMemberUids("ws-1", { level: 2, tags: ["x"] })).toEqual(["a"]);
+      expect(await store.queryMemberUids("ws-1", { level: "2" })).toEqual([]);
+      expect(await store.queryMemberUids(null, { level: 9 })).toEqual(["g"]);
+      expect(await store.queryMemberUids("ws-none", { level: 2 })).toEqual([]);
+
+      await expect(store.queryMemberUids("ws-1", {})).rejects.toThrow(/at least one attribute/);
+      await expect(store.queryMemberUids("ws-1", { team: "blue", level: 2 })).rejects.toThrow(/can't be combined/);
+      await expect(store.queryMemberUids("ws-1", { email: "a@example.com" })).rejects.toThrow(/filter key 'email'/);
+      await expect(store.queryMemberUids("ws-1", { _lanyard: {} })).rejects.toThrow(/filter key '_lanyard'/);
+      await expect(store.queryMemberUids("ws-1", { level: undefined })).rejects.toThrow(/'level' is undefined/);
+    });
+
     it("enforces no-op write guards on syncAvatar when photoUrl already matches or scoped member does not exist", async () => {
       const store = new InMemoryLanyardStore<TestRole, TestCapability>();
       await store.upsertScopeMember("ws-1", {

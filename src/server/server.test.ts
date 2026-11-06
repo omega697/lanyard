@@ -3113,6 +3113,23 @@ describe("lanyard/server unit tests", () => {
       badges: ["early-bird"],
       points: 42
     });
+
+    // queryMembers: staff look up by attributes-tier keys; any card reader by card-placed keys
+    expect(await server.queryMembers({ scopeId: "camp-1", actor: lead, attributes: { points: 42 } })).toEqual([
+      target.uid
+    ]);
+    await expect(server.queryMembers({ scopeId: "camp-1", actor: peer, attributes: { points: 42 } })).rejects.toThrow(
+      /Forbidden: queryMembers on attributes-tier keys requires staff access/
+    );
+    expect(
+      await server.queryMembers({ scopeId: "camp-1", actor: peer, attributes: { badges: ["early-bird"] } })
+    ).toEqual([target.uid]);
+    await expect(
+      server.queryMembers({ scopeId: "camp-1", actor: { uid: "outsider" }, attributes: { badges: ["early-bird"] } })
+    ).rejects.toThrow(/not a member of scope 'camp-1'/);
+    await expect(
+      server.queryMembers({ scopeId: "camp-1", actor: lead, attributes: { points: 42, badges: ["early-bird"] } })
+    ).rejects.toThrow(/can't be combined/);
     expect(await server.readUserAttributes({ scopeId: "camp-1", actor: target, targetUid: target.uid })).toEqual({
       badges: ["early-bird"],
       points: 42

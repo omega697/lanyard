@@ -2,6 +2,7 @@ import {
   collection,
   collectionGroup,
   doc,
+  getDocs,
   onSnapshot,
   query,
   setDoc,
@@ -26,6 +27,7 @@ import {
 import {
   assertNoReservedTierKeys,
   readTierDocValues,
+  resolveAttributeQueryLocation,
   resolveCardFields,
   splitAttributesTierValues,
   tierDocMetadata
@@ -549,6 +551,33 @@ export class FirestoreClientStore<
         ? { attributes: sanitizeObjectPatch<TAttributes>(data.attributes) }
         : {})
     };
+  }
+
+  async queryMemberUids(scopeId: string | null, attributes: Partial<TAttributes>): Promise<string[]> {
+    const cleanScopeId = scopeId === null ? null : assertValidFirestoreDocId(scopeId, "scopeId");
+    const location = resolveAttributeQueryLocation(attributes, this.cardFields);
+    const filters = Object.entries(attributes).map(([key, value]) =>
+      where(location === "card" ? `attributes.${key}` : key, "==", value)
+    );
+    if (location === "card") {
+      const cards =
+        cleanScopeId === null
+          ? collection(this.db, this.usersCollection)
+          : collection(this.db, this.scopeCollection, cleanScopeId, this.membersSubcollection);
+      const snap = await getDocs(query(cards, ...filters));
+      return snap.docs.map((d) => (typeof d.data()?.uid === "string" ? d.data().uid : d.id));
+    }
+    const snap = await getDocs(
+      query(
+        collectionGroup(this.db, "private"),
+        where(`${TIER_METADATA_KEY}.tier`, "==", "attributes"),
+        where(`${TIER_METADATA_KEY}.scopeId`, "==", cleanScopeId),
+        ...filters
+      )
+    );
+    return snap.docs
+      .map((d) => d.data()?.[TIER_METADATA_KEY]?.uid)
+      .filter((uid): uid is string => typeof uid === "string");
   }
 
   async syncAvatar(params: {

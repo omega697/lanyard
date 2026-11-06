@@ -40,7 +40,11 @@ import {
   type UserRecord,
   type VerifiedEmailChangeEvent
 } from "../core/index.js";
-import { assertStoreMatchesPolicyPlacement, resolveCardFields } from "../core/tierDocs.js";
+import {
+  assertStoreMatchesPolicyPlacement,
+  resolveAttributeQueryLocation,
+  resolveCardFields
+} from "../core/tierDocs.js";
 
 export {
   GLOBAL_SCOPE,
@@ -1281,7 +1285,7 @@ export function createLanyardClient<
         ) => void),
     options?: SubscribeToUsersOptions
   ): () => void {
-    if (options?.include?.includes("attributes")) assertCanIncludeAttributes(scopeId);
+    if (options?.include?.includes("attributes")) assertCanReadOthersAttributes(scopeId, 'include: ["attributes"]');
     if (scopeId === GLOBAL_SCOPE) {
       if (typeof store.subscribeToUsers !== "function") {
         throw new Error("Backing store does not implement subscribeToUsers");
@@ -1304,25 +1308,63 @@ export function createLanyardClient<
     );
   }
 
+  /** The signed-in user's own record in `scopeId` (their global record for `GLOBAL_SCOPE`), for policy checks. */
+  function currentActorRecord(
+    scopeId: ScopeId
+  ):
+    | UserRecord<TRole, TCapability, TPreferences, TAttributes>
+    | ScopedMember<TRole, TCapability, TPreferences, TAttributes>
+    | null {
+    return scopeId === GLOBAL_SCOPE
+      ? userRecordStoreInternal.get()
+      : membershipsStoreInternal.get().memberships.find((m) => m.scopeId === scopeId) || null;
+  }
+
+  function scopeLabel(scopeId: ScopeId): string {
+    return scopeId === GLOBAL_SCOPE ? "the global scope" : `scope '${scopeId}'`;
+  }
+
   /**
    * Throws unless the signed-in user may read other users' `attributes` tier in `scopeId` (system admins, and
-   * staff per the policy's `staffCapability`), so a forbidden `include` fails clearly instead of returning `[]`.
+   * staff per the policy's `staffCapability`), so forbidden reads fail clearly instead of returning `[]`.
    */
-  function assertCanIncludeAttributes(scopeId: ScopeId): void {
+  function assertCanReadOthersAttributes(scopeId: ScopeId, operation: string): void {
     const currentUser = authStoreInternal.get().user;
     const isSystemAdmin = Boolean(currentUser?.isAdmin);
-    const actor =
-      scopeId === GLOBAL_SCOPE
-        ? userRecordStoreInternal.get()
-        : membershipsStoreInternal.get().memberships.find((m) => m.scopeId === scopeId) || null;
-    const allowed = isSystemAdmin || Boolean(currentUser && policy?.canReadTier(actor, "attributes"));
-    if (!allowed) {
-      throw new Error(
-        `Forbidden: include: ["attributes"] requires staff access in ${
-          scopeId === GLOBAL_SCOPE ? "the global scope" : `scope '${scopeId}'`
-        }`
-      );
+    const allowed =
+      isSystemAdmin || Boolean(currentUser && policy?.canReadTier(currentActorRecord(scopeId), "attributes"));
+    if (!allowed) throw new Error(`Forbidden: ${operation} requires staff access in ${scopeLabel(scopeId)}`);
+  }
+
+  /**
+   * Returns the uids of members of `scopeId` (or global users for `GLOBAL_SCOPE`) whose attributes equal every
+   * value in `filter.attributes`. Filters on `attributes`-tier keys require staff access; filters on keys placed
+   * on the card (`cardFields.attributes`) require card access. Keys from both locations can't be combined.
+   * In Firestore, each combination of filtered keys needs a composite index (see the README).
+   */
+  async function queryMembers(scopeId: ScopeId, filter: { attributes: Partial<TAttributes> }): Promise<string[]> {
+    if (scopeId !== GLOBAL_SCOPE && !isValidResourceId(scopeId)) throw new Error("Invalid scopeId");
+    if (typeof store.queryMemberUids !== "function") {
+      throw new Error("Backing store does not implement queryMemberUids");
     }
+    const location = resolveAttributeQueryLocation(filter?.attributes, resolveCardFields(policy));
+    if (location === "attributes") {
+      assertCanReadOthersAttributes(scopeId, "queryMembers on attributes-tier keys");
+    } else {
+      const currentUser = authStoreInternal.get().user;
+      const actor = currentActorRecord(scopeId);
+      const isSystemAdmin = Boolean(currentUser?.isAdmin);
+      const canReadCards =
+        isSystemAdmin ||
+        Boolean(
+          currentUser &&
+          policy?.canReadTier(actor, "card", { isGlobal: scopeId === GLOBAL_SCOPE, isScopeMember: Boolean(actor) })
+        );
+      if (!canReadCards) {
+        throw new Error(`Forbidden: queryMembers on card-placed keys requires card access in ${scopeLabel(scopeId)}`);
+      }
+    }
+    return store.queryMemberUids(scopeId === GLOBAL_SCOPE ? null : scopeId, filter.attributes);
   }
 
   /**
@@ -1368,6 +1410,7 @@ export function createLanyardClient<
     subscribeToAuthUser,
     subscribeToUsers,
     subscribeToSystemAdmins,
+    queryMembers,
     loginWithSocialProvider,
     sendPasswordlessEmailLink,
     completePasswordlessSignIn,

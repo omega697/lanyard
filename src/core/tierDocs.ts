@@ -96,6 +96,35 @@ export function splitAttributesByPlacement<T extends Record<string, any>>(
 }
 
 /**
+ * Validates a `queryMembers` attribute filter and returns where it must run: on cards (every key placed on the
+ * card via `cardFields.attributes`) or in the `attributes` tier (no card-placed keys). Throws for empty filters,
+ * reserved keys, and filters mixing both locations (Firestore can't query two documents at once).
+ * @internal Shared by the Lanyard stores and facades; not part of the public API.
+ */
+export function resolveAttributeQueryLocation(
+  attributes: Record<string, any> | null | undefined,
+  cardFields: CardFieldsPlacement
+): "card" | "attributes" {
+  if (!attributes || typeof attributes !== "object" || Array.isArray(attributes)) {
+    throw new Error("Invalid attributes filter: expected an object of attribute values");
+  }
+  const keys = Object.keys(attributes);
+  if (keys.length === 0) throw new Error("Invalid attributes filter: at least one attribute is required");
+  for (const key of keys) {
+    if (FORBIDDEN_KEYS.has(key) || key === TIER_METADATA_KEY || key === "email") {
+      throw new Error(`Invalid attributes filter key '${key}'`);
+    }
+    if (attributes[key] === undefined) throw new Error(`Invalid attributes filter: '${key}' is undefined`);
+  }
+  const onCard = keys.filter((key) => cardFields.attributes.includes(key));
+  if (onCard.length === keys.length) return "card";
+  if (onCard.length === 0) return "attributes";
+  throw new Error(
+    `Invalid attributes filter: card-placed keys (${onCard.join(", ")}) can't be combined with attributes-tier keys`
+  );
+}
+
+/**
  * Throws if a store routes fields by a different card placement than the policy it is used with, which would
  * otherwise silently store fields where the policy (and generated security rules) don't expect them.
  * Stores that don't declare `cardFields` (custom implementations) are trusted to follow the policy.

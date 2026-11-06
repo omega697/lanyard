@@ -1674,6 +1674,37 @@ service cloud.firestore {
           email: "mgr@example.com",
           attributes: { badge: "mgr-badge" }
         });
+        // queryMemberUids: staff (and the server) can look members up by attributes-tier values; members can't
+        expect(await mgrStore.queryMemberUids("org-A", { badge: "starter" })).toEqual(["u-member"]);
+        expect(await mgrStore.queryMemberUids("org-A", { badge: "nobody-has-this" })).toEqual([]);
+        expect(await serverStore.queryMemberUids("org-A", { badge: "mgr-badge" })).toEqual(["u-mgr"]);
+        expect(await serverStore.queryMemberUids(null, { badge: "global-badge" })).toEqual(["u-member"]);
+        await expect(memberStore.queryMemberUids("org-A", { badge: "starter" })).rejects.toMatchObject({
+          code: "permission-denied"
+        });
+        // Card-placed keys are queried on the member cards, which every scope member can read
+        const teamPolicy = createPermissionPolicy<Role, Cap>({ cardFields: { attributes: ["team"] } });
+        const teamServerStore = new FirestoreServerStore<Role, Cap, Prefs, { team: string }>({
+          db: adminDb,
+          policy: teamPolicy,
+          scopeCollection: "workspaces",
+          membersSubcollection: "members"
+        });
+        await teamServerStore.updateScopeMemberAttributes("org-A", "u-mgr", { team: "blue" });
+        expect((await adminDb.doc("workspaces/org-A/members/u-mgr").get()).data()?.attributes).toEqual({
+          team: "blue"
+        });
+        const memberTeamStore = new FirestoreClientStore<Role, Cap, Prefs, { team: string }>({
+          db: memberClient.db,
+          policy: teamPolicy,
+          scopeCollection: "workspaces",
+          membersSubcollection: "members"
+        });
+        expect(await memberTeamStore.queryMemberUids("org-A", { team: "blue" })).toEqual(["u-mgr"]);
+        await expect(memberTeamStore.queryMemberUids("org-B", { team: "blue" })).rejects.toMatchObject({
+          code: "permission-denied"
+        });
+
         // A non-staff member's include fails (the store reports an empty list), and raw queries are denied
         const memberRoster: any[][] = [];
         const unsubMemberRoster = memberStore.subscribeToScopeMembers("org-A", (m) => memberRoster.push(m), {

@@ -1470,7 +1470,8 @@ describe("lanyard/client unit tests", () => {
     });
     await store.upsertUser({ uid: "u-peer", email: "peer@example.com", attributes: { points: 70 } });
 
-    const makeClient = (uid: string, isAdmin = false) => {
+    // Each client signs in with its stored email, so the verified-email sync leaves stored emails alone
+    const makeClient = (uid: string, email: string, isAdmin = false) => {
       const client = createLanyardClient<TestRole, TestCap, TestPrefs, Attrs>({
         store,
         policy,
@@ -1479,7 +1480,7 @@ describe("lanyard/client unit tests", () => {
       });
       client.setActiveUser({
         uid,
-        email: `${uid}@example.com`,
+        email,
         emailVerified: true,
         displayName: null,
         photoUrl: null,
@@ -1490,7 +1491,7 @@ describe("lanyard/client unit tests", () => {
     };
 
     // Scope staff get every member's tier merged in, and live tier updates
-    const staff = makeClient("u-staff");
+    const staff = makeClient("u-staff", "staff@example.com");
     const roster: any[][] = [];
     const unsubRoster = staff.subscribeToUsers("ws-a", (m) => roster.push(m), { include: ["attributes"] });
     expect(roster.at(-1)?.find((m) => m.uid === "u-peer")).toMatchObject({
@@ -1507,7 +1508,7 @@ describe("lanyard/client unit tests", () => {
     expect(plainRoster.at(-1)?.find((m) => m.uid === "u-peer")?.attributes).toBeUndefined();
 
     // Non-staff members, staff of another scope, and non-staff global users are rejected up front
-    const peer = makeClient("u-peer");
+    const peer = makeClient("u-peer", "peer@example.com");
     expect(() => peer.subscribeToUsers("ws-a", () => {}, { include: ["attributes"] })).toThrow(
       /Forbidden: include: \["attributes"\] requires staff access in scope 'ws-a'/
     );
@@ -1516,14 +1517,23 @@ describe("lanyard/client unit tests", () => {
       /the global scope/
     );
 
+    // queryMembers follows the same rules: staff (and admins) for attributes-tier keys
+    expect(await staff.queryMembers("ws-a", { attributes: { points: 8 } })).toEqual(["u-peer"]);
+    await expect(peer.queryMembers("ws-a", { attributes: { points: 8 } })).rejects.toThrow(
+      /Forbidden: queryMembers on attributes-tier keys requires staff access in scope 'ws-a'/
+    );
+    await expect(staff.queryMembers("ws-b", { attributes: { points: 8 } })).rejects.toThrow(/scope 'ws-b'/);
+    await expect(staff.queryMembers("ws-a", { attributes: {} })).rejects.toThrow(/at least one attribute/);
+
     // System admins may include anywhere
-    const admin = makeClient("u-admin", true);
+    const admin = makeClient("u-admin", "admin@example.com", true);
     const directory: any[][] = [];
     admin.subscribeToUsers(GLOBAL_SCOPE, (u) => directory.push(u), { include: ["attributes"] })();
     expect(directory.at(-1)?.find((u) => u.uid === "u-peer")).toMatchObject({
       email: "peer@example.com",
       attributes: { points: 70 }
     });
+    expect(await admin.queryMembers(GLOBAL_SCOPE, { attributes: { points: 70 } })).toEqual(["u-peer"]);
 
     [staff, peer, admin].forEach((c) => c.destroy());
   });
