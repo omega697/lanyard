@@ -104,9 +104,17 @@ Define your application's `TRole` and `TCapability` types once in a shared modul
 import { createPermissionPolicy, resolveAvatar, type ScopedMember } from "lanyard/core";
 
 export type WorkspaceRole = "base_staff" | "owner" | "manager" | "billing_manager" | "member";
-export type WorkspaceCapability = "edit_content" | "invite_members" | "assign_roles" | "billing";
+export const WORKSPACE_CAPABILITIES = [
+  "edit_content",
+  "invite_members",
+  "assign_roles",
+  "billing",
+  "delete_workspace"
+] as const;
+export type WorkspaceCapability = (typeof WORKSPACE_CAPABILITIES)[number];
 
 export const workspacePolicy = createPermissionPolicy<WorkspaceRole, WorkspaceCapability>({
+  capabilities: WORKSPACE_CAPABILITIES, // Required when any role uses capabilities: "*" (closed capability set)
   roles: {
     base_staff: {
       abstract: true, // Abstract role: groups capabilities & presence, never directly assigned or shown in UI
@@ -115,7 +123,7 @@ export const workspacePolicy = createPermissionPolicy<WorkspaceRole, WorkspaceCa
     },
     owner: {
       inherits: ["manager", "billing_manager"],
-      capabilities: "*", // Owners automatically hold all capabilities
+      capabilities: "*", // Owners automatically hold all declared WORKSPACE_CAPABILITIES
       trackPresence: true
     },
     manager: {
@@ -689,9 +697,11 @@ it("keeps the Lanyard rules in firestore.rules in sync with the policy", () => {
 
 The generated block contains:
 
-- Helper functions (`isOwner`, `isAdmin`, `isScopeMember`, `hasScopeRole`, `hasUserRole`, `isTierDoc`,
-  `isOwnVerifiedEmailWrite`). Role checks use `get()` without a preceding `exists()` so Firestore caches the single
-  document read across a query.
+- Helper functions (`isOwner`, `isAdmin`, `isScopeMember`, `hasScopeCapability`, `hasUserCapability`, `hasScopeRole`,
+  `hasUserRole`, `hasAnyScopeRole`, `hasAnyUserRole`, `isTierDoc`, `isOwnVerifiedEmailWrite`) that your own collection
+  rules below `// </lanyard-rules>` can call directly (e.g. `allow delete: if hasScopeCapability(workspaceId, 'delete_workspace');`
+  or `allow update: if hasScopeRole(workspaceId, 'base_staff');`). Role checks use `get()` without a preceding `exists()`
+  so Firestore caches the single document read across a query.
 - **Cards** (`users/{uid}`, `{scope}/{scopeId}/members/{uid}`): readable per `userCapabilities.read` (global) and
   `cardVisibility` (scoped). Owners may update only their own profile fields (`firstName`, `lastName`,
   `displayName`, `photoUrl`, `lastSeen`, plus `email` when `cardFields.email` is set); roles, attributes, and
@@ -703,10 +713,11 @@ The generated block contains:
   (`include: ["attributes"]`, `queryMembers`).
 
 > [!IMPORTANT]
-> Firestore rules can't evaluate role inheritance or capabilities, so the generator expands each capability-based
-> audience into the roles that hold it (e.g. `staffCapability: "manage_members"` becomes
-> `hasScopeRole(scopeId, ['lead', 'owner'])`). **Regenerate the rules whenever roles or capabilities change**;
-> `assertFirestoreRulesUpToDate` (or `lanyard-rules --check`) fails until you do.
+> `generateFirestoreRules` compiles your policy's role inheritance graph (`rolesForRole`, including `abstract` roles)
+> and closed capability set (`rolesForCapability`) into static O(1) lookup maps inside `firestore.rules`. Strict map
+> indexing means any misspelled role or capability name in `firestore.rules` fails closed immediately. **Regenerate
+> the rules whenever roles or capabilities change**; `assertFirestoreRulesUpToDate` (or `lanyard-rules --check`) fails
+> until you do.
 
 Lanyard's own emulator tests run against generated rules, covering every tier, custom documents, the
 collection-group queries, and the `cardVisibility` modes.

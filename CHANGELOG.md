@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.2.1
+
+### Breaking changes
+
+- **Closed-world `capabilities` when using `"*"`.** Policies where any role sets `capabilities: "*"` must pass
+  `capabilities: [...]` in `PermissionPolicyConfig` so `"*"` expands to a known closed capability set at runtime, in
+  `client.getCapabilities()`, and in generated Firestore rules (undeclared capability strings return `false` and fail
+  closed in `firestore.rules`). When `"*"` is unused, `policy.capabilities` is automatically inferred from referenced
+  capabilities unless explicitly provided.
+
+### New
+
+- **Firestore Security Rules capability & role-inheritance helpers (`lanyard/rules`).** `generateFirestoreRules` now
+  emits `hasScopeCapability(scopeId, capability)`, `hasUserCapability(capability)`, `hasScopeRole(scopeId, role)`, and
+  `hasUserRole(role)` (backed by `rolesForCapability` and `rolesForRole`, including `abstract: true` roles) so your
+  application's own collection rules can evaluate capabilities and inherited roles directly and fail closed on unknown
+  names—even for system admins.
+
+### Fixed
+
+- `client.getCapabilities(scopeId)` now returns the full closed capability set for system admins and roles granted
+  `capabilities: "*"`, instead of omitting capabilities held exclusively via `"*"`.
+
 ## 0.2.0
 
 Lanyard 0.2.0 stores each user's data in **storage tiers**: one Firestore document per read audience, so security

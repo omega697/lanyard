@@ -914,22 +914,14 @@ export function createLanyardClient<
     const subject = resolveTargetSubject(scopeId);
     const result = new Set<TCapability>();
     if (policy) {
-      const addAllPolicyCaps = () => {
-        for (const caps of Object.values(policy.roleCapabilities) as Array<readonly TCapability[] | "*" | undefined>) {
-          if (Array.isArray(caps)) {
-            for (const c of caps) result.add(c);
-          }
-        }
-      };
       if (isAdmin) {
-        addAllPolicyCaps();
-      } else if (Array.isArray(subject?.roles)) {
+        return [...policy.capabilities];
+      }
+      if (Array.isArray(subject?.roles)) {
         for (const role of subject.roles) {
           if (typeof role === "string" && Object.hasOwn(policy.roleCapabilities, role)) {
             const roleCaps = policy.roleCapabilities[role];
-            if (roleCaps === "*") {
-              addAllPolicyCaps();
-            } else if (Array.isArray(roleCaps)) {
+            if (Array.isArray(roleCaps)) {
               for (const c of roleCaps) result.add(c);
             }
           }

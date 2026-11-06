@@ -26,12 +26,20 @@ function roleList(roles: readonly string[]): string {
   return `[${roles.map(quote).join(", ")}]`;
 }
 
+function rulesMapLiteral(entries: readonly [string, readonly string[]][], indent: string): string {
+  if (entries.length === 0) return "{}";
+  const body = entries.map(([key, values]) => `${indent}  ${quote(key)}: ${roleList(values)}`).join(",\n");
+  return `{\n${body}\n${indent}}`;
+}
+
 /**
  * Generates the Firestore security rules for everything Lanyard stores, from the app's `PermissionPolicy`.
  *
- * Firestore rules can't evaluate the policy's role inheritance or capabilities, so every capability-based audience
- * (`staffCapability`, `userCapabilities.read`, `cardVisibility: { capability }`, custom-doc capabilities) is
- * expanded into the list of roles that hold it. Regenerate the rules whenever roles or capabilities change.
+ * Emits closed-world lookup maps (`rolesForRole` and `rolesForCapability`) and first-class helpers
+ * (`hasScopeRole`, `hasUserRole`, `hasScopeCapability`, `hasUserCapability`) so both Lanyard's generated rules
+ * and your app's own collection rules evaluate transitive role inheritance (including `abstract` roles) and
+ * capabilities directly, while failing closed on any misspelled role or capability name.
+ * Regenerate the rules whenever roles or capabilities change.
  *
  * The result is a block of functions and `match` statements to place inside
  * `match /databases/{database}/documents { … }`. Cards and the built-in tiers are written by trusted server code
@@ -46,19 +54,38 @@ export function generateFirestoreRules<TRole extends string, TCapability extends
   const scopeCollection = assertCollectionName(options.scopeCollection ?? "workspaces", "scopeCollection");
   const membersSubcollection = assertCollectionName(options.membersSubcollection ?? "members", "membersSubcollection");
 
-  const allRoles = Object.keys(policy.roles) as TRole[];
-  const rolesWhere = (predicate: (subject: { roles: TRole[] }) => boolean): string[] =>
-    allRoles.filter((role) => predicate({ roles: [role] })).sort();
-  const rolesWithCapability = (capability: TCapability) => rolesWhere((s) => policy.hasCapability(s, capability));
-  const staffRoles = rolesWhere((s) => policy.isStaff(s));
-  const userReadRoles = rolesWhere((s) => policy.canReadUser(s));
+  const allRoles = (Object.keys(policy.roles) as TRole[]).sort();
+  const concreteRoles = [...policy.assignableRoles].sort();
+  const concreteRolesWhere = (predicate: (subject: { roles: TRole[] }) => boolean): string[] =>
+    concreteRoles.filter((role) => predicate({ roles: [role] }));
+
+  const roleMapEntries: [string, readonly string[]][] = allRoles.map((role) => [
+    role,
+    concreteRolesWhere((s) => policy.hasRole(s, role))
+  ]);
+  const allCapabilities = [...policy.capabilities].sort();
+  const capabilityMapEntries: [string, readonly string[]][] = allCapabilities.map((capability) => [
+    capability,
+    concreteRolesWhere((s) => policy.hasCapability(s, capability))
+  ]);
+
+  const capabilityCheck = (capability: TCapability | undefined, scoped: boolean, scopeExpr = "scopeId"): string => {
+    if (!capability) return "isAdmin()";
+    return scoped
+      ? `hasScopeCapability(${scopeExpr}, ${quote(capability)})`
+      : `hasUserCapability(${quote(capability)})`;
+  };
+
+  const userReadExpr = capabilityCheck(policy.userCapabilities.read, false);
+  const globalStaffExpr = capabilityCheck(policy.staffCapability, false);
+  const scopedStaffExpr = (scopeExpr = "scopeId") => capabilityCheck(policy.staffCapability, true, scopeExpr);
 
   const scopedCardRead =
     policy.cardVisibility === "members"
       ? "isScopeMember(scopeId)"
       : policy.cardVisibility === "staff"
-        ? `hasScopeRole(scopeId, ${roleList(staffRoles)})`
-        : `hasScopeRole(scopeId, ${roleList(rolesWithCapability(policy.cardVisibility.capability))})`;
+        ? scopedStaffExpr()
+        : capabilityCheck(policy.cardVisibility.capability, true);
 
   const emailOnCard = policy.cardFields.email;
   const userCreateKeys = [
@@ -83,15 +110,13 @@ export function generateFirestoreRules<TRole extends string, TCapability extends
     "updatedAt"
   ];
 
-  /** Rule expression for a custom doc audience; `scoped` selects member vs global role checks. */
+  /** Rule expression for a custom doc audience; `scoped` selects member vs global capability checks. */
   const customAudience = (rule: Readonly<CustomDocAccessRule<TCapability>>, scoped: boolean, write: boolean) => {
     const ownerCheck = scoped ? "isOwner(memberUid)" : "isOwner(uid)";
-    const roleCheck = (roles: string[]) =>
-      scoped ? `hasScopeRole(scopeId, ${roleList(roles)})` : `hasUserRole(${roleList(roles)})`;
     const terms = ["isAdmin()"];
     if (rule.self) terms.push(scoped && write ? `(${ownerCheck} && isScopeMember(scopeId))` : ownerCheck);
-    if (rule.staff) terms.push(roleCheck(staffRoles));
-    if (rule.capability) terms.push(roleCheck(rolesWithCapability(rule.capability)));
+    if (rule.staff && policy.staffCapability) terms.push(capabilityCheck(policy.staffCapability, scoped));
+    if (rule.capability) terms.push(capabilityCheck(rule.capability, scoped));
     return terms.join(" || ");
   };
   const customDocBlocks = (scoped: boolean) =>
@@ -109,6 +134,8 @@ export function generateFirestoreRules<TRole extends string, TCapability extends
 
   const membersPath = `/databases/$(database)/documents/${scopeCollection}/$(scopeId)/${membersSubcollection}/$(request.auth.uid)`;
   const userPath = `/databases/$(database)/documents/${usersCollection}/$(request.auth.uid)`;
+  const roleMapExpr = rulesMapLiteral(roleMapEntries, "      ");
+  const capabilityMapExpr = rulesMapLiteral(capabilityMapEntries, "      ");
 
   return `    // Generated by lanyard generateFirestoreRules(); do not edit by hand. Regenerate when the policy changes.
     function isSignedIn() {
@@ -131,7 +158,15 @@ export function generateFirestoreRules<TRole extends string, TCapability extends
       return isAdmin() || (isSignedIn() && exists(memberPath(scopeId)));
     }
 
-    function hasScopeRole(scopeId, roles) {
+    function rolesForRole(role) {
+      return ${roleMapExpr}[role];
+    }
+
+    function rolesForCapability(capability) {
+      return ${capabilityMapExpr}[capability];
+    }
+
+    function hasAnyScopeRole(scopeId, roles) {
       return isAdmin() || (
         isSignedIn() &&
         get(memberPath(scopeId)).data != null &&
@@ -139,12 +174,28 @@ export function generateFirestoreRules<TRole extends string, TCapability extends
       );
     }
 
-    function hasUserRole(roles) {
+    function hasAnyUserRole(roles) {
       return isAdmin() || (
         isSignedIn() &&
         get(${userPath}).data != null &&
         get(${userPath}).data.get('roles', []).hasAny(roles)
       );
+    }
+
+    function hasScopeRole(scopeId, role) {
+      return rolesForRole(role) is list && hasAnyScopeRole(scopeId, rolesForRole(role));
+    }
+
+    function hasUserRole(role) {
+      return rolesForRole(role) is list && hasAnyUserRole(rolesForRole(role));
+    }
+
+    function hasScopeCapability(scopeId, capability) {
+      return rolesForCapability(capability) is list && hasAnyScopeRole(scopeId, rolesForCapability(capability));
+    }
+
+    function hasUserCapability(capability) {
+      return rolesForCapability(capability) is list && hasAnyUserRole(rolesForCapability(capability));
     }
 
     // Lanyard stamps every private tier document with _lanyard: { tier, uid, scopeId (null when global), updatedAt }
@@ -165,7 +216,7 @@ export function generateFirestoreRules<TRole extends string, TCapability extends
     }
 
     match /${usersCollection}/{uid} {
-      allow read: if isOwner(uid) || hasUserRole(${roleList(userReadRoles)});
+      allow read: if isOwner(uid) || ${userReadExpr};
       allow create: if isAdmin() || (
         isOwner(uid) &&
         request.resource.data.keys().hasOnly(${roleList(userCreateKeys)}) &&
@@ -186,13 +237,13 @@ export function generateFirestoreRules<TRole extends string, TCapability extends
 
       // Self + staff attributes tier (server-written, except owners syncing their verified email)
       match /private/attributes {
-        allow read: if isOwner(uid) || hasUserRole(${roleList(staffRoles)});
+        allow read: if isOwner(uid) || ${globalStaffExpr};
         allow write: if isOwner(uid) && isOwnVerifiedEmailWrite(uid, null);
       }
 
       // Staff-only hidden attributes tier (server-written)
       match /private/hiddenAttributes {
-        allow read: if hasUserRole(${roleList(staffRoles)});
+        allow read: if ${globalStaffExpr};
         allow write: if false;
       }
 
@@ -220,13 +271,13 @@ ${customDocBlocks(false).join("\n")}
 
       // Self + staff attributes tier (server-written, except members syncing their verified email)
       match /private/attributes {
-        allow read: if isOwner(memberUid) || hasScopeRole(scopeId, ${roleList(staffRoles)});
+        allow read: if isOwner(memberUid) || ${scopedStaffExpr()};
         allow write: if isOwner(memberUid) && isScopeMember(scopeId) && isOwnVerifiedEmailWrite(memberUid, scopeId);
       }
 
       // Staff-only hidden attributes tier (server-written)
       match /private/hiddenAttributes {
-        allow read: if hasScopeRole(scopeId, ${roleList(staffRoles)});
+        allow read: if ${scopedStaffExpr()};
         allow write: if false;
       }
 
@@ -247,8 +298,8 @@ ${customDocBlocks(true).join("\n")}
     match /{path=**}/private/{tierDoc} {
       allow list: if resource.data._lanyard.tier == 'attributes' && (
         resource.data._lanyard.scopeId == null
-          ? hasUserRole(${roleList(staffRoles)})
-          : hasScopeRole(resource.data._lanyard.scopeId, ${roleList(staffRoles)}));
+          ? ${globalStaffExpr}
+          : ${scopedStaffExpr("resource.data._lanyard.scopeId")});
     }
 `;
 }

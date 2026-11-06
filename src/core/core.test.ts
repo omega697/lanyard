@@ -23,6 +23,7 @@ type TestRole = "owner" | "manager" | "member";
 type TestCapability = "edit_content" | "invite_members" | "billing";
 
 const TEST_POLICY = createPermissionPolicy<TestRole, TestCapability>({
+  capabilities: ["edit_content", "invite_members", "billing"],
   roles: {
     owner: {
       inherits: ["manager"],
@@ -133,10 +134,13 @@ describe("lanyard/core unit tests", () => {
         roles: ["member", "manager"]
       };
 
-      // Owner has "*" -> implies all capabilities including "billing"
+      // Owner has "*" -> implies all declared capabilities in policy.capabilities including "billing",
+      // while undeclared/typo capability strings fail closed
+      expect(TEST_POLICY.capabilities).toEqual(["edit_content", "invite_members", "billing"]);
       expect(TEST_POLICY.hasCapability(owner, "edit_content")).toBe(true);
       expect(TEST_POLICY.hasCapability(owner, "invite_members")).toBe(true);
       expect(TEST_POLICY.hasCapability(owner, "billing")).toBe(true);
+      expect(TEST_POLICY.hasCapability(owner, "undeclared_typo" as TestCapability)).toBe(false);
 
       // Manager has ["edit_content", "invite_members"] implied by role, but NOT "billing"
       expect(TEST_POLICY.hasCapability(manager, "edit_content")).toBe(true);
@@ -884,6 +888,7 @@ describe("lanyard/core unit tests", () => {
 
       // 2. Explicit defaultRoles vs unrecognized defaultRoles fallback + omitted capabilities
       const customDefaultPolicy = createPermissionPolicy<"lead" | "viewer", "read">({
+        capabilities: ["read"],
         roles: {
           lead: { inherits: ["viewer"], capabilities: "*" },
           viewer: {}
@@ -974,6 +979,15 @@ describe("lanyard/core unit tests", () => {
         | "manage:notes";
 
       const dagPolicy = createPermissionPolicy<EventRole, EventCap>({
+        capabilities: [
+          "view:events",
+          "staff:radio",
+          "manage:points",
+          "manage:merch",
+          "manage:badges",
+          "view:notes",
+          "manage:notes"
+        ],
         roles: {
           // Abstract role at the very top of the map: must NOT be picked as defaultRole or listed in assignableRoles!
           staff_base: {
@@ -1330,6 +1344,7 @@ describe("lanyard/core unit tests", () => {
       type Cap = "manage_members" | "view_roster" | "view_shift_notes" | "edit_shift_notes";
 
       const basePolicyConfig = {
+        capabilities: ["manage_members", "view_roster", "view_shift_notes", "edit_shift_notes"] as const,
         roles: {
           volunteer: { capabilities: [] as Cap[] },
           coordinator: {
@@ -1431,7 +1446,10 @@ describe("lanyard/core unit tests", () => {
       expect(capabilityCards.canReadTier(coordinator, "card", { isScopeMember: true })).toBe(true);
 
       // Without staffCapability, only system admins are staff
-      const noStaff = createPermissionPolicy<Role, Cap>({ roles: basePolicyConfig.roles });
+      const noStaff = createPermissionPolicy<Role, Cap>({
+        capabilities: basePolicyConfig.capabilities,
+        roles: basePolicyConfig.roles
+      });
       expect(noStaff.staffCapability).toBeUndefined();
       expect(noStaff.isStaff(creator)).toBe(false);
       expect(noStaff.canReadTier(creator, "attributes")).toBe(false);
@@ -1480,6 +1498,7 @@ describe("lanyard/core unit tests", () => {
         for (const userRead of [undefined, "view_directory" as const]) {
           for (const mode of visibilityModes) {
             const policy = createPermissionPolicy<Role, Cap>({
+              capabilities: ["manage_members", "view_roster", "view_directory"],
               roles,
               staffCapability,
               cardVisibility: mode.rule,
@@ -1603,6 +1622,7 @@ describe("lanyard/core unit tests", () => {
 
       // Unsafe staffCapability / customDoc capability values are ignored rather than matched
       const unsafe = createPermissionPolicy<"lead", string>({
+        capabilities: [],
         roles: { lead: { capabilities: "*" } },
         staffCapability: "__proto__",
         customDocs: { doc: { read: { capability: "constructor" }, write: {} } }
@@ -1663,12 +1683,52 @@ describe("lanyard/core unit tests", () => {
           /Invalid cardVisibility/
         );
       }
+      // Enforce closed-world capabilities whenever "*" is used or explicit capabilities list is supplied
+      expect(() =>
+        createPermissionPolicy<"owner", "a" | "b">({
+          roles: { owner: { capabilities: "*" } }
+        })
+      ).toThrow(/Role 'owner' uses capabilities: "\*"[\s\S]*capabilities/);
+      expect(() =>
+        createPermissionPolicy<"owner", string>({
+          capabilities: [""],
+          roles: { owner: {} }
+        })
+      ).toThrow(/Invalid capability/);
+      expect(() =>
+        createPermissionPolicy<"owner", string>({
+          capabilities: ["__proto__"],
+          roles: { owner: {} }
+        })
+      ).toThrow(/Invalid capability/);
+      expect(() =>
+        createPermissionPolicy<"owner", "a" | "b">({
+          capabilities: ["a"],
+          roles: { owner: { capabilities: ["b"] } }
+        })
+      ).toThrow(/Capability 'b'[\s\S]*not listed in 'capabilities'/);
+      expect(() =>
+        createPermissionPolicy<"owner", "a" | "b">({
+          capabilities: ["a"],
+          roles: { owner: { capabilities: ["a"] } },
+          staffCapability: "b"
+        })
+      ).toThrow(/Capability 'b'[\s\S]*not listed in 'capabilities'/);
+
+      // Without "*", policy.capabilities automatically collects referenced capabilities in order
+      const inferredCaps = createPermissionPolicy<"mod", "read:x" | "write:x" | "audit:x">({
+        roles: { mod: { capabilities: ["read:x"] } },
+        attributeCapabilities: { score: "write:x" },
+        customDocs: { log: { read: { capability: "audit:x" }, write: {} } }
+      });
+      expect(inferredCaps.capabilities).toEqual(["read:x", "write:x", "audit:x"]);
     });
 
     it("grants custom doc writes to self only for the document's owner, and staff writes only with a staffCapability", () => {
       type Role = "admin" | "member";
       type Cap = "everything";
       const selfWrite = createPermissionPolicy<Role, Cap>({
+        capabilities: ["everything"],
         roles: { admin: { capabilities: "*" }, member: {} },
         customDocs: { notes: { read: {}, write: { self: true } } }
       });
@@ -1679,6 +1739,7 @@ describe("lanyard/core unit tests", () => {
 
       // Without a staffCapability nobody is staff, not even a "*" role; only system admins pass
       const staffWrite = createPermissionPolicy<Role, Cap>({
+        capabilities: ["everything"],
         roles: { admin: { capabilities: "*" }, member: {} },
         customDocs: { notes: { read: {}, write: { staff: true } } }
       });

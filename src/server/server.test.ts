@@ -15,6 +15,7 @@ type TestRole = "owner" | "manager" | "member";
 type TestCap = "edit_content" | "invite_members" | "billing";
 
 const TEST_POLICY = createPermissionPolicy<TestRole, TestCap>({
+  capabilities: ["edit_content", "invite_members", "billing"],
   roles: {
     owner: {
       inherits: ["manager"],
@@ -1098,6 +1099,15 @@ describe("lanyard/server unit tests", () => {
     }
 
     const policy = createPermissionPolicy<AppRole, AppCap>({
+      capabilities: [
+        "write:points",
+        "write:badges",
+        "read:tier",
+        "write:tier",
+        "read:notes",
+        "write:notes",
+        "write:ai_keys"
+      ],
       roles: {
         attendee: { capabilities: [] },
         scanner: { inherits: ["attendee"], capabilities: ["write:points"] },

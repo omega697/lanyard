@@ -2,11 +2,13 @@ import { describe, expect, it } from "vitest";
 import { createPermissionPolicy } from "../core/index.js";
 import { generateFirestoreRules } from "./index.js";
 
+const CAPS = ["view_roster", "manage_members", "view_notes", "everything"] as const;
 type Role = "viewer" | "volunteer" | "lead" | "director";
-type Cap = "view_roster" | "manage_members" | "view_notes" | "everything";
+type Cap = (typeof CAPS)[number];
 
 function makePolicy(overrides: Parameters<typeof createPermissionPolicy<Role, Cap>>[0] = {}) {
   return createPermissionPolicy<Role, Cap>({
+    capabilities: CAPS,
     roles: {
       viewer: { capabilities: ["view_roster"] },
       volunteer: { capabilities: [] },
@@ -30,21 +32,58 @@ function matchBlock(rules: string, path: string): string {
 }
 
 describe("generateFirestoreRules", () => {
-  it("expands capability audiences into role lists, following inheritance and wildcard capabilities", () => {
+  it("emits closed-world role inheritance and capability lookup maps and capability-based tier rules", () => {
     const rules = generateFirestoreRules(makePolicy());
-    // Staff: lead (direct) and director (inherits lead, and "*") — never viewer or volunteer
-    expect(matchBlock(rules, "/private/attributes")).toContain("hasUserRole(['director', 'lead'])");
-    expect(rules).toContain("hasScopeRole(scopeId, ['director', 'lead'])");
-    // Global profile readers: viewer (direct), lead (inherits viewer), director ("*")
+    // Role inheritance map expands every role to the sorted concrete roles that satisfy it
+    expect(rules).toContain("'director': ['director']");
+    expect(rules).toContain("'lead': ['director', 'lead']");
+    expect(rules).toContain("'viewer': ['director', 'lead', 'viewer']");
+    expect(rules).toContain("'volunteer': ['director', 'lead', 'volunteer']");
+    // Capability map includes capabilities granted directly, via inheritance, and via closed-world "*"
+    expect(rules).toContain("'everything': ['director']");
+    expect(rules).toContain("'manage_members': ['director', 'lead']");
+    expect(rules).toContain("'view_notes': ['director', 'lead']");
+    expect(rules).toContain("'view_roster': ['director', 'lead', 'viewer']");
+    // Strict map indexing (`}[role];` / `}[capability];`) rather than `.get(...)` so typos fail closed
+    expect(rules).toContain("}[role];");
+    expect(rules).toContain("}[capability];");
+    expect(rules).toContain("function hasScopeCapability(scopeId, capability)");
+    expect(rules).toContain("function hasUserCapability(capability)");
+
+    // Staff & user read tiers invoke capability helpers directly
+    expect(matchBlock(rules, "/private/attributes")).toContain("hasUserCapability('manage_members')");
+    expect(rules).toContain("hasScopeCapability(scopeId, 'manage_members')");
     expect(matchBlock(rules, "/users/{uid}")).toContain(
-      "allow read: if isOwner(uid) || hasUserRole(['director', 'lead', 'viewer']);"
+      "allow read: if isOwner(uid) || hasUserCapability('view_roster');"
     );
   });
 
-  it("gives no one but admins staff access when the policy has no staffCapability", () => {
-    const rules = generateFirestoreRules(makePolicy({ staffCapability: undefined }));
-    expect(rules).toContain("hasScopeRole(scopeId, [])");
-    expect(rules).not.toContain("['director', 'lead']");
+  it("gives no one but admins staff or global user read access when those capabilities are unset", () => {
+    const rules = generateFirestoreRules(makePolicy({ staffCapability: undefined, userCapabilities: undefined }));
+    expect(matchBlock(rules, "/users/{uid}")).toContain("allow read: if isOwner(uid) || isAdmin();");
+    expect(matchBlock(rules, "/private/attributes")).toContain("allow read: if isOwner(uid) || isAdmin();");
+    expect(rules).not.toContain("hasScopeCapability(scopeId, '");
+    expect(rules).not.toContain("hasUserCapability('");
+  });
+
+  it("expands abstract roles to their concrete inheritors and handles empty role/capability policies", () => {
+    type AbsRole = "staff_base" | "unused_abstract" | "lead" | "owner";
+    const absPolicy = createPermissionPolicy<AbsRole, "edit">({
+      roles: {
+        staff_base: { abstract: true, capabilities: ["edit"] },
+        unused_abstract: { abstract: true },
+        lead: { inherits: ["staff_base"] },
+        owner: { inherits: ["lead"] }
+      }
+    });
+    const absRules = generateFirestoreRules(absPolicy);
+    expect(absRules).toContain("'staff_base': ['lead', 'owner']");
+    expect(absRules).toContain("'unused_abstract': []");
+    expect(absRules).toContain("'edit': ['lead', 'owner']");
+
+    const emptyRules = generateFirestoreRules(createPermissionPolicy({ roles: {} as any }));
+    expect(emptyRules).toContain("return {}[role];");
+    expect(emptyRules).toContain("return {}[capability];");
   });
 
   it("emits the scoped card read rule for each cardVisibility mode", () => {
@@ -52,10 +91,10 @@ describe("generateFirestoreRules", () => {
       matchBlock(generateFirestoreRules(makePolicy({ cardVisibility })), "/workspaces/{scopeId}/members/{memberUid}");
     expect(memberCard(undefined)).toContain("allow read: if isOwner(memberUid) || isScopeMember(scopeId);");
     expect(memberCard("staff")).toContain(
-      "allow read: if isOwner(memberUid) || hasScopeRole(scopeId, ['director', 'lead']);"
+      "allow read: if isOwner(memberUid) || hasScopeCapability(scopeId, 'manage_members');"
     );
     expect(memberCard({ capability: "view_roster" })).toContain(
-      "allow read: if isOwner(memberUid) || hasScopeRole(scopeId, ['director', 'lead', 'viewer']);"
+      "allow read: if isOwner(memberUid) || hasScopeCapability(scopeId, 'view_roster');"
     );
   });
 
@@ -90,12 +129,12 @@ describe("generateFirestoreRules", () => {
       "/private/shiftNotes"
     );
     expect(scopedNotes).toContain(
-      "allow read: if isAdmin() || isOwner(memberUid) || hasScopeRole(scopeId, ['director', 'lead']);"
+      "allow read: if isAdmin() || isOwner(memberUid) || hasScopeCapability(scopeId, 'view_notes');"
     );
-    expect(scopedNotes).toContain("allow write: if (isAdmin() || hasScopeRole(scopeId, ['director', 'lead'])) &&");
+    expect(scopedNotes).toContain("allow write: if (isAdmin() || hasScopeCapability(scopeId, 'manage_members')) &&");
     expect(scopedNotes).toContain("isTierDoc('shiftNotes', memberUid, scopeId);");
     const globalNotes = matchBlock(matchBlock(rules, "/users/{uid}"), "/private/shiftNotes");
-    expect(globalNotes).toContain("allow read: if isAdmin() || isOwner(uid) || hasUserRole(['director', 'lead']);");
+    expect(globalNotes).toContain("allow read: if isAdmin() || isOwner(uid) || hasUserCapability('view_notes');");
     expect(globalNotes).toContain("isTierDoc('shiftNotes', uid, null);");
     const adminOnly = matchBlock(rules, "/private/adminOnly");
     expect(adminOnly).toContain("allow read: if isAdmin();");
@@ -129,13 +168,14 @@ describe("generateFirestoreRules", () => {
     expect(() => generateFirestoreRules(makePolicy(), { usersCollection: "x'y" })).toThrow(/Invalid usersCollection/);
   });
 
-  it("is deterministic and quotes role names safely", () => {
-    const quirky = createPermissionPolicy<"it's" | "plain", "staff">({
-      roles: { "it's": { capabilities: ["staff"] }, plain: {} },
-      staffCapability: "staff"
+  it("is deterministic and quotes role and capability names safely", () => {
+    const quirky = createPermissionPolicy<"it's" | "plain", "st'aff">({
+      roles: { "it's": { capabilities: ["st'aff"] }, plain: {} },
+      staffCapability: "st'aff"
     });
     const rules = generateFirestoreRules(quirky);
-    expect(rules).toContain("hasScopeRole(scopeId, ['it\\'s'])");
+    expect(rules).toContain("'st\\'aff': ['it\\'s']");
+    expect(rules).toContain("hasScopeCapability(scopeId, 'st\\'aff')");
     expect(generateFirestoreRules(quirky)).toBe(rules);
   });
 });

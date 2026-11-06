@@ -71,7 +71,7 @@ describe("Lanyard rules block helpers", () => {
       staffCapability: "manage_members"
     });
     expect(() => assertFirestoreRulesUpToDate(current, widened)).toThrow(
-      /out of date with the policy \(first difference at line \d+[\s\S]*expected: .*'director', 'lead'/
+      /out of date with the policy \(first difference at line \d+[\s\S]*expected: .*'director'/
     );
     // So do different collection names
     expect(() => assertFirestoreRulesUpToDate(current, policy, { scopeCollection: "campaigns" })).toThrow(

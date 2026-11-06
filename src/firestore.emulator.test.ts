@@ -24,6 +24,7 @@ import {
 import {
   collectionGroup as clientCollectionGroup,
   connectFirestoreEmulator,
+  deleteDoc as clientDeleteDoc,
   doc as clientDoc,
   getDoc as clientGetDoc,
   getDocs as clientGetDocs,
@@ -855,6 +856,7 @@ describe.skipIf(!emulatorsAvailable)(
       type Cap = "edit:content" | "manage:billing" | "read:notes" | "write:notes" | "manage:secrets";
 
       const policy = createPermissionPolicy<Role, Cap>({
+        capabilities: ["edit:content", "manage:billing", "read:notes", "write:notes", "manage:secrets"],
         roles: {
           member: { capabilities: [] },
           manager: { inherits: ["member"], capabilities: ["edit:content", "read:notes"] },
@@ -1672,7 +1674,39 @@ ${block}
         );
         expect(globalHiddenSnap.data()).toMatchObject({ secretNote: "Top secret global note" });
 
-        // Generated rules for cardVisibility: "staff": only staff (and the member themselves) can read member cards
+        // Generated rules for cardVisibility: "staff", plus app-level rules calling hasScopeCapability,
+        // hasScopeRole (including abstract/inherited roles), hasUserCapability, hasUserRole, and fail-closed typo checks
+        const appCapabilities = ["invite_members", "delete_workspace"] as const;
+        type AppRuleRole = "staff_base" | "member" | "manager" | "owner";
+        type AppRuleCap = (typeof appCapabilities)[number];
+        const appPolicy = createPermissionPolicy<AppRuleRole, AppRuleCap>({
+          capabilities: appCapabilities,
+          roles: {
+            staff_base: { abstract: true, capabilities: ["invite_members"] },
+            member: { capabilities: [] },
+            manager: { inherits: ["member", "staff_base"], capabilities: [] },
+            owner: { inherits: ["manager"], capabilities: "*" }
+          },
+          staffCapability: "invite_members",
+          cardVisibility: "staff"
+        });
+        const appRulesBlock = `${generateFirestoreRules(appPolicy)}
+    match /workspaces/{scopeId} {
+      allow get: if isScopeMember(scopeId);
+      allow update: if hasScopeRole(scopeId, 'staff_base');
+      allow delete: if hasScopeCapability(scopeId, 'delete_workspace');
+
+      match /typoCap/{docId} {
+        allow read: if hasScopeCapability(scopeId, 'delete_workspcae');
+      }
+      match /typoRole/{docId} {
+        allow read: if hasScopeRole(scopeId, 'managre');
+      }
+    }
+    match /globalReports/{docId} {
+      allow read: if hasUserCapability('invite_members');
+      allow write: if hasUserRole('owner');
+    }`;
         const staffCardsRes = await fetch(
           `http://127.0.0.1:${emulatorPort}/emulator/v1/projects/${projectId}:securityRules`,
           {
@@ -1683,19 +1717,7 @@ ${block}
                 files: [
                   {
                     name: "firestore.rules",
-                    content: wrapRules(
-                      generateFirestoreRules(
-                        createPermissionPolicy<"member" | "manager" | "owner", "invite_members">({
-                          roles: {
-                            member: { capabilities: [] },
-                            manager: { inherits: ["member"], capabilities: ["invite_members"] },
-                            owner: { inherits: ["manager"], capabilities: [] }
-                          },
-                          staffCapability: "invite_members",
-                          cardVisibility: "staff"
-                        })
-                      )
-                    )
+                    content: wrapRules(appRulesBlock)
                   }
                 ]
               }
@@ -1712,6 +1734,42 @@ ${block}
         expect(
           (await clientGetDoc(clientDoc(mgrClient.db, "workspaces", "org-A", "members", "u-member"))).exists()
         ).toBe(true);
+
+        // App-level rules evaluate inherited abstract roles (`hasScopeRole(scopeId, 'staff_base')`) and
+        // closed-world "*" capabilities (`hasScopeCapability(scopeId, 'delete_workspace')`)
+        await adminDb.doc("workspaces/org-A").set({ name: "Org A" });
+        await adminDb.doc("globalReports/r1").set({ title: "Q4" });
+        await expect(
+          clientUpdateDoc(clientDoc(memberClient.db, "workspaces", "org-A"), { name: "Member Edit" })
+        ).rejects.toMatchObject({ code: "permission-denied" });
+        await clientUpdateDoc(clientDoc(mgrClient.db, "workspaces", "org-A"), { name: "Mgr Edit via staff_base" });
+        // Manager lacks 'delete_workspace'; promoting to 'owner' grants it via closed-world "*"
+        await expect(clientDeleteDoc(clientDoc(mgrClient.db, "workspaces", "org-A"))).rejects.toMatchObject({
+          code: "permission-denied"
+        });
+        await adminDb.doc("workspaces/org-A/members/u-mgr").set({ roles: ["owner"] }, { merge: true });
+        await clientDeleteDoc(clientDoc(mgrClient.db, "workspaces", "org-A"));
+        await adminDb.doc("workspaces/org-A/members/u-mgr").set({ roles: ["manager"] }, { merge: true });
+        await expect(
+          clientGetDoc(clientDoc(mgrClient.db, "workspaces", "org-A", "typoCap", "d1"))
+        ).rejects.toMatchObject({ code: "permission-denied" });
+        // Misspelled capability or role in firestore.rules fails closed EVEN for a system admin!
+        await expect(
+          clientGetDoc(clientDoc(sysAdminClient.db, "workspaces", "org-A", "typoCap", "d1"))
+        ).rejects.toMatchObject({ code: "permission-denied" });
+        await expect(
+          clientGetDoc(clientDoc(sysAdminClient.db, "workspaces", "org-A", "typoRole", "d1"))
+        ).rejects.toMatchObject({ code: "permission-denied" });
+        // Global `u-mgr` holds `manager` -> inherits `staff_base` -> has `invite_members` (`hasUserCapability`),
+        // but does NOT hold `owner` (`hasUserRole('owner')`)
+        expect((await clientGetDoc(clientDoc(mgrClient.db, "globalReports", "r1"))).exists()).toBe(true);
+        await expect(clientGetDoc(clientDoc(memberClient.db, "globalReports", "r1"))).rejects.toMatchObject({
+          code: "permission-denied"
+        });
+        await expect(
+          clientUpdateDoc(clientDoc(mgrClient.db, "globalReports", "r1"), { title: "Denied" })
+        ).rejects.toMatchObject({ code: "permission-denied" });
+        await clientUpdateDoc(clientDoc(sysAdminClient.db, "globalReports", "r1"), { title: "Admin Updated" });
       } finally {
         await terminate(memberClient.db);
         await deleteClientApp(memberClient.app);

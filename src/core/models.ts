@@ -210,6 +210,13 @@ export interface SecretCipher {
  */
 export interface PermissionPolicyConfig<TRole extends string = string, TCapability extends string = string> {
   /**
+   * Closed list of every capability in `TCapability` (e.g. `export const CAPS = [...] as const`).
+   * Required whenever any role specifies `capabilities: "*"` so `"*"` expands to a known closed set at runtime
+   * and in generated security rules. When omitted (and no role uses `"*"`), `policy.capabilities` is inferred
+   * from the capabilities referenced across `roles` and tier rules.
+   */
+  capabilities?: readonly TCapability[];
+  /**
    * Optional map of every role in `TRole` to its `RoleDefinition` (inherited roles, implied capabilities, and presence tracking).
    * Omit or pass `{}` for applications where users do not hold roles and only `isSystemAdmin` grants elevated privileges.
    */
@@ -278,11 +285,18 @@ export interface PolicySubject<TRole extends string = string, _TCapability exten
  * presence tracking, user record access, and field-level `attributes` / `secrets` access control.
  */
 export interface PermissionPolicy<TRole extends string = string, TCapability extends string = string> {
+  readonly capabilities: readonly TCapability[];
   readonly roles: Readonly<Record<TRole, Readonly<RoleDefinition<TRole, TCapability>>>>;
-  readonly roleCapabilities: Readonly<Partial<Record<TRole, readonly TCapability[] | "*">>>;
+  readonly roleCapabilities: Readonly<Partial<Record<TRole, readonly TCapability[]>>>;
   readonly roleInherits: Readonly<Record<TRole, readonly TRole[]>>;
   readonly assignableRoles: readonly TRole[];
   readonly defaultRoles: readonly TRole[];
+  /** Normalized global user record access capabilities. */
+  readonly userCapabilities: Readonly<{
+    read?: TCapability;
+    write?: TCapability;
+    assignRoles?: TCapability;
+  }>;
   /** Capability identifying scope staff (`undefined` means only system admins are staff). */
   readonly staffCapability: TCapability | undefined;
   /** Normalized scoped card visibility rule (defaults to `"members"`). */

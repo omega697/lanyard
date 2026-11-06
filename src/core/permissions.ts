@@ -15,7 +15,7 @@ const FORBIDDEN_PROTOTYPE_KEYS = new Set(["__proto__", "constructor", "prototype
 /** Built-in storage tier names; app-defined `customDocs` may not reuse them. */
 const RESERVED_TIER_NAMES = new Set<string>(["card", "preferences", "attributes", "hiddenAttributes", "secrets"]);
 
-function isSafeKey(key: unknown): key is string {
+function isSafeKey<T extends string = string>(key: unknown): key is T {
   return typeof key === "string" && key.trim().length > 0 && !FORBIDDEN_PROTOTYPE_KEYS.has(key);
 }
 
@@ -94,14 +94,57 @@ export function createPermissionPolicy<TRole extends string = string, TCapabilit
     if (!def || typeof def !== "object") {
       throw new Error(`Invalid definition for role '${role}'.`);
     }
+    if (def.capabilities === "*" && !Array.isArray(config.capabilities)) {
+      throw new Error(
+        `Role '${role}' uses capabilities: "*" — provide 'capabilities: [...]' in PermissionPolicyConfig ` +
+          `so the closed capability set is known at runtime and in generated security rules.`
+      );
+    }
     rawRoles[role] = def;
+  }
+
+  let explicitCapabilities: TCapability[] | undefined;
+  let explicitCapabilitySet: Set<TCapability> | undefined;
+  if (config.capabilities !== undefined) {
+    if (!Array.isArray(config.capabilities)) {
+      throw new Error("Invalid capabilities: expected an array of capability names.");
+    }
+    explicitCapabilitySet = new Set<TCapability>();
+    for (const cap of config.capabilities) {
+      if (!isSafeKey<TCapability>(cap)) {
+        throw new Error(`Invalid capability '${String(cap)}' in capabilities.`);
+      }
+      explicitCapabilitySet.add(cap);
+    }
+    explicitCapabilities = Array.from(explicitCapabilitySet);
+  }
+
+  const referencedCapabilitySet = new Set<TCapability>();
+  const registerReferencedCapability = (cap: TCapability | undefined): void => {
+    if (!cap || !isSafeKey<TCapability>(cap)) return;
+    if (explicitCapabilitySet && !explicitCapabilitySet.has(cap)) {
+      throw new Error(`Capability '${cap}' referenced in policy is not listed in 'capabilities'.`);
+    }
+    referencedCapabilitySet.add(cap);
+  };
+
+  for (const [, def] of entries) {
+    if (Array.isArray(def.capabilities)) {
+      for (const cap of def.capabilities) {
+        if (!isSafeKey<TCapability>(cap)) {
+          throw new Error(`Invalid capability '${String(cap)}' in role capabilities.`);
+        }
+        registerReferencedCapability(cap);
+      }
+    }
   }
 
   // Validate explicit `inherits` references and compute transitive closure with cycle detection (DFS)
   const roleInherits = Object.create(null) as Record<TRole, readonly TRole[]>;
-  const resolvedCapabilities = Object.create(null) as Partial<Record<TRole, readonly TCapability[] | "*">>;
+  const resolvedCapabilities = Object.create(null) as Partial<Record<TRole, readonly TCapability[]>>;
   const resolvedTrackPresence = Object.create(null) as Record<TRole, boolean>;
   const visitState = new Map<TRole, "visiting" | "visited">();
+  const wildcardRoles = new Set<TRole>();
 
   function resolveRoleGraph(role: TRole, chain: TRole[]): void {
     const state = visitState.get(role);
@@ -136,10 +179,11 @@ export function createPermissionPolicy<TRole extends string = string, TCapabilit
     let hasWildcard = def.capabilities === "*";
     const capSet = new Set<TCapability>(Array.isArray(def.capabilities) ? def.capabilities : []);
     for (const ancestor of ancestors) {
-      const ancCaps = resolvedCapabilities[ancestor];
-      if (ancCaps === "*") {
+      if (wildcardRoles.has(ancestor)) {
         hasWildcard = true;
-      } else if (Array.isArray(ancCaps)) {
+      }
+      const ancCaps = resolvedCapabilities[ancestor];
+      if (Array.isArray(ancCaps)) {
         for (const c of ancCaps) {
           capSet.add(c);
         }
@@ -147,7 +191,8 @@ export function createPermissionPolicy<TRole extends string = string, TCapabilit
     }
 
     if (hasWildcard) {
-      resolvedCapabilities[role] = "*";
+      wildcardRoles.add(role);
+      resolvedCapabilities[role] = Object.freeze([...(explicitCapabilities ?? [])]);
     } else if (def.capabilities !== undefined || capSet.size > 0) {
       resolvedCapabilities[role] = Object.freeze(Array.from(capSet));
     }
@@ -293,6 +338,31 @@ export function createPermissionPolicy<TRole extends string = string, TCapabilit
   }
   Object.freeze(customDocs);
 
+  registerReferencedCapability(userRule.read);
+  registerReferencedCapability(userRule.write);
+  registerReferencedCapability(userRule.assignRoles);
+  registerReferencedCapability(staffCapability);
+  if (typeof cardVisibility === "object") {
+    registerReferencedCapability(cardVisibility.capability);
+  }
+  for (const key of Object.keys(attrRules)) {
+    registerReferencedCapability(attrRules[key].write);
+  }
+  for (const key of Object.keys(hiddenAttrRules)) {
+    registerReferencedCapability(hiddenAttrRules[key].write);
+  }
+  for (const key of Object.keys(secretRules)) {
+    registerReferencedCapability(secretRules[key].write);
+  }
+  for (const name of Object.keys(customDocs)) {
+    registerReferencedCapability(customDocs[name].read.capability);
+    registerReferencedCapability(customDocs[name].write.capability);
+  }
+
+  const capabilities: readonly TCapability[] = Object.freeze(
+    explicitCapabilities ?? Array.from(referencedCapabilitySet)
+  );
+
   // Default to explicit config.defaultRoles or [rootConcreteRole] (or [] when no roles are defined)
   const rootConcreteRole =
     assignableEntries.length > 0
@@ -360,8 +430,6 @@ export function createPermissionPolicy<TRole extends string = string, TCapabilit
   function roleImpliesCapability(role: TRole, capability: TCapability): boolean {
     if (typeof role !== "string" || !Object.hasOwn(resolvedCapabilities, role)) return false;
     const implied = resolvedCapabilities[role];
-    if (!implied) return false;
-    if (implied === "*") return true;
     return Array.isArray(implied) && implied.includes(capability);
   }
 
@@ -645,11 +713,13 @@ export function createPermissionPolicy<TRole extends string = string, TCapabilit
   }
 
   return Object.freeze({
+    capabilities,
     roles,
     roleCapabilities: resolvedCapabilities,
     roleInherits,
     assignableRoles,
     defaultRoles,
+    userCapabilities: userRule,
     staffCapability,
     cardVisibility,
     cardFields,

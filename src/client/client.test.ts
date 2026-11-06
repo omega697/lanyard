@@ -62,8 +62,9 @@ vi.mock("firebase/firestore", async () => {
   };
 });
 
+const TEST_CAPS = ["edit_content", "invite_members", "delete_workspace"] as const;
 type TestRole = "owner" | "manager" | "member";
-type TestCap = "edit_content" | "invite_members";
+type TestCap = (typeof TEST_CAPS)[number];
 
 interface TestPrefs {
   theme: "light" | "dark" | "system";
@@ -76,6 +77,7 @@ const DEFAULT_PREFS: TestPrefs = {
 };
 
 const TEST_POLICY = createPermissionPolicy<TestRole, TestCap>({
+  capabilities: TEST_CAPS,
   roles: {
     owner: {
       inherits: ["manager"],
@@ -1751,6 +1753,7 @@ describe("lanyard/client unit tests", () => {
 
     type DualRole = "owner" | "manager" | "editor" | "member";
     const dualPolicy = createPermissionPolicy<DualRole, TestCap>({
+      capabilities: TEST_CAPS,
       roles: {
         owner: { inherits: ["manager"], capabilities: "*" },
         manager: { inherits: ["editor"], capabilities: ["invite_members"] },
@@ -1864,6 +1867,8 @@ describe("lanyard/client unit tests", () => {
     expect(client.getRoles("ws-beta")).toEqual(["owner"]);
     expect(client.hasRole("owner", "ws-beta")).toBe(true);
     expect(client.hasCapability("invite_members", "ws-beta")).toBe(true);
+    expect(client.hasCapability("delete_workspace", "ws-beta")).toBe(true);
+    expect(client.getCapabilities("ws-beta").sort()).toEqual(["delete_workspace", "edit_content", "invite_members"]);
     expect(client.getAttributes("ws-beta")).toEqual({ points: 999, tier: "platinum" });
 
     // Unknown or invalid scopeId returns safe defaults
