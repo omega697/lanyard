@@ -533,7 +533,9 @@ export class InMemoryLanyardStore<
   ): Promise<Partial<THiddenAttributes>> {
     assertValidResourceId(uid, "uid");
     const current = this.userHiddenAttributes.get(uid) || {};
-    const updated = { ...current, ...sanitizePatch(patch) };
+    const cleanPatch = sanitizePatch(patch);
+    assertNoReservedTierKeys(cleanPatch, "hiddenAttributes");
+    const updated = { ...current, ...cleanPatch };
     this.userHiddenAttributes.set(uid, updated);
     return { ...updated };
   }
@@ -554,6 +556,7 @@ export class InMemoryLanyardStore<
   ): Promise<Partial<Record<keyof TSecrets & string, boolean>>> {
     assertValidResourceId(uid, "uid");
     const current = this.userSecrets.get(uid) || {};
+    assertNoReservedTierKeys(patch || {}, "secrets");
     const updated = this.encryptSecretMapPatch(current, patch);
     this.userSecrets.set(uid, updated);
     return this.toSecretStatusMap(updated);
@@ -725,7 +728,9 @@ export class InMemoryLanyardStore<
       this.scopeMemberHiddenAttributes.set(scopeId, new Map());
     }
     const current = this.scopeMemberHiddenAttributes.get(scopeId)!.get(uid) || {};
-    const updated = { ...current, ...sanitizePatch(patch) };
+    const cleanPatch = sanitizePatch(patch);
+    assertNoReservedTierKeys(cleanPatch, "hiddenAttributes");
+    const updated = { ...current, ...cleanPatch };
     this.scopeMemberHiddenAttributes.get(scopeId)!.set(uid, updated);
     return { ...updated };
   }
@@ -756,6 +761,7 @@ export class InMemoryLanyardStore<
       this.scopeMemberSecrets.set(scopeId, new Map());
     }
     const current = this.scopeMemberSecrets.get(scopeId)!.get(uid) || {};
+    assertNoReservedTierKeys(patch || {}, "secrets");
     const updated = this.encryptSecretMapPatch(current, patch);
     this.scopeMemberSecrets.get(scopeId)!.set(uid, updated);
     return this.toSecretStatusMap(updated);

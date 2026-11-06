@@ -1639,13 +1639,18 @@ describe("lanyard/server unit tests", () => {
     expect(await fsStore.getUser("u-1")).toMatchObject({ email: "u1@example.com", attributes: { pointsAllTime: 250 } });
     expect(docs.get("users/u-1")?.note).toBeUndefined();
     expect(docs.get("users/u-1")?.geminiKey).toBeUndefined();
-    expect(docs.get("users/u-1/private/hiddenAttributes")).toEqual({ note: "Top secret" });
+    expect(docs.get("users/u-1/private/hiddenAttributes")).toEqual({
+      note: "Top secret",
+      _lanyard: { tier: "hiddenAttributes", uid: "u-1", scopeId: null, updatedAt: expect.any(String) }
+    });
     expect(await fsStore.getUserHiddenAttributes("u-1")).toEqual({ note: "Top secret" });
 
     // Verify raw Firestore `users/u-1/private/secrets` document stores AES-256-GCM `{ ciphertext, iv, tag }`, NEVER plaintext!
     const rawUserSecretsDoc = docs.get("users/u-1/private/secrets");
     expect(isEncryptedSecretData(rawUserSecretsDoc?.geminiKey)).toBe(true);
     expect(JSON.stringify(rawUserSecretsDoc)).not.toContain("AIzaSyLiveKey999");
+    // Secrets docs carry tier metadata, which never shows up as a configured secret
+    expect(rawUserSecretsDoc?._lanyard).toMatchObject({ tier: "secrets", uid: "u-1", scopeId: null });
     expect(statusAfterWrite).toEqual({ geminiKey: true, openaiKey: true });
     expect(await fsStore.getUserSecretsStatus("u-1")).toEqual({ geminiKey: true, openaiKey: true });
     expect(await fsStore.getUserSecrets("u-1")).toEqual({
@@ -1684,7 +1689,22 @@ describe("lanyard/server unit tests", () => {
       _lanyard: { tier: "attributes", uid: "u-1", scopeId: "ws-1", updatedAt: expect.any(String) }
     });
     expect((await fsStore.getScopeMember("ws-1", "u-1"))?.attributes).toEqual({ pointsAllTime: 77 });
-    expect(docs.get("workspaces/ws-1/members/u-1/private/hiddenAttributes")).toEqual({ note: "Workspace note" });
+    expect(docs.get("workspaces/ws-1/members/u-1/private/hiddenAttributes")).toEqual({
+      note: "Workspace note",
+      _lanyard: { tier: "hiddenAttributes", uid: "u-1", scopeId: "ws-1", updatedAt: expect.any(String) }
+    });
+    await expect(fsStore.updateScopeMemberHiddenAttributes("ws-1", "u-1", { _lanyard: {} } as any)).rejects.toThrow(
+      "Invalid hiddenAttributes key '_lanyard'"
+    );
+    await expect(fsStore.updateUserSecrets("u-1", { _lanyard: "x" } as any)).rejects.toThrow(
+      "Invalid secrets key '_lanyard'"
+    );
+    // Legacy docs without metadata still read cleanly, and metadata never leaks into reads
+    docs.set("workspaces/ws-9/members/u-9/private/hiddenAttributes", {
+      note: "legacy",
+      _lanyard: { tier: "hiddenAttributes", uid: "u-9", scopeId: "ws-9" }
+    });
+    expect(await fsStore.getScopeMemberHiddenAttributes("ws-9", "u-9")).toEqual({ note: "legacy" });
     expect(await fsStore.getScopeMemberHiddenAttributes("ws-1", "u-1")).toEqual({ note: "Workspace note" });
     expect(isEncryptedSecretData(docs.get("workspaces/ws-1/members/u-1/private/secrets")?.geminiKey)).toBe(true);
     expect(await fsStore.getScopeMemberSecretsStatus("ws-1", "u-1")).toEqual({ geminiKey: true });

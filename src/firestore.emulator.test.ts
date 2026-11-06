@@ -1662,12 +1662,15 @@ ${block}
         const orgAHiddenSnap = await clientGetDoc(
           clientDoc(mgrClient.db, "workspaces", "org-A", "members", "u-member", "private", "hiddenAttributes")
         );
-        expect(orgAHiddenSnap.data()).toEqual({ secretNote: "Top secret org-A note" });
+        expect(orgAHiddenSnap.data()).toMatchObject({
+          secretNote: "Top secret org-A note",
+          _lanyard: { tier: "hiddenAttributes", uid: "u-member", scopeId: "org-A" }
+        });
 
         const globalHiddenSnap = await clientGetDoc(
           clientDoc(sysAdminClient.db, "users", "u-member", "private", "hiddenAttributes")
         );
-        expect(globalHiddenSnap.data()).toEqual({ secretNote: "Top secret global note" });
+        expect(globalHiddenSnap.data()).toMatchObject({ secretNote: "Top secret global note" });
 
         // Generated rules for cardVisibility: "staff": only staff (and the member themselves) can read member cards
         const staffCardsRes = await fetch(

@@ -300,7 +300,7 @@ export class FirestoreServerStore<
   private parseSecretsStatusFromDocData(data: Record<string, any>): Partial<Record<keyof TSecrets & string, boolean>> {
     const status: Record<string, boolean> = {};
     for (const [k, v] of Object.entries(data)) {
-      if (FORBIDDEN_KEYS.has(k) || k === "updatedAt") continue;
+      if (FORBIDDEN_KEYS.has(k) || k === "updatedAt" || k === TIER_METADATA_KEY) continue;
       status[k] = isEncryptedSecretData(v) || (typeof v === "string" && v.length > 0);
     }
     return status as Partial<Record<keyof TSecrets & string, boolean>>;
@@ -308,7 +308,9 @@ export class FirestoreServerStore<
 
   private decryptSecretsFromDocData(data: Record<string, any>): Partial<Record<keyof TSecrets & string, string>> {
     const out: Record<string, string> = {};
-    const entries = Object.entries(data).filter(([k]) => !FORBIDDEN_KEYS.has(k) && k !== "updatedAt");
+    const entries = Object.entries(data).filter(
+      ([k]) => !FORBIDDEN_KEYS.has(k) && k !== "updatedAt" && k !== TIER_METADATA_KEY
+    );
     if (entries.length === 0) return out as Partial<Record<keyof TSecrets & string, string>>;
     const cipher = this.requireCipher();
     for (const [k, v] of entries) {
@@ -323,12 +325,15 @@ export class FirestoreServerStore<
 
   private async writeEncryptedSecretsToRef(
     ref: FirebaseFirestore.DocumentReference,
+    uid: string,
+    scopeId: string | null,
     patch: Partial<Record<keyof TSecrets & string, string | null>>
   ): Promise<Partial<Record<keyof TSecrets & string, boolean>>> {
     if (!patch || typeof patch !== "object" || Array.isArray(patch)) {
       const snap = await ref.get();
       return snap.exists ? this.parseSecretsStatusFromDocData(snap.data() || {}) : {};
     }
+    assertNoReservedTierKeys(patch, "secrets");
     const cipher = this.requireCipher();
     const firestorePayload: Record<string, any> = {};
     for (const [k, v] of Object.entries(patch)) {
@@ -340,7 +345,7 @@ export class FirestoreServerStore<
       }
     }
     if (Object.keys(firestorePayload).length > 0) {
-      await ref.set(firestorePayload, { merge: true });
+      await ref.set({ ...firestorePayload, ...tierDocMetadata("secrets", uid, scopeId) }, { merge: true });
     }
     const snap = await ref.get();
     return snap.exists ? this.parseSecretsStatusFromDocData(snap.data() || {}) : {};
@@ -442,17 +447,21 @@ export class FirestoreServerStore<
   async getUserHiddenAttributes(uid: string): Promise<Partial<THiddenAttributes>> {
     const snap = await this.userHiddenAttributesDocRef(uid).get();
     if (!snap.exists) return {};
-    return sanitizeObjectPatch<THiddenAttributes>(snap.data() || {});
+    return readTierDocValues<THiddenAttributes>(snap.data());
   }
 
   async updateUserHiddenAttributes(
     uid: string,
     patch: Partial<THiddenAttributes>
   ): Promise<Partial<THiddenAttributes>> {
-    const ref = this.userHiddenAttributesDocRef(uid);
+    const cleanUid = assertValidFirestoreDocId(uid, "uid");
     const cleanPatch = sanitizeObjectPatch<THiddenAttributes>(patch);
-    await ref.set(cleanPatch, { merge: true });
-    return this.getUserHiddenAttributes(uid);
+    assertNoReservedTierKeys(cleanPatch, "hiddenAttributes");
+    await this.userHiddenAttributesDocRef(cleanUid).set(
+      { ...cleanPatch, ...tierDocMetadata("hiddenAttributes", cleanUid, null) },
+      { merge: true }
+    );
+    return this.getUserHiddenAttributes(cleanUid);
   }
 
   async getUserSecrets(uid: string): Promise<Partial<Record<keyof TSecrets & string, string>>> {
@@ -471,8 +480,8 @@ export class FirestoreServerStore<
     uid: string,
     patch: Partial<Record<keyof TSecrets & string, string | null>>
   ): Promise<Partial<Record<keyof TSecrets & string, boolean>>> {
-    const ref = this.userSecretsDocRef(uid);
-    return this.writeEncryptedSecretsToRef(ref, patch);
+    const cleanUid = assertValidFirestoreDocId(uid, "uid");
+    return this.writeEncryptedSecretsToRef(this.userSecretsDocRef(cleanUid), cleanUid, null, patch);
   }
 
   async grantUserRoles(
@@ -689,7 +698,7 @@ export class FirestoreServerStore<
   async getScopeMemberHiddenAttributes(scopeId: string, uid: string): Promise<Partial<THiddenAttributes>> {
     const snap = await this.memberHiddenAttributesDocRef(scopeId, uid).get();
     if (!snap.exists) return {};
-    return sanitizeObjectPatch<THiddenAttributes>(snap.data() || {});
+    return readTierDocValues<THiddenAttributes>(snap.data());
   }
 
   async updateScopeMemberHiddenAttributes(
@@ -697,10 +706,15 @@ export class FirestoreServerStore<
     uid: string,
     patch: Partial<THiddenAttributes>
   ): Promise<Partial<THiddenAttributes>> {
-    const ref = this.memberHiddenAttributesDocRef(scopeId, uid);
+    const cleanScopeId = assertValidFirestoreDocId(scopeId, "scopeId");
+    const cleanUid = assertValidFirestoreDocId(uid, "uid");
     const cleanPatch = sanitizeObjectPatch<THiddenAttributes>(patch);
-    await ref.set(cleanPatch, { merge: true });
-    return this.getScopeMemberHiddenAttributes(scopeId, uid);
+    assertNoReservedTierKeys(cleanPatch, "hiddenAttributes");
+    await this.memberHiddenAttributesDocRef(cleanScopeId, cleanUid).set(
+      { ...cleanPatch, ...tierDocMetadata("hiddenAttributes", cleanUid, cleanScopeId) },
+      { merge: true }
+    );
+    return this.getScopeMemberHiddenAttributes(cleanScopeId, cleanUid);
   }
 
   async getScopeMemberSecrets(scopeId: string, uid: string): Promise<Partial<Record<keyof TSecrets & string, string>>> {
@@ -723,8 +737,14 @@ export class FirestoreServerStore<
     uid: string,
     patch: Partial<Record<keyof TSecrets & string, string | null>>
   ): Promise<Partial<Record<keyof TSecrets & string, boolean>>> {
-    const ref = this.memberSecretsDocRef(scopeId, uid);
-    return this.writeEncryptedSecretsToRef(ref, patch);
+    const cleanScopeId = assertValidFirestoreDocId(scopeId, "scopeId");
+    const cleanUid = assertValidFirestoreDocId(uid, "uid");
+    return this.writeEncryptedSecretsToRef(
+      this.memberSecretsDocRef(cleanScopeId, cleanUid),
+      cleanUid,
+      cleanScopeId,
+      patch
+    );
   }
 
   async grantScopeRoles(

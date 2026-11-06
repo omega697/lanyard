@@ -764,6 +764,24 @@ describe("lanyard/core unit tests", () => {
       await expect(store.queryMemberUids("ws-1", { level: undefined })).rejects.toThrow(/'level' is undefined/);
     });
 
+    it("rejects the reserved _lanyard key in hiddenAttributes and secrets", async () => {
+      const store = new InMemoryLanyardStore<TestRole, TestCapability>();
+      await store.upsertScopeMember("ws-1", { uid: "u-1", email: "u1@example.com", roles: [] });
+      await expect(store.updateUserHiddenAttributes("u-1", { _lanyard: {} } as any)).rejects.toThrow(
+        "Invalid hiddenAttributes key '_lanyard'"
+      );
+      await expect(store.updateScopeMemberHiddenAttributes("ws-1", "u-1", { _lanyard: {} } as any)).rejects.toThrow(
+        "Invalid hiddenAttributes key '_lanyard'"
+      );
+      await expect(store.updateUserSecrets("u-1", { _lanyard: "x" } as any)).rejects.toThrow(
+        "Invalid secrets key '_lanyard'"
+      );
+      await expect(store.updateScopeMemberSecrets("ws-1", "u-1", { _lanyard: "x" } as any)).rejects.toThrow(
+        "Invalid secrets key '_lanyard'"
+      );
+      expect(await store.getUserHiddenAttributes("u-1")).toEqual({});
+    });
+
     it("stores custom documents per user and scope, with live updates, validation, and delete cleanup", async () => {
       const store = new InMemoryLanyardStore<TestRole, TestCapability>();
       await store.upsertScopeMember("ws-1", { uid: "u-1", email: "u1@example.com", roles: ["member"] });
