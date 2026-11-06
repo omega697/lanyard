@@ -16,6 +16,8 @@ import {
   type CardFieldsPlacement,
   type LanyardClientStore,
   type LanyardStorePlacementSource,
+  TIER_METADATA_KEY,
+  type SubscribeToMembersOptions,
   type ScopedMember,
   type SubscribeToUsersOptions,
   type UserProfilePatch,
@@ -227,24 +229,112 @@ export class FirestoreClientStore<
     onChange: (users: UserRecord<TRole, TCapability, TPreferences, TAttributes>[]) => void,
     options?: SubscribeToUsersOptions
   ): () => void {
-    const colRef = collection(this.db, this.usersCollection);
-    const target =
-      typeof options?.isSystemAdmin === "boolean"
-        ? query(colRef, where("isSystemAdmin", "==", options.isSystemAdmin))
-        : colRef;
-    return onSnapshot(
-      target,
-      (snapshot) => {
-        const list: UserRecord<TRole, TCapability, TPreferences, TAttributes>[] = [];
-        snapshot.forEach((docSnap) => {
-          list.push(this.parseUserRecord(docSnap.id, docSnap.data() || {}));
-        });
-        onChange(list);
-      },
-      () => {
-        onChange([]);
-      }
+    const subscribeToCards = (
+      onCards: (users: UserRecord<TRole, TCapability, TPreferences, TAttributes>[]) => void,
+      onError: () => void
+    ) => {
+      const colRef = collection(this.db, this.usersCollection);
+      const target =
+        typeof options?.isSystemAdmin === "boolean"
+          ? query(colRef, where("isSystemAdmin", "==", options.isSystemAdmin))
+          : colRef;
+      return onSnapshot(
+        target,
+        (snapshot) => {
+          const list: UserRecord<TRole, TCapability, TPreferences, TAttributes>[] = [];
+          snapshot.forEach((docSnap) => {
+            list.push(this.parseUserRecord(docSnap.id, docSnap.data() || {}));
+          });
+          onCards(list);
+        },
+        onError
+      );
+    };
+    if (options?.include?.includes("attributes")) {
+      return this.subscribeWithAttributesTiers(null, subscribeToCards, onChange);
+    }
+    return subscribeToCards(onChange, () => onChange([]));
+  }
+
+  /**
+   * Listens to every `attributes` tier document of a scope (`scopeId`) or of global users (`scopeId === null`)
+   * with a single collection-group query on `private`, emitting each uid's attributes and private email.
+   */
+  private subscribeToAttributesTiers(
+    scopeId: string | null,
+    onChange: (byUid: Map<string, { attributes: Partial<TAttributes>; email?: string }>) => void,
+    onError: () => void
+  ): () => void {
+    const tiersQuery = query(
+      collectionGroup(this.db, "private"),
+      where(`${TIER_METADATA_KEY}.tier`, "==", "attributes"),
+      where(`${TIER_METADATA_KEY}.scopeId`, "==", scopeId)
     );
+    return onSnapshot(
+      tiersQuery,
+      (snapshot) => {
+        const byUid = new Map<string, { attributes: Partial<TAttributes>; email?: string }>();
+        snapshot.forEach((docSnap) => {
+          const data = docSnap.data() || {};
+          const uid = data[TIER_METADATA_KEY]?.uid;
+          if (typeof uid !== "string") return;
+          const { attributes, email } = splitAttributesTierValues<TAttributes>(readTierDocValues(data));
+          byUid.set(uid, { attributes, email: this.cardFields.email ? undefined : email });
+        });
+        onChange(byUid);
+      },
+      onError
+    );
+  }
+
+  /**
+   * Combines a card list listener with the matching attributes tiers listener. Emits merged records once both
+   * have loaded (so lists never flash without attributes), and `[]` if either listener fails.
+   */
+  private subscribeWithAttributesTiers<R extends { uid: string; email: string; attributes?: Partial<TAttributes> }>(
+    scopeId: string | null,
+    subscribeToCards: (onCards: (cards: R[]) => void, onError: () => void) => () => void,
+    onChange: (records: R[]) => void
+  ): () => void {
+    let cards: R[] | null = null;
+    let tiers: Map<string, { attributes: Partial<TAttributes>; email?: string }> | null = null;
+    let failed = false;
+    const emit = () => {
+      if (failed || !cards || !tiers) return;
+      const byUid = tiers;
+      onChange(
+        cards.map((card) => {
+          const tier = byUid.get(card.uid);
+          if (!tier) return card;
+          return {
+            ...card,
+            attributes: { ...(card.attributes || {}), ...tier.attributes },
+            ...(tier.email ? { email: tier.email } : {})
+          };
+        })
+      );
+    };
+    const fail = () => {
+      if (failed) return;
+      failed = true;
+      onChange([]);
+    };
+    const unsubCards = subscribeToCards((next) => {
+      cards = next;
+      emit();
+    }, fail);
+    const unsubTiers = this.subscribeToAttributesTiers(
+      scopeId,
+      (next) => {
+        tiers = next;
+        emit();
+      },
+      fail
+    );
+    return () => {
+      unsubCards();
+      unsubTiers();
+    };
   }
 
   /** `users/{uid}/private/{tier}` (global, `scopeId === null`) or `{scope}/{scopeId}/members/{uid}/private/{tier}`. */
@@ -410,24 +500,32 @@ export class FirestoreClientStore<
 
   subscribeToScopeMembers(
     scopeId: string,
-    onChange: (members: ScopedMember<TRole, TCapability, TPreferences, TAttributes>[]) => void
+    onChange: (members: ScopedMember<TRole, TCapability, TPreferences, TAttributes>[]) => void,
+    options?: SubscribeToMembersOptions
   ): () => void {
     const cleanScopeId = assertValidFirestoreDocId(scopeId, "scopeId");
-    const colRef = collection(this.db, this.scopeCollection, cleanScopeId, this.membersSubcollection);
-    return onSnapshot(
-      colRef,
-      (snapshot) => {
-        const list: ScopedMember<TRole, TCapability, TPreferences, TAttributes>[] = [];
-        snapshot.forEach((docSnap) => {
-          const data = docSnap.data();
-          list.push(this.parseScopedMember(docSnap.id, cleanScopeId, data));
-        });
-        onChange(list);
-      },
-      () => {
-        onChange([]);
-      }
-    );
+    const subscribeToCards = (
+      onCards: (members: ScopedMember<TRole, TCapability, TPreferences, TAttributes>[]) => void,
+      onError: () => void
+    ) => {
+      const colRef = collection(this.db, this.scopeCollection, cleanScopeId, this.membersSubcollection);
+      return onSnapshot(
+        colRef,
+        (snapshot) => {
+          const list: ScopedMember<TRole, TCapability, TPreferences, TAttributes>[] = [];
+          snapshot.forEach((docSnap) => {
+            const data = docSnap.data();
+            list.push(this.parseScopedMember(docSnap.id, cleanScopeId, data));
+          });
+          onCards(list);
+        },
+        onError
+      );
+    };
+    if (options?.include?.includes("attributes")) {
+      return this.subscribeWithAttributesTiers(cleanScopeId, subscribeToCards, onChange);
+    }
+    return subscribeToCards(onChange, () => onChange([]));
   }
 
   private parseScopedMember(

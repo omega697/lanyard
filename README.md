@@ -266,7 +266,31 @@ const canConfigureGeminiKey = lanyard.canWriteSecret(activeWorkspaceId, "geminiK
 const unsubAdmins = lanyard.subscribeToSystemAdmins((admins) => {
   console.log("System admins:", admins);
 });
+
+// Rosters and directories carry only card fields by default (other users' private email is ""). Staff and
+// system admins can merge in each member's `attributes` tier, including private emails:
+const unsubRoster = lanyard.subscribeToUsers(
+  activeWorkspaceId,
+  (members) => console.log(members.map((m) => [m.email, m.attributes])),
+  { include: ["attributes"] } // throws for callers who aren't staff in this scope (or admins)
+);
 ```
+
+> [!NOTE]
+> With `FirestoreClientStore`, `include: ["attributes"]` adds a single collection-group listener on `private`
+> (`_lanyard.tier == "attributes"` and `_lanyard.scopeId == scopeId`, or `null` for global users). It needs this
+> composite index in `firestore.indexes.json`, plus the collection-group `list` rule in the reference rules below:
+>
+> ```json
+> {
+>   "collectionGroup": "private",
+>   "queryScope": "COLLECTION_GROUP",
+>   "fields": [
+>     { "fieldPath": "_lanyard.tier", "order": "ASCENDING" },
+>     { "fieldPath": "_lanyard.scopeId", "order": "ASCENDING" }
+>   ]
+> }
+> ```
 
 #### Authentication & Magic Links
 
@@ -686,6 +710,16 @@ match /users/{uid} {
     allow read: if isOwner(uid) || hasUserRole(['owner', 'manager']);
     allow write: if isOwner(uid) && isOwnVerifiedEmailWrite(uid, null);
   }
+}
+
+// Let staff list every attributes tier document of their scope (or of global users) in one collection-group
+// query (`include: ["attributes"]`). The query's equality filters on `_lanyard.tier` and `_lanyard.scopeId` are
+// what let Firestore prove this rule for the whole result set.
+match /{path=**}/private/{tierDoc} {
+  allow list: if resource.data._lanyard.tier == 'attributes' && (
+    resource.data._lanyard.scopeId == null
+      ? hasUserRole(['owner', 'manager'])
+      : hasScopeRole(resource.data._lanyard.scopeId, ['owner', 'manager']));
 }
 
 // Allow authenticated users to query their own memberships across scopes via collectionGroup('members'):

@@ -506,6 +506,41 @@ describe("lanyard/client unit tests", () => {
     expect(scopeMembers).toHaveLength(1);
     expect(scopeMembers[0].roles).toEqual(["member", "manager"]);
 
+    // 3b. include: ["attributes"] adds ONE collection-group listener on the scope's attributes tiers and waits for
+    // both listeners before emitting merged members
+    let emitCards!: (snap: any) => void;
+    let emitTiers!: (snap: any) => void;
+    vi.mocked(firebaseFirestore.onSnapshot)
+      .mockImplementationOnce((_ref: any, onNext: any) => {
+        emitCards = onNext;
+        return () => {};
+      })
+      .mockImplementationOnce((_q: any, onNext: any) => {
+        emitTiers = onNext;
+        return () => {};
+      });
+    vi.mocked(firebaseFirestore.where).mockClear();
+    const included: any[][] = [];
+    store.subscribeToScopeMembers("ws-1", (m) => included.push(m), { include: ["attributes"] });
+    expect(firebaseFirestore.collectionGroup).toHaveBeenLastCalledWith(fakeDb, "private");
+    expect(firebaseFirestore.where).toHaveBeenCalledWith("_lanyard.tier", "==", "attributes");
+    expect(firebaseFirestore.where).toHaveBeenCalledWith("_lanyard.scopeId", "==", "ws-1");
+    emitCards({ forEach: (cb: any) => cb({ id: "u-2", data: () => ({ uid: "u-2", roles: ["member"] }) }) });
+    expect(included).toHaveLength(0);
+    emitTiers({
+      forEach: (cb: any) =>
+        cb({
+          data: () => ({
+            points: 3,
+            email: "u2@example.com",
+            _lanyard: { tier: "attributes", uid: "u-2", scopeId: "ws-1" }
+          })
+        })
+    });
+    expect(included.at(-1)).toEqual([
+      expect.objectContaining({ uid: "u-2", email: "u2@example.com", attributes: { points: 3 } })
+    ]);
+
     // 4. syncAvatar uses updateDoc for scoped members and setDoc for users/{uid}
     await store.syncAvatar({ uid: "u-1", scopeId: "ws-1", photoUrl: "https://example.com/u1.png" });
     expect(firebaseFirestore.updateDoc).toHaveBeenCalledWith(
@@ -1417,6 +1452,80 @@ describe("lanyard/client unit tests", () => {
     client.setActiveUser(null);
     expect(client.userRecordStore.get()).toBeNull();
     client.destroy();
+  });
+
+  it("lets staff and admins include members' attributes tier and private email in list subscriptions, and rejects everyone else", async () => {
+    type Attrs = { points: number };
+    const policy = createPermissionPolicy<TestRole, TestCap>({
+      roles: { owner: { capabilities: ["invite_members"] }, manager: { capabilities: ["invite_members"] }, member: {} },
+      staffCapability: "invite_members"
+    });
+    const store = new InMemoryLanyardStore<TestRole, TestCap, TestPrefs, Attrs>({ policy });
+    await store.upsertScopeMember("ws-a", { uid: "u-staff", email: "staff@example.com", roles: ["manager"] });
+    await store.upsertScopeMember("ws-a", {
+      uid: "u-peer",
+      email: "peer@example.com",
+      roles: ["member"],
+      attributes: { points: 7 }
+    });
+    await store.upsertUser({ uid: "u-peer", email: "peer@example.com", attributes: { points: 70 } });
+
+    const makeClient = (uid: string, isAdmin = false) => {
+      const client = createLanyardClient<TestRole, TestCap, TestPrefs, Attrs>({
+        store,
+        policy,
+        defaultPreferences: DEFAULT_PREFS,
+        storageKeyPrefix: `include-${uid}`
+      });
+      client.setActiveUser({
+        uid,
+        email: `${uid}@example.com`,
+        emailVerified: true,
+        displayName: null,
+        photoUrl: null,
+        isAdmin,
+        providerIds: []
+      });
+      return client;
+    };
+
+    // Scope staff get every member's tier merged in, and live tier updates
+    const staff = makeClient("u-staff");
+    const roster: any[][] = [];
+    const unsubRoster = staff.subscribeToUsers("ws-a", (m) => roster.push(m), { include: ["attributes"] });
+    expect(roster.at(-1)?.find((m) => m.uid === "u-peer")).toMatchObject({
+      email: "peer@example.com",
+      attributes: { points: 7 }
+    });
+    await store.updateScopeMemberAttributes("ws-a", "u-peer", { points: 8 });
+    expect(roster.at(-1)?.find((m) => m.uid === "u-peer")?.attributes).toEqual({ points: 8 });
+    unsubRoster();
+    // ...but without include, other members' private fields stay out
+    const plainRoster: any[][] = [];
+    staff.subscribeToUsers("ws-a", (m) => plainRoster.push(m))();
+    expect(plainRoster.at(-1)?.find((m) => m.uid === "u-peer")).toMatchObject({ email: "" });
+    expect(plainRoster.at(-1)?.find((m) => m.uid === "u-peer")?.attributes).toBeUndefined();
+
+    // Non-staff members, staff of another scope, and non-staff global users are rejected up front
+    const peer = makeClient("u-peer");
+    expect(() => peer.subscribeToUsers("ws-a", () => {}, { include: ["attributes"] })).toThrow(
+      /Forbidden: include: \["attributes"\] requires staff access in scope 'ws-a'/
+    );
+    expect(() => staff.subscribeToUsers("ws-b", () => {}, { include: ["attributes"] })).toThrow(/scope 'ws-b'/);
+    expect(() => staff.subscribeToUsers(GLOBAL_SCOPE, () => {}, { include: ["attributes"] })).toThrow(
+      /the global scope/
+    );
+
+    // System admins may include anywhere
+    const admin = makeClient("u-admin", true);
+    const directory: any[][] = [];
+    admin.subscribeToUsers(GLOBAL_SCOPE, (u) => directory.push(u), { include: ["attributes"] })();
+    expect(directory.at(-1)?.find((u) => u.uid === "u-peer")).toMatchObject({
+      email: "peer@example.com",
+      attributes: { points: 70 }
+    });
+
+    [staff, peer, admin].forEach((c) => c.destroy());
   });
 
   it("wires userRecordStore, attributesStore, updateProfile, real-time isSystemAdmin sync, and single-tenant role presence tracking", async () => {

@@ -7,6 +7,7 @@ import type {
   LanyardStorePlacementSource,
   ScopedMember,
   SecretCipher,
+  SubscribeToMembersOptions,
   SubscribeToUsersOptions,
   SystemAdminProfile,
   UserProfilePatch,
@@ -161,6 +162,11 @@ export class InMemoryLanyardStore<
     string,
     Set<(members: ScopedMember<TRole, TCapability, TPreferences, TAttributes>[]) => void>
   >();
+  // Subset of scopeMemberListeners that include the attributes tier, re-notified when a member's tier changes
+  private scopeMemberIncludeListeners = new Map<
+    string,
+    Set<(members: ScopedMember<TRole, TCapability, TPreferences, TAttributes>[]) => void>
+  >();
 
   // --- Client Store Methods ---
 
@@ -296,17 +302,28 @@ export class InMemoryLanyardStore<
 
   subscribeToScopeMembers(
     scopeId: string,
-    onChange: (members: ScopedMember<TRole, TCapability, TPreferences, TAttributes>[]) => void
+    onChange: (members: ScopedMember<TRole, TCapability, TPreferences, TAttributes>[]) => void,
+    options?: SubscribeToMembersOptions
   ): () => void {
     assertValidResourceId(scopeId, "scopeId");
+    const includeAttributes = Boolean(options?.include?.includes("attributes"));
+    const listener = includeAttributes
+      ? (members: ScopedMember<TRole, TCapability, TPreferences, TAttributes>[]) =>
+          onChange(members.map((m) => this.withAttributesTier(m, scopeId)))
+      : onChange;
     if (!this.scopeMemberListeners.has(scopeId)) {
       this.scopeMemberListeners.set(scopeId, new Set());
     }
-    this.scopeMemberListeners.get(scopeId)!.add(onChange);
-    onChange(this.getMembersForScopeSync(scopeId));
+    this.scopeMemberListeners.get(scopeId)!.add(listener);
+    if (includeAttributes) {
+      if (!this.scopeMemberIncludeListeners.has(scopeId)) this.scopeMemberIncludeListeners.set(scopeId, new Set());
+      this.scopeMemberIncludeListeners.get(scopeId)!.add(listener);
+    }
+    listener(this.getMembersForScopeSync(scopeId));
 
     return () => {
-      this.scopeMemberListeners.get(scopeId)?.delete(onChange);
+      this.scopeMemberListeners.get(scopeId)?.delete(listener);
+      this.scopeMemberIncludeListeners.get(scopeId)?.delete(listener);
     };
   }
 
@@ -819,10 +836,18 @@ export class InMemoryLanyardStore<
 
   private notifyTierListeners(tier: MergedTier, scopeId: string | null, uid: string): void {
     const key = tierKey(scopeId, uid);
-    const callbacks = this.tierListeners[tier].get(key);
-    if (!callbacks) return;
-    for (const cb of callbacks) {
+    for (const cb of this.tierListeners[tier].get(key) || []) {
       cb({ ...(this.tierValues[tier].get(key) || {}) });
+    }
+    if (tier !== "attributes") return;
+    // List subscriptions that include the attributes tier see tier changes too
+    if (scopeId === null) {
+      for (const entry of this.usersDirectoryListeners) {
+        if (entry.options?.include?.includes("attributes")) entry.cb(this.getFilteredUsersSnapshot(entry.options));
+      }
+    } else {
+      const members = this.getMembersForScopeSync(scopeId);
+      for (const cb of this.scopeMemberIncludeListeners.get(scopeId) || []) cb(members);
     }
   }
 
@@ -834,13 +859,24 @@ export class InMemoryLanyardStore<
   >(record: R, scopeId: string | null): R {
     const key = tierKey(scopeId, record.uid);
     const preferences = this.tierValues.preferences.get(key);
-    const tierValues = this.tierValues.attributes.get(key);
+    return {
+      ...this.withAttributesTier(record, scopeId),
+      ...(preferences ? { preferences: { ...preferences } } : {})
+    };
+  }
+
+  /** Returns a record with its `attributes` tier (and private email) merged in. */
+  private withAttributesTier<
+    R extends
+      | UserRecord<TRole, TCapability, TPreferences, TAttributes>
+      | ScopedMember<TRole, TCapability, TPreferences, TAttributes>
+  >(record: R, scopeId: string | null): R {
+    const tierValues = this.tierValues.attributes.get(tierKey(scopeId, record.uid));
     const tier = tierValues ? splitAttributesTierValues<TAttributes>(tierValues) : undefined;
     return {
       ...record,
       ...(record.roles ? { roles: [...record.roles] } : {}),
       ...(record.attributes ? { attributes: { ...record.attributes } } : {}),
-      ...(preferences ? { preferences: { ...preferences } } : {}),
       ...(tier ? { attributes: { ...(record.attributes || {}), ...tier.attributes } } : {}),
       ...(tier && !this.cardFields.email ? { email: tier.email || "" } : {})
     };
@@ -922,7 +958,9 @@ export class InMemoryLanyardStore<
       typeof options?.isSystemAdmin === "boolean"
         ? all.filter((u) => Boolean(u.isSystemAdmin) === options.isSystemAdmin)
         : all;
-    return filtered.map((u) => this.cloneUser(u)!);
+    return options?.include?.includes("attributes")
+      ? filtered.map((u) => this.withAttributesTier(u, null))
+      : filtered.map((u) => this.cloneUser(u)!);
   }
 
   private notifyUserListeners(uid: string): void {

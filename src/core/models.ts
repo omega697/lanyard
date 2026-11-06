@@ -687,7 +687,19 @@ export interface LanyardWritable<T> extends LanyardReadable<T> {
 /**
  * Optional filter options when subscribing to `usersCollection` via `subscribeToUsers`.
  */
-export interface SubscribeToUsersOptions {
+/** Private tiers that user/member list subscriptions can merge into each record. */
+export type IncludableTier = "attributes";
+
+export interface SubscribeToMembersOptions {
+  /**
+   * Private tiers to merge into each record. `"attributes"` adds every member's `attributes` tier (and private
+   * `email`); only readers allowed to read that tier for others (scope staff and system admins) may request it.
+   * In Firestore this adds one collection-group listener on `private` (see the README for the required index).
+   */
+  include?: readonly IncludableTier[];
+}
+
+export interface SubscribeToUsersOptions extends SubscribeToMembersOptions {
   /**
    * When set to a boolean (`true` or `false`), filters the query to documents matching `isSystemAdmin == options.isSystemAdmin`
    * (using an indexed `where("isSystemAdmin", "==", ...)` query in Firestore).
@@ -770,7 +782,8 @@ export interface LanyardClientStore<
   /** Optional: Subscribe to all members within a single scope (`scopeId`). */
   subscribeToScopeMembers?(
     scopeId: string,
-    onChange: (members: ScopedMember<TRole, TCapability, TPreferences, TAttributes>[]) => void
+    onChange: (members: ScopedMember<TRole, TCapability, TPreferences, TAttributes>[]) => void,
+    options?: SubscribeToMembersOptions
   ): () => void;
 
   /**

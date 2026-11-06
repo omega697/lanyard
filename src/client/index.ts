@@ -33,6 +33,7 @@ import {
   type ScopeId,
   type ScopedMember,
   type SocialProviderType,
+  type SubscribeToMembersOptions,
   type SubscribeToUsersOptions,
   type SystemAdminProfile,
   type UserProfilePatch,
@@ -46,6 +47,7 @@ export {
   formatExistingAccountError,
   type GlobalScope,
   type ScopeId,
+  type SubscribeToMembersOptions,
   type SubscribeToUsersOptions,
   type VerifiedEmailChangeEvent
 };
@@ -1255,7 +1257,8 @@ export function createLanyardClient<
   ): () => void;
   function subscribeToUsers(
     scopeId: string,
-    cb: (members: ScopedMember<TRole, TCapability, TPreferences, TAttributes>[]) => void
+    cb: (members: ScopedMember<TRole, TCapability, TPreferences, TAttributes>[]) => void,
+    options?: SubscribeToMembersOptions
   ): () => void;
   function subscribeToUsers(
     scopeId: ScopeId,
@@ -1278,6 +1281,7 @@ export function createLanyardClient<
         ) => void),
     options?: SubscribeToUsersOptions
   ): () => void {
+    if (options?.include?.includes("attributes")) assertCanIncludeAttributes(scopeId);
     if (scopeId === GLOBAL_SCOPE) {
       if (typeof store.subscribeToUsers !== "function") {
         throw new Error("Backing store does not implement subscribeToUsers");
@@ -1295,8 +1299,30 @@ export function createLanyardClient<
     }
     return store.subscribeToScopeMembers(
       scopeId,
-      cb as (members: ScopedMember<TRole, TCapability, TPreferences, TAttributes>[]) => void
+      cb as (members: ScopedMember<TRole, TCapability, TPreferences, TAttributes>[]) => void,
+      options?.include ? { include: options.include } : undefined
     );
+  }
+
+  /**
+   * Throws unless the signed-in user may read other users' `attributes` tier in `scopeId` (system admins, and
+   * staff per the policy's `staffCapability`), so a forbidden `include` fails clearly instead of returning `[]`.
+   */
+  function assertCanIncludeAttributes(scopeId: ScopeId): void {
+    const currentUser = authStoreInternal.get().user;
+    const isSystemAdmin = Boolean(currentUser?.isAdmin);
+    const actor =
+      scopeId === GLOBAL_SCOPE
+        ? userRecordStoreInternal.get()
+        : membershipsStoreInternal.get().memberships.find((m) => m.scopeId === scopeId) || null;
+    const allowed = isSystemAdmin || Boolean(currentUser && policy?.canReadTier(actor, "attributes"));
+    if (!allowed) {
+      throw new Error(
+        `Forbidden: include: ["attributes"] requires staff access in ${
+          scopeId === GLOBAL_SCOPE ? "the global scope" : `scope '${scopeId}'`
+        }`
+      );
+    }
   }
 
   /**
@@ -1304,13 +1330,16 @@ export function createLanyardClient<
    * Uses an indexed `where("isSystemAdmin", "==", true)` query in `FirestoreClientStore` so only
    * system admin documents are read from Firestore.
    */
-  function subscribeToSystemAdmins(cb: (admins: SystemAdminProfile[]) => void): () => void {
+  function subscribeToSystemAdmins(
+    cb: (admins: SystemAdminProfile[]) => void,
+    options?: SubscribeToMembersOptions
+  ): () => void {
     return subscribeToUsers(
       GLOBAL_SCOPE,
       (users) => {
         cb(users.filter((u) => u.isSystemAdmin === true) as SystemAdminProfile[]);
       },
-      { isSystemAdmin: true }
+      { isSystemAdmin: true, ...(options?.include ? { include: options.include } : {}) }
     );
   }
 

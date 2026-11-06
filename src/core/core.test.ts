@@ -685,6 +685,46 @@ describe("lanyard/core unit tests", () => {
       expect((await cardStore.getUser("u-2"))?.email).toBe("u2-new@example.com");
     });
 
+    it("merges the attributes tier into list subscriptions only when included, and re-emits on tier changes", async () => {
+      const store = new InMemoryLanyardStore<TestRole, TestCapability>();
+      await store.upsertScopeMember("ws-1", {
+        uid: "u-1",
+        email: "u1@example.com",
+        roles: ["member"],
+        attributes: { a: 1 }
+      });
+      await store.upsertUser({ uid: "u-1", email: "u1@example.com", attributes: { g: 1 } });
+
+      const plain: any[][] = [];
+      const included: any[][] = [];
+      const plainUsers: any[][] = [];
+      const includedUsers: any[][] = [];
+      const unsubs = [
+        store.subscribeToScopeMembers("ws-1", (m) => plain.push(m)),
+        store.subscribeToScopeMembers("ws-1", (m) => included.push(m), { include: ["attributes"] }),
+        store.subscribeToUsers((u) => plainUsers.push(u)),
+        store.subscribeToUsers((u) => includedUsers.push(u), { include: ["attributes"] })
+      ];
+      expect(plain.at(-1)?.[0]).toMatchObject({ email: "" });
+      expect(plain.at(-1)?.[0].attributes).toBeUndefined();
+      expect(included.at(-1)?.[0]).toMatchObject({ email: "u1@example.com", attributes: { a: 1 } });
+      expect(plainUsers.at(-1)?.[0].email).toBe("");
+      expect(includedUsers.at(-1)?.[0]).toMatchObject({ email: "u1@example.com", attributes: { g: 1 } });
+
+      // Tier changes re-emit subscriptions that include the tier; plain subscriptions never see tier values
+      await store.updateScopeMemberAttributes("ws-1", "u-1", { a: 2 });
+      await store.updateUserAttributes("u-1", { g: 2 });
+      expect(plain.at(-1)?.[0].attributes).toBeUndefined();
+      expect(included.at(-1)?.[0].attributes).toEqual({ a: 2 });
+      expect(includedUsers.at(-1)?.[0].attributes).toEqual({ g: 2 });
+
+      // Unsubscribed include listeners stop receiving tier changes
+      unsubs.forEach((unsub) => unsub());
+      const includedCount = included.length;
+      await store.updateScopeMemberAttributes("ws-1", "u-1", { a: 3 });
+      expect(included).toHaveLength(includedCount);
+    });
+
     it("enforces no-op write guards on syncAvatar when photoUrl already matches or scoped member does not exist", async () => {
       const store = new InMemoryLanyardStore<TestRole, TestCapability>();
       await store.upsertScopeMember("ws-1", {

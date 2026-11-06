@@ -22,9 +22,13 @@ import {
   type Auth as ClientAuth
 } from "firebase/auth";
 import {
+  collectionGroup as clientCollectionGroup,
   connectFirestoreEmulator,
   doc as clientDoc,
   getDoc as clientGetDoc,
+  getDocs as clientGetDocs,
+  query as clientQuery,
+  where as clientWhere,
   getFirestore as getClientFirestore,
   setDoc as clientSetDoc,
   terminate,
@@ -1100,6 +1104,14 @@ service cloud.firestore {
       }
     }
 
+    // Staff list every attributes tier document of their scope (or of global users) with one collection-group query
+    match /{path=**}/private/{tierDoc} {
+      allow list: if resource.data._lanyard.tier == 'attributes' && (
+        resource.data._lanyard.scopeId == null
+          ? hasUserCapability(['manager', 'owner'])
+          : hasScopeCapability(resource.data._lanyard.scopeId, ['owner', 'manager']));
+    }
+
     match /{path=**}/members/{memberUid} {
       allow read: if isSignedIn() && (resource.data.uid == request.auth.uid || isAdmin());
     }
@@ -1636,6 +1648,60 @@ service cloud.firestore {
           await deleteClientApp(unverifiedClient.app);
         }
 
+        // Attack H: Only scope staff can list a scope's attributes tiers (include: ["attributes"])
+        const mgrStore = new FirestoreClientStore<Role, Cap, Prefs, { badge: string }>({
+          db: mgrClient.db,
+          defaultRoles: ["member"],
+          usersCollection: "users",
+          scopeCollection: "workspaces",
+          membersSubcollection: "members"
+        });
+        const attributesTiersQuery = (db: any, scopeId: string | null) =>
+          clientQuery(
+            clientCollectionGroup(db, "private"),
+            clientWhere("_lanyard.tier", "==", "attributes"),
+            clientWhere("_lanyard.scopeId", "==", scopeId)
+          );
+        const staffRoster: any[][] = [];
+        const unsubStaffRoster = mgrStore.subscribeToScopeMembers("org-A", (m) => staffRoster.push(m), {
+          include: ["attributes"]
+        });
+        await new Promise((r) => setTimeout(r, 250));
+        unsubStaffRoster();
+        const memberWithTier = staffRoster.at(-1)?.find((m: any) => m.uid === "u-member");
+        expect(memberWithTier).toMatchObject({ email: "member@example.com", attributes: { badge: "starter" } });
+        expect(staffRoster.at(-1)?.find((m: any) => m.uid === "u-mgr")).toMatchObject({
+          email: "mgr@example.com",
+          attributes: { badge: "mgr-badge" }
+        });
+        // A non-staff member's include fails (the store reports an empty list), and raw queries are denied
+        const memberRoster: any[][] = [];
+        const unsubMemberRoster = memberStore.subscribeToScopeMembers("org-A", (m) => memberRoster.push(m), {
+          include: ["attributes"]
+        });
+        await new Promise((r) => setTimeout(r, 250));
+        unsubMemberRoster();
+        expect(memberRoster.at(-1)).toEqual([]);
+        await expect(clientGetDocs(attributesTiersQuery(memberClient.db, "org-A"))).rejects.toMatchObject({
+          code: "permission-denied"
+        });
+        // Staff of org-A can't list org-B's tiers, and nobody can list across scopes without the scope filter
+        await expect(clientGetDocs(attributesTiersQuery(mgrClient.db, "org-B"))).rejects.toMatchObject({
+          code: "permission-denied"
+        });
+        await expect(
+          clientGetDocs(
+            clientQuery(
+              clientCollectionGroup(mgrClient.db, "private"),
+              clientWhere("_lanyard.tier", "==", "attributes")
+            )
+          )
+        ).rejects.toMatchObject({ code: "permission-denied" });
+        // Not global staff (yet): the global users' tiers can't be listed either
+        await expect(clientGetDocs(attributesTiersQuery(mgrClient.db, null))).rejects.toMatchObject({
+          code: "permission-denied"
+        });
+
         // Positive Verification:
         // - Non-admin user with global `manager` role on `users/u-mgr` CAN read another user's profile (`users/u-member`) via `hasUserCapability(['manager', 'owner'])`!
         await adminDb
@@ -1644,10 +1710,20 @@ service cloud.firestore {
         const mgrReadOtherUser = await clientGetDoc(clientDoc(mgrClient.db, "users", "u-member"));
         expect(mgrReadOtherUser.exists()).toBe(true);
         expect(mgrReadOtherUser.data()?.firstName).toBe("Memby");
-        // ...and, as global staff, that user's attributes tier
+        // ...and, as global staff, that user's attributes tier, including through include: ["attributes"]
         expect(
           (await clientGetDoc(clientDoc(mgrClient.db, "users", "u-member", "private", "attributes"))).data()
         ).toMatchObject({ badge: "global-badge" });
+        const staffDirectory: any[][] = [];
+        const unsubStaffDirectory = mgrStore.subscribeToUsers((users) => staffDirectory.push(users), {
+          include: ["attributes"]
+        });
+        await new Promise((r) => setTimeout(r, 250));
+        unsubStaffDirectory();
+        expect(staffDirectory.at(-1)?.find((u: any) => u.uid === "u-member")).toMatchObject({
+          email: "member@example.com",
+          attributes: { badge: "global-badge" }
+        });
 
         // - Manager of `org-A` CAN read/write `org-A` member `private/hiddenAttributes`, and System Admin CAN read/write global `private/hiddenAttributes`
         const orgAHiddenSnap = await clientGetDoc(
