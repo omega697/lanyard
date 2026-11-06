@@ -252,3 +252,74 @@ ${customDocBlocks(true).join("\n")}
     }
 `;
 }
+
+/** Comment line that starts the generated block in `firestore.rules`. */
+export const LANYARD_RULES_BEGIN = "// <lanyard-rules>";
+/** Comment line that ends the generated block in `firestore.rules`. */
+export const LANYARD_RULES_END = "// </lanyard-rules>";
+
+/** Finds the marker lines, throwing unless each appears exactly once and in order. */
+function locateMarkers(rulesText: string): { beginLineEnd: number; endLineStart: number } {
+  const lines = rulesText.split("\n");
+  const beginIndexes = lines.flatMap((line, i) => (line.trim() === LANYARD_RULES_BEGIN ? [i] : []));
+  const endIndexes = lines.flatMap((line, i) => (line.trim() === LANYARD_RULES_END ? [i] : []));
+  if (beginIndexes.length !== 1 || endIndexes.length !== 1 || endIndexes[0] < beginIndexes[0]) {
+    throw new Error(
+      `firestore.rules must contain exactly one '${LANYARD_RULES_BEGIN}' line followed by one '${LANYARD_RULES_END}' ` +
+        "line, inside match /databases/{database}/documents { … }"
+    );
+  }
+  const offsetOfLine = (index: number) => lines.slice(0, index).reduce((sum, line) => sum + line.length + 1, 0);
+  return {
+    beginLineEnd: offsetOfLine(beginIndexes[0]) + lines[beginIndexes[0]].length,
+    endLineStart: offsetOfLine(endIndexes[0])
+  };
+}
+
+/** Returns the text between the `LANYARD_RULES_BEGIN` and `LANYARD_RULES_END` marker lines. */
+export function extractLanyardRulesBlock(rulesText: string): string {
+  const { beginLineEnd, endLineStart } = locateMarkers(rulesText);
+  return rulesText.slice(beginLineEnd + 1, endLineStart);
+}
+
+/** Returns `rulesText` with the text between the marker lines replaced by `generatedBlock`. */
+export function replaceLanyardRulesBlock(rulesText: string, generatedBlock: string): string {
+  const { beginLineEnd, endLineStart } = locateMarkers(rulesText);
+  const block = generatedBlock.endsWith("\n") ? generatedBlock : `${generatedBlock}\n`;
+  return `${rulesText.slice(0, beginLineEnd + 1)}${block}${rulesText.slice(endLineStart)}`;
+}
+
+/** Normalizes line endings and trailing whitespace so formatting-only differences don't count as stale. */
+function normalizeRules(text: string): string[] {
+  return text
+    .replace(/\r\n/g, "\n")
+    .split("\n")
+    .map((line) => line.trimEnd())
+    .join("\n")
+    .trim()
+    .split("\n");
+}
+
+/**
+ * Throws if the generated block in `rulesText` (between the marker lines) doesn't match what
+ * `generateFirestoreRules(policy, options)` produces now, e.g. after roles, capabilities, `cardFields`,
+ * `cardVisibility`, or `customDocs` changed. Call it from your app's tests so stale rules fail CI.
+ */
+export function assertFirestoreRulesUpToDate<TRole extends string, TCapability extends string>(
+  rulesText: string,
+  policy: PermissionPolicy<TRole, TCapability>,
+  options: FirestoreRulesOptions = {}
+): void {
+  const actual = normalizeRules(extractLanyardRulesBlock(rulesText));
+  const expected = normalizeRules(generateFirestoreRules(policy, options));
+  const length = Math.max(actual.length, expected.length);
+  for (let i = 0; i < length; i++) {
+    if (actual[i] !== expected[i]) {
+      throw new Error(
+        `The Lanyard rules block is out of date with the policy (first difference at line ${i + 1} of ` +
+          `the generated block).\n  expected: ${expected[i] ?? "<end of block>"}\n  actual:   ${actual[i] ?? "<end of block>"}\n` +
+          "Regenerate them with `npx lanyard-rules --policy <module> --export <name> --write firestore.rules`."
+      );
+    }
+  }
+}

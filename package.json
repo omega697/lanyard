@@ -35,6 +35,9 @@
       "import": "./dist/rules/index.js"
     }
   },
+  "bin": {
+    "lanyard-rules": "./dist/rules/bin.js"
+  },
   "files": [
     "dist"
   ],

@@ -64,7 +64,7 @@ Like a conference or workplace lanyard, `lanyard` answers two questions everywhe
 | `lanyard/client/firestore` | Browser        | `FirestoreClientStore` implementation of `LanyardClientStore` (peer dependency: `firebase` `^11.0.0 \|\| ^12.0.0 \|\| ^13.0.0`).                                                                                                                                                                |
 | `lanyard/server`           | Node / Express | `GoogleAuthService`, Express middleware (`checkAuth`, `requireAdmin`, `requireRole`, `requireCapability`), UID/role provisioning, and capability-gated `attributes`/`hiddenAttributes`/`secrets`/user management with `actor: LanyardActor` (peer dependency: `express` `^4.18.0 \|\| ^5.0.0`). |
 | `lanyard/server/firestore` | Node / Express | `FirestoreServerStore` implementation of `LanyardServerStore` (peer dependency: `firebase-admin` `^13.0.0 \|\| ^14.0.0`).                                                                                                                                                                       |
-| `lanyard/rules`            | Build / Test   | `generateFirestoreRules(policy, options)`: Firestore security rules for every Lanyard tier, custom doc, and collection-group query, generated from your `PermissionPolicy`. Zero runtime dependencies.                                                                                          |
+| `lanyard/rules`            | Build / Test   | `generateFirestoreRules(policy, options)`: Firestore security rules for every Lanyard tier, custom doc, and collection-group query, generated from your `PermissionPolicy`, plus `assertFirestoreRulesUpToDate` and the `lanyard-rules` CLI. Zero runtime dependencies.                         |
 
 ---
 
@@ -648,7 +648,42 @@ const lanyardRules = generateFirestoreRules(workspacePolicy, {
 });
 ```
 
-Place the generated block inside `match /databases/{database}/documents { … }` in `firestore.rules`. It contains:
+Place the generated block between marker comments inside `match /databases/{database}/documents { … }` in
+`firestore.rules`, next to your app's own rules:
+
+```javascript
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // <lanyard-rules>
+    // </lanyard-rules>
+
+    match /appData/{docId} { /* your rules */ }
+  }
+}
+```
+
+Then fill (or refresh) the block with the CLI, pointing it at your compiled policy module:
+
+```bash
+npx lanyard-rules --policy ./dist/policy.js --export workspacePolicy --scopes workspaces --write firestore.rules
+npx lanyard-rules --policy ./dist/policy.js --export workspacePolicy --scopes workspaces --check firestore.rules
+```
+
+and keep it from going stale by checking it in your tests:
+
+```typescript
+import { readFileSync } from "node:fs";
+import { assertFirestoreRulesUpToDate } from "lanyard/rules";
+
+it("keeps the Lanyard rules in firestore.rules in sync with the policy", () => {
+  assertFirestoreRulesUpToDate(readFileSync("firestore.rules", "utf8"), workspacePolicy, {
+    scopeCollection: "workspaces"
+  });
+});
+```
+
+The generated block contains:
 
 - Helper functions (`isOwner`, `isAdmin`, `isScopeMember`, `hasScopeRole`, `hasUserRole`, `isTierDoc`,
   `isOwnVerifiedEmailWrite`). Role checks use `get()` without a preceding `exists()` so Firestore caches the single
@@ -666,7 +701,8 @@ Place the generated block inside `match /databases/{database}/documents { … }`
 > [!IMPORTANT]
 > Firestore rules can't evaluate role inheritance or capabilities, so the generator expands each capability-based
 > audience into the roles that hold it (e.g. `staffCapability: "manage_members"` becomes
-> `hasScopeRole(scopeId, ['lead', 'owner'])`). **Regenerate the rules whenever roles or capabilities change.**
+> `hasScopeRole(scopeId, ['lead', 'owner'])`). **Regenerate the rules whenever roles or capabilities change**;
+> `assertFirestoreRulesUpToDate` (or `lanyard-rules --check`) fails until you do.
 
 Lanyard's own emulator tests run against generated rules, covering every tier, custom documents, the
 collection-group queries, and the `cardVisibility` modes.
