@@ -39,7 +39,7 @@ Like a conference or workplace lanyard, `lanyard` answers two questions everywhe
     - **`secrets`** (`TSecrets`): **Write-only AES-256-GCM encrypted user secrets** (e.g., BYOK AI API keys or personal OAuth tokens). Stored encrypted at rest (`{ ciphertext, iv, tag }`) in `private/secrets`, never readable back out to any client, with boolean status checks (`getUserSecretsStatus`) for the UI and server-only decryption (`getDecryptedUserSecrets(scopeId, uid)`) for backend API calls.
     - **Custom private documents** (`customDocs`): app-defined documents with their own read/write audiences (`self`, `staff`, or a `capability`) for cases the built-in tiers don't cover. Each lives at `…/{uid}/private/{name}` (stamped with `_lanyard: { tier: name, … }`), is read and written through `readCustomDoc` / `subscribeToCustomDoc` / `updateCustomDoc` (client) and `getCustomDoc` / `updateCustomDoc` (server), and is deleted with its user/member.
     - > [!WARNING]
-    - **`email`** is private by default: it's stored in the `attributes` tier document (so `email` is a reserved attribute key) and merged back into `UserRecord.email` / `ScopedMember.email` for readers of that tier (the user, staff, admins, and the server). Other readers see `email: ""`. Set `cardFields.email: true` to store it on the card instead. Users change their email through Firebase Auth (`sendEmailUpdateVerification`); once verified, Lanyard syncs the stored copy from the client and the server, and the reference rules accept a client write only for the owner's own verified email.
+    - **`email`** is private by default: it's stored in the `attributes` tier document (so `email` is a reserved attribute key) and merged back into `UserRecord.email` / `ScopedMember.email` for readers of that tier (the user, staff, admins, and the server). Other readers see `email: ""`. Set `cardFields.email: true` to store it on the card instead. Users change their email through Firebase Auth (`sendEmailUpdateVerification`); once verified, Lanyard syncs the stored copy from the client and the server, and the generated security rules accept a client write only for the owner's own verified email.
   - **Single-Listener Multiplexing**: `FirestoreClientStore` multiplexes `onSnapshot` listeners on `users/{uid}` so repeated subscriptions to the user profile, `attributes`, and admin status only ever open **1 Firestore document listener**. Preferences and private attributes use one more listener each on the user's own `private/preferences` and `private/attributes` documents, plus one of each per scope membership.
 - **Smart Avatar Tracking & Fallback Resolution**:
   - **Provider Fallback**: When a user signs up via Magic Email Link (`user.photoURL === null`) and later links Google or GitHub, `normalizeFirebaseUser` automatically extracts their avatar from `user.providerData[].photoURL` and sanitizes the URL.
@@ -64,6 +64,7 @@ Like a conference or workplace lanyard, `lanyard` answers two questions everywhe
 | `lanyard/client/firestore` | Browser        | `FirestoreClientStore` implementation of `LanyardClientStore` (peer dependency: `firebase` `^11.0.0 \|\| ^12.0.0 \|\| ^13.0.0`).                                                                                                                                                                |
 | `lanyard/server`           | Node / Express | `GoogleAuthService`, Express middleware (`checkAuth`, `requireAdmin`, `requireRole`, `requireCapability`), UID/role provisioning, and capability-gated `attributes`/`hiddenAttributes`/`secrets`/user management with `actor: LanyardActor` (peer dependency: `express` `^4.18.0 \|\| ^5.0.0`). |
 | `lanyard/server/firestore` | Node / Express | `FirestoreServerStore` implementation of `LanyardServerStore` (peer dependency: `firebase-admin` `^13.0.0 \|\| ^14.0.0`).                                                                                                                                                                       |
+| `lanyard/rules`            | Build / Test   | `generateFirestoreRules(policy, options)`: Firestore security rules for every Lanyard tier, custom doc, and collection-group query, generated from your `PermissionPolicy`. Zero runtime dependencies.                                                                                          |
 
 ---
 
@@ -300,7 +301,7 @@ const unsubNotes = lanyard.subscribeToCustomDoc(activeWorkspaceId, "shiftNotes",
 > [!NOTE]
 > With `FirestoreClientStore`, `include: ["attributes"]` adds a single collection-group listener on `private`
 > (`_lanyard.tier == "attributes"` and `_lanyard.scopeId == scopeId`, or `null` for global users). It needs this
-> composite index in `firestore.indexes.json`, plus the collection-group `list` rule in the reference rules below:
+> composite index in `firestore.indexes.json`, plus the collection-group `list` rule that `generateFirestoreRules` emits (see section 5):
 >
 > ```json
 > {
@@ -631,164 +632,44 @@ For unit tests, use the built-in **`InMemoryLanyardStore<TRole, TCapability, TPr
 
 ---
 
-### 5. Reference Firestore Security Rules (Single-Read Optimized)
+### 5. Firestore Security Rules (generated from your policy)
 
-When using `FirestoreClientStore` and `FirestoreServerStore`, use the following helper functions in `firestore.rules`. Note that `hasScopeRole` and `hasUserRole` use `get()` without a preceding `exists()` call so Firestore caches the single document read across an entire query:
+Generate the rules for everything Lanyard stores from the same `PermissionPolicy` your app uses, so they always
+match the storage tiers, `cardFields`, `cardVisibility`, `staffCapability`, and `customDocs`:
 
-> [!WARNING]
-> Firestore rules grant or deny **whole documents**. Anything placed on the card with `cardFields` is visible to every reader the card's `allow read` admits (e.g. `isScopeMember(scopeId)` on member documents, or `hasUserRole(['owner', 'manager'])` on `users/{uid}`). Keep sensitive fields in their private tiers.
+```typescript
+import { generateFirestoreRules } from "lanyard/rules";
+import { workspacePolicy } from "./policy.js";
 
-```javascript
-function isSignedIn() {
-  return request.auth != null;
-}
-
-function isOwner(uid) {
-  return isSignedIn() && request.auth.uid == uid;
-}
-
-function isAdmin() {
-  return isSignedIn() &&
-    request.auth.token != null &&
-    ("admin" in request.auth.token) &&
-    request.auth.token.admin == true;
-}
-
-function memberPath(scopeId) {
-  return /databases/$(database)/documents/workspaces/$(scopeId)/members/$(request.auth.uid);
-}
-
-function isScopeMember(scopeId) {
-  return isAdmin() || (isSignedIn() && exists(memberPath(scopeId)));
-}
-
-function hasScopeRole(scopeId, allowedRoles) {
-  return isAdmin() || (
-    isSignedIn() &&
-    get(memberPath(scopeId)).data != null &&
-    get(memberPath(scopeId)).data.get('roles', []).hasAny(allowedRoles)
-  );
-}
-
-// Lanyard stamps every private tier document with its tier, owner, and scope (null for global).
-function isPreferencesTierDoc(uid, scopeId) {
-  return request.resource.data._lanyard.tier == 'preferences' &&
-    request.resource.data._lanyard.uid == uid &&
-    request.resource.data._lanyard.scopeId == scopeId;
-}
-
-// Owners may write only their own verified Firebase Auth email (plus Lanyard metadata) to their attributes tier.
-function isOwnVerifiedEmailWrite(uid, scopeId) {
-  return request.auth.token.email_verified == true &&
-    request.resource.data.email == request.auth.token.email.lower() &&
-    request.resource.data._lanyard.tier == 'attributes' &&
-    request.resource.data._lanyard.uid == uid &&
-    request.resource.data._lanyard.scopeId == scopeId &&
-    (resource == null
-      ? request.resource.data.keys().hasOnly(['email', '_lanyard'])
-      : request.resource.data.diff(resource.data).affectedKeys().hasOnly(['email', '_lanyard']));
-}
-
-function hasUserRole(allowedRoles) {
-  return isAdmin() || (
-    isSignedIn() &&
-    get(/databases/$(database)/documents/users/$(request.auth.uid)).data != null &&
-    get(/databases/$(database)/documents/users/$(request.auth.uid)).data.get('roles', []).hasAny(allowedRoles)
-  );
-}
-
-// Example unified users/{uid} & private subdocuments rules:
-match /users/{uid} {
-  allow read: if isOwner(uid) || hasUserRole(['owner', 'manager']);
-  allow create: if isAdmin() || (
-    isOwner(uid) &&
-    request.resource.data.keys().hasOnly([
-      'uid', 'email', 'firstName', 'lastName', 'displayName', 'photoUrl', 'lastSeen', 'createdAt', 'updatedAt'
-    ]) &&
-    (!('uid' in request.resource.data) || request.resource.data.uid == uid)
-  );
-  allow update: if isAdmin() || (
-    isOwner(uid) &&
-    request.resource.data.diff(resource.data).affectedKeys().hasOnly([
-      'uid', 'email', 'firstName', 'lastName', 'displayName', 'photoUrl', 'lastSeen', 'updatedAt'
-    ]) &&
-    (!('uid' in request.resource.data) || request.resource.data.uid == uid)
-  );
-
-  match /private/{docId} {
-    allow read, write: if isAdmin();
-  }
-
-  // Self-only preferences tier
-  match /private/preferences {
-    allow read: if isOwner(uid);
-    allow write: if isOwner(uid) && isPreferencesTierDoc(uid, null);
-  }
-
-  // Self + staff attributes tier (written by the server through the Admin SDK, except owners syncing their
-  // verified email)
-  match /private/attributes {
-    allow read: if isOwner(uid) || hasUserRole(['owner', 'manager']);
-    allow write: if isOwner(uid) && isOwnVerifiedEmailWrite(uid, null);
-  }
-}
-
-// Let staff list every attributes tier document of their scope (or of global users) in one collection-group
-// query (`include: ["attributes"]`). The query's equality filters on `_lanyard.tier` and `_lanyard.scopeId` are
-// what let Firestore prove this rule for the whole result set.
-match /{path=**}/private/{tierDoc} {
-  allow list: if resource.data._lanyard.tier == 'attributes' && (
-    resource.data._lanyard.scopeId == null
-      ? hasUserRole(['owner', 'manager'])
-      : hasScopeRole(resource.data._lanyard.scopeId, ['owner', 'manager']));
-}
-
-// Allow authenticated users to query their own memberships across scopes via collectionGroup('members'):
-match /{path=**}/members/{memberUid} {
-  allow read: if isSignedIn() && (resource.data.uid == request.auth.uid || isAdmin());
-}
-
-// Example tenant-scoped member rules preventing cross-tenant access and self-role/attribute escalation:
-match /workspaces/{scopeId}/members/{memberUid} {
-  allow read: if isScopeMember(scopeId);
-  allow create, delete: if hasScopeRole(scopeId, ['owner', 'manager']);
-  allow update: if hasScopeRole(scopeId, ['owner', 'manager']) || (
-    isOwner(memberUid) &&
-    request.resource.data.diff(resource.data).affectedKeys().hasOnly(['firstName', 'lastName', 'displayName', 'lastSeen', 'photoUrl', 'updatedAt'])
-  );
-
-  match /private/hiddenAttributes {
-    allow read, write: if hasScopeRole(scopeId, ['owner', 'manager']);
-  }
-
-  // Self + staff scoped attributes tier (written by the server through the Admin SDK, except members syncing
-  // their verified email)
-  match /private/attributes {
-    allow read: if isOwner(memberUid) || hasScopeRole(scopeId, ['owner', 'manager']);
-    allow write: if isOwner(memberUid) && isScopeMember(scopeId) && isOwnVerifiedEmailWrite(memberUid, scopeId);
-  }
-
-  // Example custom doc (customDocs.shiftNotes: read self + staff, write staff)
-  match /private/shiftNotes {
-    allow read: if isOwner(memberUid) || hasScopeRole(scopeId, ['owner', 'manager']);
-    allow write: if hasScopeRole(scopeId, ['owner', 'manager']) &&
-      request.resource.data._lanyard.tier == 'shiftNotes' &&
-      request.resource.data._lanyard.uid == memberUid &&
-      request.resource.data._lanyard.scopeId == scopeId;
-  }
-
-  // Self-only scoped preferences tier (writable only while the user is a member of the scope)
-  match /private/preferences {
-    allow read: if isOwner(memberUid) || isAdmin();
-    allow write: if (isOwner(memberUid) && isScopeMember(scopeId) || isAdmin()) &&
-      isPreferencesTierDoc(memberUid, scopeId);
-  }
-
-  match /private/secrets {
-    allow read, write: if false; // Write-only encrypted secrets are managed exclusively via Admin SDK on the server
-  }
-}
+const lanyardRules = generateFirestoreRules(workspacePolicy, {
+  usersCollection: "users", // must match the collections passed to the Firestore stores
+  scopeCollection: "workspaces",
+  membersSubcollection: "members"
+});
 ```
+
+Place the generated block inside `match /databases/{database}/documents { … }` in `firestore.rules`. It contains:
+
+- Helper functions (`isOwner`, `isAdmin`, `isScopeMember`, `hasScopeRole`, `hasUserRole`, `isTierDoc`,
+  `isOwnVerifiedEmailWrite`). Role checks use `get()` without a preceding `exists()` so Firestore caches the single
+  document read across a query.
+- **Cards** (`users/{uid}`, `{scope}/{scopeId}/members/{uid}`): readable per `userCapabilities.read` (global) and
+  `cardVisibility` (scoped). Owners may update only their own profile fields (`firstName`, `lastName`,
+  `displayName`, `photoUrl`, `lastSeen`, plus `email` when `cardFields.email` is set); roles, attributes, and
+  memberships are written by your server through the Admin SDK (or by system admins).
+- **Private tiers**: self-only `preferences` (stamped with `_lanyard` metadata), self + staff `attributes`
+  (server-written, except owners syncing their own verified email), staff-only `hiddenAttributes`, server-only
+  `secrets`, and one block per `customDocs` entry with its read/write audiences.
+- **Collection-group rules** for listing your own memberships and for staff listing a scope's attributes tiers
+  (`include: ["attributes"]`, `queryMembers`).
+
+> [!IMPORTANT]
+> Firestore rules can't evaluate role inheritance or capabilities, so the generator expands each capability-based
+> audience into the roles that hold it (e.g. `staffCapability: "manage_members"` becomes
+> `hasScopeRole(scopeId, ['lead', 'owner'])`). **Regenerate the rules whenever roles or capabilities change.**
+
+Lanyard's own emulator tests run against generated rules, covering every tier, custom documents, the
+collection-group queries, and the `cardVisibility` modes.
 
 ---
 

@@ -29,6 +29,10 @@
     "./server/firestore": {
       "types": "./dist/server/firestore.d.ts",
       "import": "./dist/server/firestore.js"
+    },
+    "./rules": {
+      "types": "./dist/rules/index.d.ts",
+      "import": "./dist/rules/index.js"
     }
   },
   "files": [

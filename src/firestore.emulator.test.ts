@@ -41,6 +41,7 @@ import { createLanyardClient } from "./client/index.js";
 import { createPermissionPolicy, GLOBAL_SCOPE, type LanyardReadable } from "./core/index.js";
 import { FirestoreServerStore } from "./server/firestore.js";
 import { createLanyardServer, isEncryptedSecretData } from "./server/index.js";
+import { generateFirestoreRules } from "./rules/index.js";
 
 /**
  * Resolves the Cloud Firestore Emulator jar: `FIRESTORE_EMULATOR_JAR` if set, otherwise the newest
@@ -1010,151 +1011,26 @@ describe.skipIf(!emulatorsAvailable)(
     });
 
     it("enforces real Firestore Security Rules and thoroughly validates all direct FirestoreClientStore operations", async () => {
-      const referenceRules = `
-rules_version = '2';
+      // The rules under test are generated from a policy matching this scenario: managers and owners are staff (and
+      // can read global user profiles), and shiftNotes are readable by the member and staff and writable by staff.
+      const rulesPolicy = createPermissionPolicy<"member" | "manager" | "owner", "invite_members" | "edit:content">({
+        roles: {
+          member: { capabilities: [] },
+          manager: { inherits: ["member"], capabilities: ["invite_members"] },
+          owner: { inherits: ["manager"], capabilities: ["edit:content"] }
+        },
+        staffCapability: "invite_members",
+        userCapabilities: { read: "invite_members" },
+        customDocs: { shiftNotes: { read: { self: true, staff: true }, write: { staff: true } } }
+      });
+      const wrapRules = (block: string) => `rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
-    function isSignedIn() {
-      return request.auth != null;
-    }
-
-    function isOwner(uid) {
-      return isSignedIn() && request.auth.uid == uid;
-    }
-
-    function isAdmin() {
-      return isSignedIn() &&
-        request.auth.token != null &&
-        ("admin" in request.auth.token) &&
-        request.auth.token.admin == true;
-    }
-
-    function memberPath(scopeId) {
-      return /databases/$(database)/documents/workspaces/$(scopeId)/members/$(request.auth.uid);
-    }
-
-    function isScopeMember(scopeId) {
-      return isAdmin() || (isSignedIn() && exists(memberPath(scopeId)));
-    }
-
-    function hasScopeCapability(scopeId, rolesImplyingCapability) {
-      return isAdmin() || (
-        isSignedIn() &&
-        get(memberPath(scopeId)).data != null &&
-        get(memberPath(scopeId)).data.get('roles', []).hasAny(rolesImplyingCapability)
-      );
-    }
-
-    function isPreferencesTierDoc(uid, scopeId) {
-      return request.resource.data._lanyard.tier == 'preferences' &&
-        request.resource.data._lanyard.uid == uid &&
-        request.resource.data._lanyard.scopeId == scopeId;
-    }
-
-    // Owners may write only their own verified Firebase Auth email (plus Lanyard metadata) to their attributes tier
-    function isOwnVerifiedEmailWrite(uid, scopeId) {
-      return request.auth.token.email_verified == true &&
-        request.resource.data.email == request.auth.token.email.lower() &&
-        request.resource.data._lanyard.tier == 'attributes' &&
-        request.resource.data._lanyard.uid == uid &&
-        request.resource.data._lanyard.scopeId == scopeId &&
-        (resource == null
-          ? request.resource.data.keys().hasOnly(['email', '_lanyard'])
-          : request.resource.data.diff(resource.data).affectedKeys().hasOnly(['email', '_lanyard']));
-    }
-
-    function hasUserCapability(rolesImplyingCapability) {
-      return isAdmin() || (
-        isSignedIn() &&
-        get(/databases/$(database)/documents/users/$(request.auth.uid)).data != null &&
-        get(/databases/$(database)/documents/users/$(request.auth.uid)).data.get('roles', []).hasAny(rolesImplyingCapability)
-      );
-    }
-
-    match /users/{uid} {
-      allow read: if isOwner(uid) || hasUserCapability(['manager', 'owner']);
-      allow create: if isAdmin() || (
-        isOwner(uid) &&
-        request.resource.data.keys().hasOnly([
-          'uid', 'email', 'firstName', 'lastName', 'displayName', 'photoUrl', 'lastSeen', 'createdAt', 'updatedAt'
-        ]) &&
-        (!('uid' in request.resource.data) || request.resource.data.uid == uid)
-      );
-      allow update: if isAdmin() || (
-        isOwner(uid) &&
-        request.resource.data.diff(resource.data).affectedKeys().hasOnly([
-          'uid', 'email', 'firstName', 'lastName', 'displayName', 'photoUrl', 'lastSeen', 'updatedAt'
-        ]) &&
-        (!('uid' in request.resource.data) || request.resource.data.uid == uid)
-      );
-
-      match /private/{docId} {
-        allow read, write: if isAdmin();
-      }
-
-      match /private/preferences {
-        allow read: if isOwner(uid);
-        allow write: if isOwner(uid) && isPreferencesTierDoc(uid, null);
-      }
-
-      // Self + staff attributes tier; written by the server (Admin SDK), except owners syncing their verified email
-      match /private/attributes {
-        allow read: if isOwner(uid) || hasUserCapability(['manager', 'owner']);
-        allow write: if isOwner(uid) && isOwnVerifiedEmailWrite(uid, null);
-      }
-    }
-
-    // Staff list every attributes tier document of their scope (or of global users) with one collection-group query
-    match /{path=**}/private/{tierDoc} {
-      allow list: if resource.data._lanyard.tier == 'attributes' && (
-        resource.data._lanyard.scopeId == null
-          ? hasUserCapability(['manager', 'owner'])
-          : hasScopeCapability(resource.data._lanyard.scopeId, ['owner', 'manager']));
-    }
-
-    match /{path=**}/members/{memberUid} {
-      allow read: if isSignedIn() && (resource.data.uid == request.auth.uid || isAdmin());
-    }
-
-    match /workspaces/{scopeId}/members/{memberUid} {
-      allow read: if isScopeMember(scopeId);
-      allow create, delete: if hasScopeCapability(scopeId, ['owner', 'manager']);
-      allow update: if hasScopeCapability(scopeId, ['owner', 'manager']) || (
-        isOwner(memberUid) &&
-        request.resource.data.diff(resource.data).affectedKeys().hasOnly(['firstName', 'lastName', 'displayName', 'lastSeen', 'photoUrl', 'updatedAt'])
-      );
-
-      match /private/hiddenAttributes {
-        allow read, write: if hasScopeCapability(scopeId, ['owner', 'manager']);
-      }
-
-      match /private/attributes {
-        allow read: if isOwner(memberUid) || hasScopeCapability(scopeId, ['owner', 'manager']);
-        allow write: if isOwner(memberUid) && isScopeMember(scopeId) && isOwnVerifiedEmailWrite(memberUid, scopeId);
-      }
-
-      // App-defined custom doc: readable by the member and staff, writable by staff
-      match /private/shiftNotes {
-        allow read: if isOwner(memberUid) || hasScopeCapability(scopeId, ['owner', 'manager']);
-        allow write: if hasScopeCapability(scopeId, ['owner', 'manager']) &&
-          request.resource.data._lanyard.tier == 'shiftNotes' &&
-          request.resource.data._lanyard.uid == memberUid &&
-          request.resource.data._lanyard.scopeId == scopeId;
-      }
-
-      match /private/preferences {
-        allow read: if isOwner(memberUid) || isAdmin();
-        allow write: if (isOwner(memberUid) && isScopeMember(scopeId) || isAdmin()) &&
-          isPreferencesTierDoc(memberUid, scopeId);
-      }
-
-      match /private/secrets {
-        allow read, write: if false;
-      }
-    }
+${block}
   }
 }
 `;
+      const referenceRules = wrapRules(generateFirestoreRules(rulesPolicy));
 
       const rulesRes = await fetch(`http://127.0.0.1:${emulatorPort}/emulator/v1/projects/${projectId}:securityRules`, {
         method: "PUT",
@@ -1792,6 +1668,47 @@ service cloud.firestore {
           clientDoc(sysAdminClient.db, "users", "u-member", "private", "hiddenAttributes")
         );
         expect(globalHiddenSnap.data()).toEqual({ secretNote: "Top secret global note" });
+
+        // Generated rules for cardVisibility: "staff": only staff (and the member themselves) can read member cards
+        const staffCardsRes = await fetch(
+          `http://127.0.0.1:${emulatorPort}/emulator/v1/projects/${projectId}:securityRules`,
+          {
+            method: "PUT",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              rules: {
+                files: [
+                  {
+                    name: "firestore.rules",
+                    content: wrapRules(
+                      generateFirestoreRules(
+                        createPermissionPolicy<"member" | "manager" | "owner", "invite_members">({
+                          roles: {
+                            member: { capabilities: [] },
+                            manager: { inherits: ["member"], capabilities: ["invite_members"] },
+                            owner: { inherits: ["manager"], capabilities: [] }
+                          },
+                          staffCapability: "invite_members",
+                          cardVisibility: "staff"
+                        })
+                      )
+                    )
+                  }
+                ]
+              }
+            })
+          }
+        );
+        expect(staffCardsRes.status).toBe(200);
+        await expect(
+          clientGetDoc(clientDoc(memberClient.db, "workspaces", "org-A", "members", "u-mgr"))
+        ).rejects.toMatchObject({ code: "permission-denied" });
+        expect(
+          (await clientGetDoc(clientDoc(memberClient.db, "workspaces", "org-A", "members", "u-member"))).exists()
+        ).toBe(true);
+        expect(
+          (await clientGetDoc(clientDoc(mgrClient.db, "workspaces", "org-A", "members", "u-member"))).exists()
+        ).toBe(true);
       } finally {
         await terminate(memberClient.db);
         await deleteClientApp(memberClient.app);
