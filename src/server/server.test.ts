@@ -67,6 +67,12 @@ function createFakeAdminAuth(): AdminAuthAdapter & {
           email_verified: false
         };
       }
+      if (idToken === "missing-verified-claim-token") {
+        return {
+          uid: "u-missing-verified-claim",
+          email: "missing-claim@example.com"
+        };
+      }
       if (idToken === "no-email-token") {
         return {
           uid: "u-no-email"
@@ -182,6 +188,74 @@ describe("lanyard/server unit tests", () => {
     const unverifiedUser = await lenientAuth.verifyToken("Bearer unverified-token");
     expect(unverifiedUser?.emailVerified).toBe(false);
   });
+
+  it.each([
+    ["false", "unverified-token"],
+    ["missing", "missing-verified-claim-token"]
+  ])("treats a token whose email_verified claim is %s as unverified in GoogleAuthService", async (_case, token) => {
+    const adminAuth = createFakeAdminAuth();
+
+    await expect(new GoogleAuthService(adminAuth).verifyToken(`Bearer ${token}`)).rejects.toThrow(
+      "Token email must be verified"
+    );
+
+    const lenientUser = await new GoogleAuthService(adminAuth, false).verifyToken(`Bearer ${token}`);
+    expect(lenientUser?.emailVerified).toBe(false);
+  });
+
+  it.each([
+    ["false", "unverified-token"],
+    ["missing", "missing-verified-claim-token"]
+  ])("rejects a request in checkAuth when the token's email_verified claim is %s", async (_case, token) => {
+    const server = createLanyardServer<TestRole, TestCap>({
+      adminAuth: createFakeAdminAuth(),
+      store: new InMemoryLanyardStore<TestRole, TestCap>(),
+      policy: TEST_POLICY
+    });
+    const req: any = { headers: { authorization: `Bearer ${token}` } };
+    const res = createMockRes();
+    let nextCalled = false;
+
+    await server.checkAuth(req, res, () => {
+      nextCalled = true;
+    });
+
+    expect(nextCalled).toBe(false);
+    expect(req.user).toBeUndefined();
+    expect(res.statusCode).toBe(401);
+    expect(res.body).toEqual({ error: "Unauthorized: Token email must be verified" });
+  });
+
+  it.each([
+    ["false", "unverified-token", "u-unverified", "unverified@example.com"],
+    ["missing", "missing-verified-claim-token", "u-missing-verified-claim", "missing-claim@example.com"]
+  ])(
+    "does not sync users/{uid}.email when requireVerifiedEmail is off and the email_verified claim is %s",
+    async (_case, token, uid, tokenEmail) => {
+      const adminAuth = createFakeAdminAuth();
+      const store = new InMemoryLanyardStore<TestRole, TestCap>();
+      await store.upsertUser({ uid, email: "old@example.com", roles: ["member"] });
+      const onVerifiedEmailChange = vi.fn();
+      const server = createLanyardServer<TestRole, TestCap>({
+        adminAuth,
+        store,
+        policy: TEST_POLICY,
+        authService: new GoogleAuthService(adminAuth, false),
+        onVerifiedEmailChange
+      });
+      const req: any = { headers: { authorization: `Bearer ${token}` } };
+      let nextCalled = false;
+
+      await server.checkAuth(req, createMockRes(), () => {
+        nextCalled = true;
+      });
+
+      expect(nextCalled).toBe(true);
+      expect(req.user).toMatchObject({ uid, email: tokenEmail, emailVerified: false });
+      expect(onVerifiedEmailChange).not.toHaveBeenCalled();
+      expect((await store.getUser(uid))?.email).toBe("old@example.com");
+    }
+  );
 
   it("provisions UIDs by email, manages system admins, and grants/revokes multi-capabilities", async () => {
     const adminAuth = createFakeAdminAuth();
@@ -3069,6 +3143,37 @@ describe("lanyard/server unit tests", () => {
     await server.checkAuth(req3, createMockRes(), () => {});
     expect(onVerifiedEmailChange).toHaveBeenCalledTimes(2);
   });
+
+  it.each([
+    ["omits emailVerified", {}, false],
+    ["reports emailVerified false", { emailVerified: false }, false],
+    ["reports emailVerified true", { emailVerified: true }, true]
+  ])(
+    "syncs users/{uid}.email in checkAuth only when a custom AuthService reports a verified email (%s)",
+    async (_description, verification, shouldSync) => {
+      const store = new InMemoryLanyardStore<TestRole, TestCap>();
+      await store.upsertUser({ uid: "u-custom", email: "old@example.com", roles: ["member"] });
+      const onVerifiedEmailChange = vi.fn();
+      const server = createLanyardServer<TestRole, TestCap>({
+        adminAuth: createFakeAdminAuth(),
+        store,
+        policy: TEST_POLICY,
+        authService: {
+          verifyToken: async () => ({ uid: "u-custom", email: "new@example.com", ...verification })
+        },
+        onVerifiedEmailChange
+      });
+
+      let nextCalled = false;
+      await server.checkAuth({ headers: { authorization: "Bearer custom" } } as any, createMockRes(), () => {
+        nextCalled = true;
+      });
+
+      expect(nextCalled).toBe(true);
+      expect(onVerifiedEmailChange).toHaveBeenCalledTimes(shouldSync ? 1 : 0);
+      expect((await store.getUser("u-custom"))?.email).toBe(shouldSync ? "new@example.com" : "old@example.com");
+    }
+  );
 
   it("supports createLanyardServer and FirestoreServerStore without roles or defaultRole (users have roles: [])", async () => {
     const adminAuth = createFakeAdminAuth();

@@ -25,6 +25,7 @@ export * from "./encryption.js";
 export interface AuthenticatedUser {
   uid: string;
   email: string;
+  /** Only `true` counts as verified; `false` or omitted is treated as unverified. */
   emailVerified?: boolean;
   name?: string;
   photoUrl?: string | null;
@@ -110,13 +111,13 @@ export class GoogleAuthService implements AuthService {
     if (!decodedToken.email) {
       throw new Error("Token must contain an email claim");
     }
-    if (this.requireVerifiedEmail && decodedToken.email_verified === false) {
+    if (this.requireVerifiedEmail && decodedToken.email_verified !== true) {
       throw new Error("Token email must be verified");
     }
     return {
       uid: decodedToken.uid,
       email: decodedToken.email.toLowerCase().trim(),
-      emailVerified: decodedToken.email_verified !== false,
+      emailVerified: decodedToken.email_verified === true,
       name: decodedToken.name,
       photoUrl: sanitizeAvatarUrl(decodedToken.picture),
       isAdmin: Boolean(decodedToken.admin)
@@ -253,7 +254,7 @@ export function createLanyardServer<
         }
         if (
           user.email &&
-          user.emailVerified !== false &&
+          user.emailVerified === true &&
           userRecord?.email &&
           userRecord.email.toLowerCase() !== user.email.toLowerCase() &&
           (typeof onVerifiedEmailChange === "function" || typeof store.upsertUser === "function")

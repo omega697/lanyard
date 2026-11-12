@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+### Breaking changes
+
+- **Missing `email_verified` now fails closed on the server.** `GoogleAuthService.verifyToken` used to reject a token
+  only when its `email_verified` claim was exactly `false`, and reported `emailVerified: true` when the claim was
+  absent. It now requires `email_verified === true` (when `requireVerifiedEmail` is on) and reports `emailVerified`
+  as `true` only in that case. Likewise, `checkAuth` only syncs `users/{uid}.email` (and calls
+  `onVerifiedEmailChange`) when the authenticated user has `emailVerified: true`, so a custom `AuthService` that
+  omits `emailVerified` no longer counts as verified. This matches the generated Firestore rules, which already
+  required `email_verified == true`. If you mint custom tokens that carry an `email` claim, also set
+  `email_verified: true` on them when the email is genuinely verified.
+
 ## 0.2.1
 
 ### Breaking changes
