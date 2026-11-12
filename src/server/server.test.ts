@@ -1,9 +1,15 @@
 import { describe, it, expect, vi } from "vitest";
-import { GLOBAL_SCOPE, createPermissionPolicy, InMemoryLanyardStore } from "../core/index.js";
+import {
+  EMAIL_NOT_VERIFIED_ERROR_CODE,
+  GLOBAL_SCOPE,
+  createPermissionPolicy,
+  InMemoryLanyardStore
+} from "../core/index.js";
 import {
   createLanyardServer,
   createSecretCipher,
   decryptSecret,
+  EmailNotVerifiedError,
   encryptSecret,
   GoogleAuthService,
   isEncryptedSecretData,
@@ -195,12 +201,27 @@ describe("lanyard/server unit tests", () => {
   ])("treats a token whose email_verified claim is %s as unverified in GoogleAuthService", async (_case, token) => {
     const adminAuth = createFakeAdminAuth();
 
-    await expect(new GoogleAuthService(adminAuth).verifyToken(`Bearer ${token}`)).rejects.toThrow(
-      "Token email must be verified"
-    );
+    const rejection = new GoogleAuthService(adminAuth).verifyToken(`Bearer ${token}`);
+    await expect(rejection).rejects.toThrow("Token email must be verified");
+    await expect(rejection).rejects.toBeInstanceOf(EmailNotVerifiedError);
+    await expect(rejection).rejects.toHaveProperty("code", EMAIL_NOT_VERIFIED_ERROR_CODE);
 
     const lenientUser = await new GoogleAuthService(adminAuth, false).verifyToken(`Bearer ${token}`);
     expect(lenientUser?.emailVerified).toBe(false);
+  });
+
+  it("omits the email-not-verified code from other checkAuth rejections", async () => {
+    const server = createLanyardServer<TestRole, TestCap>({
+      adminAuth: createFakeAdminAuth(),
+      store: new InMemoryLanyardStore<TestRole, TestCap>(),
+      policy: TEST_POLICY
+    });
+    for (const token of ["no-email-token", "bogus-token"]) {
+      const res = createMockRes();
+      await server.checkAuth({ headers: { authorization: `Bearer ${token}` } } as any, res, () => {});
+      expect(res.statusCode).toBe(401);
+      expect(res.body).not.toHaveProperty("code");
+    }
   });
 
   it.each([
@@ -223,7 +244,10 @@ describe("lanyard/server unit tests", () => {
     expect(nextCalled).toBe(false);
     expect(req.user).toBeUndefined();
     expect(res.statusCode).toBe(401);
-    expect(res.body).toEqual({ error: "Unauthorized: Token email must be verified" });
+    expect(res.body).toEqual({
+      error: "Unauthorized: Token email must be verified",
+      code: EMAIL_NOT_VERIFIED_ERROR_CODE
+    });
   });
 
   it.each([

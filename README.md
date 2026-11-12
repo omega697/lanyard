@@ -341,6 +341,22 @@ await lanyard.completePasswordlessSignIn();
 await lanyard.linkSocialProvider("github");
 ```
 
+#### Verifying an Unverified Email
+
+GitHub, and Microsoft work or school accounts, usually sign users in with `emailVerified: false`, and Lanyard's server
+rejects those tokens by default. Its 401 body then carries `code: EMAIL_NOT_VERIFIED_ERROR_CODE`
+(`"auth/email-not-verified"`), so the app can ask the user to verify their address:
+
+```ts
+import { EMAIL_NOT_VERIFIED_ERROR_CODE } from "lanyard/core";
+
+// Emails a verification link for the signed-in user's own address (resolves false if it's already verified)
+await lanyard.sendEmailVerificationLink();
+
+// After the user clicks the link (in any tab or on any device), pick up the verified state and a fresh ID token
+const verified = await lanyard.refreshEmailVerification();
+```
+
 #### Presence Tracking
 
 ```ts

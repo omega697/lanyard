@@ -13,6 +13,18 @@
   required `email_verified == true`. If you mint custom tokens that carry an `email` claim, also set
   `email_verified: true` on them when the email is genuinely verified.
 
+### New
+
+- **Email verification for providers that don't vouch for the address.** `client.sendEmailVerificationLink(redirectUrl?)`
+  emails a Firebase verification link for the signed-in user's own address (it never takes an address, and resolves
+  `false` without sending when the email is already verified). `client.refreshEmailVerification()` reloads the user and
+  forces a fresh ID token, so a verification completed in another tab or on another device reaches `authStore` and the
+  server's `email_verified` check.
+- **A recognizable "email not verified" rejection.** `GoogleAuthService.verifyToken` now throws
+  `EmailNotVerifiedError` (with `code: EMAIL_NOT_VERIFIED_ERROR_CODE`, `"auth/email-not-verified"`, exported from
+  `lanyard/core` and `lanyard/server`), and `checkAuth` includes that `code` in its 401 JSON body alongside the existing
+  `error` message.
+
 ## 0.2.1
 
 ### Breaking changes

@@ -11,6 +11,7 @@ import {
   isSignInWithEmailLink,
   signInWithEmailLink,
   verifyBeforeUpdateEmail,
+  sendEmailVerification,
   applyActionCode,
   fetchSignInMethodsForEmail,
   updateProfile as firebaseUpdateProfile,
@@ -732,6 +733,42 @@ export function createLanyardClient<
       url: redirectUrl ? validateRedirectUrl(redirectUrl) : defaultUrl,
       handleCodeInApp: true
     });
+  }
+
+  /**
+   * Emails a Firebase verification link for the signed-in user's current address, for users whose provider (such as
+   * GitHub, or Microsoft work accounts) doesn't vouch for their email. It never takes an address, so it can't be used
+   * to verify an email the user doesn't already have. By default the link returns to the current page. Resolves
+   * `false` without sending when the address is already verified. Call `refreshEmailVerification` once the user has
+   * clicked the link.
+   */
+  async function sendEmailVerificationLink(redirectUrl?: string): Promise<boolean> {
+    if (!auth || !auth.currentUser) throw new Error("No authenticated user.");
+    const user = auth.currentUser;
+    if (!user.email) throw new Error("The signed-in user has no email address to verify.");
+    const url = redirectUrl
+      ? validateRedirectUrl(redirectUrl)
+      : typeof window !== "undefined"
+        ? `${window.location.origin}${window.location.pathname}${window.location.hash}`
+        : undefined;
+    if (user.emailVerified) return false;
+    await sendEmailVerification(user, url ? { url } : undefined);
+    return true;
+  }
+
+  /**
+   * Reloads the signed-in user and forces a fresh ID token, so a verification completed elsewhere (another tab or
+   * device) reaches both `authStore` and the `email_verified` claim the server checks. Resolves whether the email is
+   * now verified.
+   */
+  async function refreshEmailVerification(): Promise<boolean> {
+    if (!auth || !auth.currentUser) throw new Error("No authenticated user.");
+    const user = auth.currentUser;
+    await user.reload();
+    const tokenResult = await user.getIdTokenResult(true);
+    const normalized = normalizeFirebaseUser(auth.currentUser || user, tokenResult?.claims || {});
+    setActiveUser(normalized);
+    return normalized.emailVerified;
   }
 
   // --- Self-Service Profile & Preferences (Unified with Explicit ScopeId) ---
@@ -1478,6 +1515,8 @@ export function createLanyardClient<
     unlinkSocialProvider,
     getSignInMethodsForEmail,
     sendEmailUpdateVerification,
+    sendEmailVerificationLink,
+    refreshEmailVerification,
     updatePreferences,
     updateProfile,
     getRoles,

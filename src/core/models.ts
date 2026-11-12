@@ -4,6 +4,12 @@
 export type SocialProviderType = "google" | "microsoft" | "github";
 
 /**
+ * Error code a Lanyard server sends (as `code` in its 401 JSON body) when a request's ID token carries an email that
+ * isn't verified, so clients can prompt the user to verify their address instead of showing a generic sign-in failure.
+ */
+export const EMAIL_NOT_VERIFIED_ERROR_CODE = "auth/email-not-verified";
+
+/**
  * Unique symbol identifying the explicit global (unscoped / single-tenant) scope.
  *
  * Because `GLOBAL_SCOPE` is a `symbol`, an untrusted string from an HTTP route parameter

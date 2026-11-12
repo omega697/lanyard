@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, vi } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import * as firebaseAuth from "firebase/auth";
 import * as firebaseFirestore from "firebase/firestore";
 import { createPermissionPolicy, GLOBAL_SCOPE, InMemoryLanyardStore } from "../core/index.js";
@@ -35,6 +35,7 @@ vi.mock("firebase/auth", async () => {
     isSignInWithEmailLink: vi.fn(),
     signInWithEmailLink: vi.fn(),
     verifyBeforeUpdateEmail: vi.fn(),
+    sendEmailVerification: vi.fn(),
     applyActionCode: vi.fn(),
     fetchSignInMethodsForEmail: vi.fn(),
     updateProfile: vi.fn()
@@ -2106,6 +2107,145 @@ describe("lanyard/client unit tests", () => {
     ]);
 
     unsubAdmins();
+    client.destroy();
+  });
+});
+
+describe("lanyard/client email verification", () => {
+  function createSignedInClient(currentUser: Record<string, any> | null) {
+    const fakeAuth: any = { currentUser };
+    vi.mocked(firebaseAuth.onAuthStateChanged).mockImplementation(() => () => {});
+    const client = createLanyardClient<TestRole, TestCap, TestPrefs>({
+      auth: fakeAuth,
+      store: new InMemoryLanyardStore<TestRole, TestCap, TestPrefs>(),
+      defaultPreferences: DEFAULT_PREFS
+    });
+    return { client, fakeAuth };
+  }
+
+  function unverifiedUser(overrides: Record<string, any> = {}) {
+    return {
+      uid: "u-github",
+      email: "Octo@Example.com",
+      emailVerified: false,
+      displayName: "Octo",
+      photoURL: null,
+      providerData: [{ providerId: "github.com" }],
+      reload: vi.fn().mockResolvedValue(undefined),
+      getIdTokenResult: vi.fn().mockResolvedValue({ claims: {} }),
+      ...overrides
+    };
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.stubGlobal("localStorage", new MemoryLocalStorage());
+    vi.stubGlobal("window", {
+      location: {
+        href: "https://app.example.com/campaigns#/c/abc",
+        search: "",
+        origin: "https://app.example.com",
+        pathname: "/campaigns",
+        hash: "#/c/abc"
+      },
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn()
+    });
+    vi.mocked(firebaseAuth.isSignInWithEmailLink).mockReturnValue(false);
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("sends a verification email to the signed-in user's own address, returning to the current page by default", async () => {
+    const user = unverifiedUser();
+    const { client } = createSignedInClient(user);
+
+    await expect(client.sendEmailVerificationLink()).resolves.toBe(true);
+    expect(firebaseAuth.sendEmailVerification).toHaveBeenCalledTimes(1);
+    expect(firebaseAuth.sendEmailVerification).toHaveBeenCalledWith(user, {
+      url: "https://app.example.com/campaigns#/c/abc"
+    });
+    client.destroy();
+  });
+
+  it("uses a validated redirectUrl and rejects unsafe ones without sending", async () => {
+    const user = unverifiedUser();
+    const { client } = createSignedInClient(user);
+
+    await client.sendEmailVerificationLink("https://app.example.com/verified");
+    expect(firebaseAuth.sendEmailVerification).toHaveBeenCalledWith(user, { url: "https://app.example.com/verified" });
+
+    vi.mocked(firebaseAuth.sendEmailVerification).mockClear();
+    await expect(client.sendEmailVerificationLink("javascript:alert(1)")).rejects.toThrow(
+      /protocol must be http: or https:/
+    );
+    await expect(client.sendEmailVerificationLink("not-a-url")).rejects.toThrow(/valid absolute http\(s\) URL/);
+    expect(firebaseAuth.sendEmailVerification).not.toHaveBeenCalled();
+    client.destroy();
+  });
+
+  it("does not send another email when the address is already verified", async () => {
+    const { client } = createSignedInClient(unverifiedUser({ emailVerified: true }));
+
+    await expect(client.sendEmailVerificationLink()).resolves.toBe(false);
+    expect(firebaseAuth.sendEmailVerification).not.toHaveBeenCalled();
+    client.destroy();
+  });
+
+  it("refuses to send when nobody is signed in, the user has no email, or Auth is not initialized", async () => {
+    const signedOut = createSignedInClient(null);
+    await expect(signedOut.client.sendEmailVerificationLink()).rejects.toThrow(/No authenticated user/);
+    signedOut.client.destroy();
+
+    const noEmail = createSignedInClient(unverifiedUser({ email: null }));
+    await expect(noEmail.client.sendEmailVerificationLink()).rejects.toThrow(/no email address/);
+    noEmail.client.destroy();
+
+    const noAuth = createLanyardClient<TestRole, TestCap, TestPrefs>({
+      store: new InMemoryLanyardStore<TestRole, TestCap, TestPrefs>(),
+      defaultPreferences: DEFAULT_PREFS
+    });
+    await expect(noAuth.sendEmailVerificationLink()).rejects.toThrow(/No authenticated user/);
+    noAuth.destroy();
+
+    expect(firebaseAuth.sendEmailVerification).not.toHaveBeenCalled();
+  });
+
+  it("refreshEmailVerification reloads the user, forces a fresh token, and publishes the verified user", async () => {
+    const user = unverifiedUser();
+    user.reload.mockImplementation(async () => {
+      user.emailVerified = true;
+    });
+    user.getIdTokenResult.mockResolvedValue({ claims: { admin: false } });
+    const { client } = createSignedInClient(user);
+
+    await expect(client.refreshEmailVerification()).resolves.toBe(true);
+    expect(user.reload).toHaveBeenCalledTimes(1);
+    expect(user.getIdTokenResult).toHaveBeenCalledWith(true);
+    expect(user.reload.mock.invocationCallOrder[0]).toBeLessThan(user.getIdTokenResult.mock.invocationCallOrder[0]);
+    expect(client.authStore.get().user).toMatchObject({
+      uid: "u-github",
+      email: "octo@example.com",
+      emailVerified: true
+    });
+    client.destroy();
+  });
+
+  it("refreshEmailVerification reports false while the email is still unverified", async () => {
+    const user = unverifiedUser();
+    const { client } = createSignedInClient(user);
+
+    await expect(client.refreshEmailVerification()).resolves.toBe(false);
+    expect(user.getIdTokenResult).toHaveBeenCalledWith(true);
+    expect(client.authStore.get().user?.emailVerified).toBe(false);
+    client.destroy();
+  });
+
+  it("refreshEmailVerification refuses when nobody is signed in", async () => {
+    const { client } = createSignedInClient(null);
+    await expect(client.refreshEmailVerification()).rejects.toThrow(/No authenticated user/);
     client.destroy();
   });
 });

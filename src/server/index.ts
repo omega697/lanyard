@@ -1,5 +1,6 @@
 import type { NextFunction, Request, Response } from "express";
 import {
+  EMAIL_NOT_VERIFIED_ERROR_CODE,
   GLOBAL_SCOPE,
   assertValidResourceId,
   createPermissionPolicy,
@@ -19,7 +20,14 @@ import {
 } from "../core/index.js";
 import { assertStoreMatchesPolicyPlacement, resolveAttributeQueryLocation } from "../core/tierDocs.js";
 
-export { GLOBAL_SCOPE, type GlobalScope, type LanyardActor, type ScopeId, type VerifiedEmailChangeEvent };
+export {
+  EMAIL_NOT_VERIFIED_ERROR_CODE,
+  GLOBAL_SCOPE,
+  type GlobalScope,
+  type LanyardActor,
+  type ScopeId,
+  type VerifiedEmailChangeEvent
+};
 export * from "./encryption.js";
 
 export interface AuthenticatedUser {
@@ -80,14 +88,30 @@ export interface AdminAuthAdapter {
   deleteUser?(uid: string): Promise<void>;
 }
 
+/**
+ * Thrown by `GoogleAuthService.verifyToken` when the token's email isn't verified. `checkAuth` turns it into a 401
+ * whose JSON body carries `code: EMAIL_NOT_VERIFIED_ERROR_CODE`; custom middleware can check `code` the same way.
+ */
+export class EmailNotVerifiedError extends Error {
+  readonly code = EMAIL_NOT_VERIFIED_ERROR_CODE;
+
+  constructor() {
+    super("Token email must be verified");
+    this.name = "EmailNotVerifiedError";
+  }
+}
+
 const SAFE_AUTH_ERROR_PREFIXES = ["Token must contain an email claim", "Token email must be verified"];
 
-function formatClientAuthError(error: unknown): string {
+function formatClientAuthError(error: unknown): { error: string; code?: typeof EMAIL_NOT_VERIFIED_ERROR_CODE } {
+  if (error instanceof EmailNotVerifiedError) {
+    return { error: `Unauthorized: ${error.message}`, code: error.code };
+  }
   const message = error instanceof Error ? error.message : "";
   if (message && SAFE_AUTH_ERROR_PREFIXES.some((prefix) => message.startsWith(prefix))) {
-    return `Unauthorized: ${message}`;
+    return { error: `Unauthorized: ${message}` };
   }
-  return "Unauthorized: Invalid or expired authentication token";
+  return { error: "Unauthorized: Invalid or expired authentication token" };
 }
 
 export class GoogleAuthService implements AuthService {
@@ -112,7 +136,7 @@ export class GoogleAuthService implements AuthService {
       throw new Error("Token must contain an email claim");
     }
     if (this.requireVerifiedEmail && decodedToken.email_verified !== true) {
-      throw new Error("Token email must be verified");
+      throw new EmailNotVerifiedError();
     }
     return {
       uid: decodedToken.uid,
@@ -294,7 +318,7 @@ export function createLanyardServer<
       req.user = user;
       next();
     } catch (error: unknown) {
-      res.status(401).json({ error: formatClientAuthError(error) });
+      res.status(401).json(formatClientAuthError(error));
     }
   }
 
