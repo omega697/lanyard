@@ -202,6 +202,11 @@ export function createLanyardClient<
     staleTokenRetryDelayMs = REVOCATION_CLOCK_SKEW_MS + 1000
   } = config;
   assertStoreMatchesPolicyPlacement(store, resolveCardFields(policy));
+  if (typeof (store as any).subscribeToRevocationEpoch !== "function") {
+    throw new Error(
+      "Lanyard client store must implement subscribeToRevocationEpoch() (required for immediate revocation); verify custom stores with lanyard/testing"
+    );
+  }
 
   const prefStorageKey = `${storageKeyPrefix}_user_preferences`;
   const emailForSignInKey = `${storageKeyPrefix}_emailForSignIn`;
@@ -250,6 +255,10 @@ export function createLanyardClient<
   let unsubAttributes: (() => void) | null = null;
   let unsubMemberships: (() => void) | null = null;
   let unsubAuth: (() => void) | null = null;
+  let unsubRevocationEpoch: (() => void) | null = null;
+  // Newest revocation epoch seen for the active user, and whether a proactive refresh loop is running
+  let latestRevocationEpochMs: number | null = null;
+  let proactiveRefreshRunning = false;
   let authGeneration = 0;
 
   // The user's own attributes are split between card-placed keys (on the card) and the `attributes` tier
@@ -324,6 +333,11 @@ export function createLanyardClient<
   }
 
   function cleanupUserSubscriptions(): void {
+    if (unsubRevocationEpoch) {
+      unsubRevocationEpoch();
+      unsubRevocationEpoch = null;
+    }
+    latestRevocationEpochMs = null;
     if (unsubUser) {
       unsubUser();
       unsubUser = null;
@@ -364,6 +378,48 @@ export function createLanyardClient<
   }
 
   /**
+   * While a user is signed in, watches the revocation epoch and refreshes their token as soon as a revocation supersedes
+   * it, so their next request (and Firestore access) already uses current claims. If the epoch can't be read (for
+   * example, rules not yet regenerated), `authorizedFetch` still refreshes on demand.
+   */
+  function watchRevocationEpoch(uid: string): void {
+    const generation = authGeneration;
+    const unsubscribe = store.subscribeToRevocationEpoch(
+      (epochMs) => {
+        if (epochMs === null || generation !== authGeneration) return;
+        latestRevocationEpochMs = Math.max(latestRevocationEpochMs ?? 0, epochMs);
+        if (!proactiveRefreshRunning) void refreshPastRevocations(uid, generation);
+      },
+      () => {}
+    );
+    unsubRevocationEpoch = typeof unsubscribe === "function" ? unsubscribe : null;
+  }
+
+  async function refreshPastRevocations(uid: string, generation: number): Promise<void> {
+    proactiveRefreshRunning = true;
+    try {
+      for (;;) {
+        const user = auth?.currentUser;
+        const target = latestRevocationEpochMs;
+        if (!user || user.uid !== uid || generation !== authGeneration || target === null) return;
+        const { claims } = await user.getIdTokenResult();
+        if (Number(claims.iat) * 1000 <= target + REVOCATION_CLOCK_SKEW_MS) {
+          // A token minted before then would still be stale, so wait until a new one will be past the revocation
+          const waitMs = target + REVOCATION_CLOCK_SKEW_MS + 1000 - Date.now();
+          if (waitMs > 0) await new Promise((resolve) => setTimeout(resolve, waitMs));
+          if (generation !== authGeneration || auth?.currentUser?.uid !== uid) return;
+          await refreshTokenAndClaims(user);
+        }
+        if (latestRevocationEpochMs === target) return;
+      }
+    } catch {
+      // Best effort: authorizedFetch refreshes on demand if the server reports the token stale
+    } finally {
+      proactiveRefreshRunning = false;
+    }
+  }
+
+  /**
    * Programmatically sets the authenticated user (useful in tests or custom auth flows)
    * and wires up reactive store subscriptions for `users/{uid}`, preferences, memberships, and avatar syncing.
    */
@@ -383,6 +439,7 @@ export function createLanyardClient<
 
     authStoreInternal.set({ user, isReady: true });
     membershipsStoreInternal.set({ memberships: [], isLoading: true });
+    watchRevocationEpoch(user.uid);
 
     const globalUserSyncKey = `user:${user.uid}`;
 

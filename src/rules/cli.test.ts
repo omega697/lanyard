@@ -106,10 +106,15 @@ describe("lanyard-rules CLI", () => {
   });
 
   it("prints the generated block with the given collection names", async () => {
-    expect(await runRulesCli(["--policy", "./policy.js", "--export", "appPolicy", "--scopes", "campaigns"], io)).toBe(
-      0
+    expect(
+      await runRulesCli(
+        ["--policy", "./policy.js", "--export", "appPolicy", "--scopes", "campaigns", "--meta", "app_meta"],
+        io
+      )
+    ).toBe(0);
+    expect(out.join("")).toBe(
+      generateFirestoreRules(policy, { scopeCollection: "campaigns", metaCollection: "app_meta" })
     );
-    expect(out.join("")).toBe(generateFirestoreRules(policy, { scopeCollection: "campaigns" }));
     expect(err).toEqual([]);
   });
 

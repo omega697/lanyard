@@ -32,6 +32,17 @@ function matchBlock(rules: string, path: string): string {
 }
 
 describe("generateFirestoreRules", () => {
+  it("lets signed-in clients read only the revocation epoch from Lanyard's metadata collection", () => {
+    const rules = generateFirestoreRules(makePolicy());
+    expect(matchBlock(rules, "/lanyard_meta/revocation")).toContain("allow get: if isSignedIn();");
+    expect(matchBlock(rules, "/lanyard_meta/{document}")).toContain("allow read, write: if false;");
+    expect(rules).not.toMatch(/match \/lanyard_meta\/session_revocations/);
+
+    const custom = generateFirestoreRules(makePolicy(), { metaCollection: "app_meta" });
+    expect(matchBlock(custom, "/app_meta/revocation")).toContain("allow get: if isSignedIn();");
+    expect(() => generateFirestoreRules(makePolicy(), { metaCollection: "bad/name" })).toThrow(/metaCollection/);
+  });
+
   it("emits closed-world role inheritance and capability lookup maps and capability-based tier rules", () => {
     const rules = generateFirestoreRules(makePolicy());
     // Role inheritance map expands every role to the sorted concrete roles that satisfy it

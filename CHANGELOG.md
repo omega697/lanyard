@@ -17,6 +17,16 @@
   `lanyard/core` (still exported from `lanyard/server`) alongside the new `SessionRevokedError` and `TokenStaleError`,
   each with a `code`, so browser code can check `instanceof`.
 
+- **Proactive refresh after revocations.** While a user is signed in, the client watches the revocation epoch and, as
+  soon as a revocation supersedes their token, waits until a new token would be past it and refreshes, publishing the
+  new claims to `authStore`. A demoted admin's UI, next request and Firestore access use `admin: false` without waiting
+  for a 401. If the epoch can't be read, `authorizedFetch` still refreshes on demand. `createLanyardClient` now throws if
+  the store lacks `subscribeToRevocationEpoch`.
+- **Generated rules cover Lanyard's metadata collection.** Signed-in users may `get` the revocation epoch
+  (`{metaCollection}/revocation`, needed for proactive refresh); everything else there, including session revocations,
+  is server-only. `generateFirestoreRules` takes a `metaCollection` option and `lanyard-rules` a `--meta` flag (default
+  `lanyard_meta`). Regenerate your rules.
+
 ### Breaking changes
 
 - **`checkAuth` enforces revocations, and requires token times.** It now rejects, before any store lookup:

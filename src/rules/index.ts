@@ -1,4 +1,9 @@
-import type { CustomDocAccessRule, PermissionPolicy } from "../core/index.js";
+import {
+  DEFAULT_LANYARD_META_COLLECTION,
+  REVOCATION_EPOCH_DOC_ID,
+  type CustomDocAccessRule,
+  type PermissionPolicy
+} from "../core/index.js";
 
 /** Collection names the generated rules match (they must equal the ones passed to the Firestore stores). */
 export interface FirestoreRulesOptions {
@@ -8,6 +13,8 @@ export interface FirestoreRulesOptions {
   scopeCollection?: string;
   /** Members subcollection under each scope (defaults to `"members"`). */
   membersSubcollection?: string;
+  /** Lanyard's metadata collection, holding the revocation epoch (defaults to `"lanyard_meta"`). */
+  metaCollection?: string;
 }
 
 const COLLECTION_NAME = /^[A-Za-z0-9_-]+$/;
@@ -53,6 +60,10 @@ export function generateFirestoreRules<TRole extends string, TCapability extends
   const usersCollection = assertCollectionName(options.usersCollection ?? "users", "usersCollection");
   const scopeCollection = assertCollectionName(options.scopeCollection ?? "workspaces", "scopeCollection");
   const membersSubcollection = assertCollectionName(options.membersSubcollection ?? "members", "membersSubcollection");
+  const metaCollection = assertCollectionName(
+    options.metaCollection ?? DEFAULT_LANYARD_META_COLLECTION,
+    "metaCollection"
+  );
 
   const allRoles = (Object.keys(policy.roles) as TRole[]).sort();
   const concreteRoles = [...policy.assignableRoles].sort();
@@ -300,6 +311,15 @@ ${customDocBlocks(true).join("\n")}
         resource.data._lanyard.scopeId == null
           ? ${globalStaffExpr}
           : ${scopedStaffExpr("resource.data._lanyard.scopeId")});
+    }
+
+    // Lanyard metadata is written only by the server. Signed-in clients may read the revocation epoch so they can
+    // refresh tokens that predate a revocation before their next request; session revocations stay server-only.
+    match /${metaCollection}/{document} {
+      allow read, write: if false;
+    }
+    match /${metaCollection}/${REVOCATION_EPOCH_DOC_ID} {
+      allow get: if isSignedIn();
     }
 `;
 }

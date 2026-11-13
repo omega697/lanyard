@@ -2185,6 +2185,72 @@ service cloud.firestore {
       }
     }, 60_000);
 
+    it("under the generated rules, signed-in clients can read only the revocation epoch, and refresh to new claims on their own when it moves", async () => {
+      const suffix = Date.now();
+      const usersCollection = `users_proactive_${suffix}`;
+      const metaCollection = `meta_proactive_${suffix}`;
+      const rules = `rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+${generateFirestoreRules(createPermissionPolicy({}), { usersCollection, metaCollection })}
+  }
+}
+`;
+      const rulesRes = await fetch(`http://127.0.0.1:${emulatorPort}/emulator/v1/projects/${projectId}:securityRules`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ rules: { files: [{ name: "firestore.rules", content: rules }] } })
+      });
+      expect(rulesRes.status).toBe(200);
+
+      const serverStore = new FirestoreServerStore({ db: adminDb, usersCollection, metaCollection });
+      await serverStore.bumpRevocationEpoch(Date.now() - 60_000);
+      await serverStore.recordSessionRevocation("u-someone-else", Date.now() - 60_000);
+
+      const user = await signInEmulatorUser("u-proactive", "proactive@example.com", { admin: true });
+      const signedOutApp = initializeClientApp({ projectId, apiKey: "fake-api-key" }, `client-signed-out-${suffix}`);
+      const signedOutDb = getClientFirestore(signedOutApp);
+      connectFirestoreEmulator(signedOutDb, "127.0.0.1", emulatorPort);
+      const lanyard = createLanyardClient({
+        auth: user.auth,
+        store: new FirestoreClientStore({ db: user.db, usersCollection, metaCollection }),
+        defaultPreferences: {}
+      });
+      try {
+        // Rules: the epoch is readable when signed in; session revocations never; clients can't write either
+        await clientGetDoc(clientDoc(user.db, `${metaCollection}/revocation`));
+        await expect(clientGetDoc(clientDoc(signedOutDb, `${metaCollection}/revocation`))).rejects.toMatchObject({
+          code: "permission-denied"
+        });
+        await expect(clientGetDoc(clientDoc(user.db, `${metaCollection}/session_revocations`))).rejects.toMatchObject({
+          code: "permission-denied"
+        });
+        await expect(
+          clientSetDoc(clientDoc(user.db, `${metaCollection}/revocation`), { lastRevocationAtMs: 0 })
+        ).rejects.toMatchObject({ code: "permission-denied" });
+
+        // A demotion: the claim changes in Firebase, then the epoch moves. No request is made.
+        await crossSecondBoundary();
+        await adminAuth.setCustomUserClaims("u-proactive", { admin: false });
+        const epoch = await serverStore.bumpRevocationEpoch(Date.now());
+
+        let claims = (await user.user.getIdTokenResult()).claims;
+        const deadline = Date.now() + 15_000;
+        while (claims.admin !== false && Date.now() < deadline) {
+          await new Promise((resolve) => setTimeout(resolve, 200));
+          claims = (await user.user.getIdTokenResult()).claims;
+        }
+        expect(claims.admin).toBe(false);
+        expect(Number(claims.iat) * 1000).toBeGreaterThan(epoch + REVOCATION_CLOCK_SKEW_MS);
+        expect(user.auth.currentUser?.uid).toBe("u-proactive");
+      } finally {
+        lanyard.destroy();
+        await terminate(signedOutDb);
+        await deleteClientApp(signedOutApp);
+        await user.close();
+      }
+    }, 60_000);
+
     knownVulnerability(
       "KNOWN VULNERABILITY: generated rules keep honoring a demoted admin's stale claim",
       async () => {
