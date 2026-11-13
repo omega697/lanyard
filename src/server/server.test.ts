@@ -145,6 +145,10 @@ function createFakeAdminAuth(): FakeAdminAuth {
     async updateUser(uid, properties) {
       updatedUsersByUid.set(uid, properties);
     },
+    // Like Firebase, reports each user's current custom claims (the admin authority for actors checkAuth didn't verify)
+    async getUser(uid: string) {
+      return { uid, customClaims: claimsByUid.get(uid) ?? null };
+    },
     async deleteUser(uid) {
       deletedUids.add(uid);
       for (const [email, rec] of usersByEmail.entries()) {
@@ -160,8 +164,6 @@ function createFakeAdminAuth(): FakeAdminAuth {
     const now = Math.floor(Date.now() / 1000);
     return { iat: now, auth_time: now - 60, ...(await verifyClaims(idToken)) };
   };
-  // Like Firebase, reports each user's current custom claims (the admin authority for actors checkAuth didn't verify)
-  fake.getUser = async (uid: string) => ({ uid, customClaims: claimsByUid.get(uid) ?? null });
   return fake;
 }
 

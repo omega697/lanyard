@@ -44,7 +44,8 @@ function fakeAdminAuth(): AdminAuthAdapter & { revoked: string[] } {
     setCustomUserClaims: async () => {},
     revokeRefreshTokens: async (uid: string) => {
       revoked.push(uid);
-    }
+    },
+    getUser: async (uid: string) => ({ uid, customClaims: {} })
   };
 }
 

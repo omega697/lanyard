@@ -29,6 +29,18 @@
 
 ### Breaking changes
 
+- **Non-admins can't manage system admins, judged by the Firebase claim.** The guards that stop a non-admin with
+  `userCapabilities.write` / `assignRoles` from editing, re-roling or deleting a system admin used to check the
+  store's `isSystemAdmin` flag, and only in `GLOBAL_SCOPE`. So an admin whose record lacked the flag (for example one
+  promoted in the Firebase console or by a script) could be edited, re-roled, or deleted (including their Firebase
+  Auth account) by staff, and the scoped paths had no guard at all.
+
+  `updateUserProfile`, `updateUserRoles` and `deleteUser` now check the target's current admin claim, globally and in
+  scopes. This fails closed: if the claim can't be read, the target is treated as an admin. A target with no Firebase
+  account (`auth/user-not-found`) can't hold the claim, so it can still be managed. `AdminAuthAdapter.getUser` is now
+  required (Firebase Admin's `Auth` has it), and `createLanyardServer` throws without it rather than quietly treating
+  every hand-built actor as a non-admin and every target as an admin.
+
 - **Only `checkAuth` produces `isAdmin`; nothing else can create or alter it.** Before:
   - `GoogleAuthService.verifyToken` returned `isAdmin` straight from the token claim, which isn't freshness-checked;
   - `createLanyardServer` returned its `authService`, so it was easy to build middleware that trusted a demoted or
@@ -124,7 +136,7 @@ currentEmail }` (someone is already signed in; their session is left alone) or `
   - `checkAuth` takes `req.user.isAdmin` from the verified token claim (kept current by the revocation checks) and
     never reads or writes admin records; admin status no longer depends on the store being reachable;
   - `requireAdmin` trusts `req.user.isAdmin` only on a `req.user` that `checkAuth` verified; for any other object it asks
-    Firebase for the user's current claim (`AdminAuthAdapter.getUser`, newly optional) and fails closed if it can't;
+    Firebase for the user's current claim (`AdminAuthAdapter.getUser`) and fails closed if it can't;
   - actor-based server methods do the same: `actor.isAdmin` on a hand-built actor is ignored in favor of the user's
     current Firebase claim (pass `req.user` to avoid the lookup);
   - `setSystemAdminStatus` demotions bump the revocation epoch after changing the claim, so the demoted user's existing

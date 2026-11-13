@@ -2292,7 +2292,8 @@ ${generateFirestoreRules(createPermissionPolicy({}), { usersCollection, metaColl
         createUser: (properties: any) => adminAuth.createUser(properties),
         setCustomUserClaims: (uid: string, claims: Record<string, any> | null) =>
           adminAuth.setCustomUserClaims(uid, claims),
-        revokeRefreshTokens: (uid: string) => adminAuth.revokeRefreshTokens(uid)
+        revokeRefreshTokens: (uid: string) => adminAuth.revokeRefreshTokens(uid),
+        getUser: (uid: string) => adminAuth.getUser(uid)
       };
     }
 
@@ -2733,6 +2734,65 @@ ${generateFirestoreRules(createPermissionPolicy({}), { usersCollection, metaColl
         await expect(store.patchUser("u-nobody", { firstName: "X" })).rejects.toThrow();
         await expect(store.patchScopeMember("org-1", "u-nobody", { firstName: "X" })).rejects.toThrow();
         expect((await adminDb.doc(`users_lost_update_${suffix}/u-nobody`).get()).exists).toBe(false);
+      } finally {
+        server.close();
+      }
+    }, 30_000);
+
+    it("FIXED: staff with user-management rights can't delete an admin known only by their Firebase claim", async () => {
+      const suffix = Date.now();
+      type Role = "member" | "staff";
+      const policy = createPermissionPolicy<Role, "manage">({
+        roles: { member: { capabilities: [] }, staff: { inherits: ["member"], capabilities: ["manage"] } },
+        userCapabilities: { write: "manage" }
+      });
+      const store = new FirestoreServerStore<Role, "manage">({
+        db: adminDb,
+        usersCollection: `users_target_admin_${suffix}`,
+        metaCollection: `meta_target_admin_${suffix}`
+      });
+      const server = createLanyardServer({ adminAuth: adminAuth as any, store, policy });
+      const adminUid = `u-claim-admin-${suffix}`;
+      await adminAuth.createUser({ uid: adminUid, email: `claim-admin-${suffix}@example.com`, emailVerified: true });
+      await adminAuth.setCustomUserClaims(adminUid, { admin: true });
+      await store.upsertUser({ uid: "u-ta-staff", email: "ta-staff@example.com", roles: ["staff"] });
+      // The admin's record carries no isSystemAdmin flag (promoted through the console or a script)
+      await store.upsertUser({ uid: adminUid, email: `claim-admin-${suffix}@example.com`, roles: ["member"] });
+      // A user record with no Firebase account (real firebase-admin reports auth/user-not-found for it)
+      await store.upsertUser({ uid: `u-no-account-${suffix}`, email: `no-account-${suffix}@example.com`, roles: [] });
+      try {
+        await expect(
+          server.deleteUser({
+            scopeId: GLOBAL_SCOPE,
+            actor: { uid: "u-ta-staff" },
+            targetUid: adminUid,
+            confirmTargetEmail: `claim-admin-${suffix}@example.com`
+          })
+        ).rejects.toThrow(/Forbidden/);
+        expect((await adminAuth.getUser(adminUid)).customClaims?.admin).toBe(true);
+        expect(await store.getUser(adminUid)).not.toBeNull();
+
+        // A record with no Firebase account can't hold the claim: real firebase-admin reports auth/user-not-found,
+        // which the guard recognizes, so staff can still manage it
+        await server.updateUserProfile({
+          scopeId: GLOBAL_SCOPE,
+          actor: { uid: "u-ta-staff" },
+          targetUid: `u-no-account-${suffix}`,
+          patch: { firstName: "Nobody" }
+        });
+        expect((await store.getUser(`u-no-account-${suffix}`))?.firstName).toBe("Nobody");
+
+        // An ordinary account (no claim) can be deleted
+        const plainUid = `u-ta-plain-${suffix}`;
+        await adminAuth.createUser({ uid: plainUid, email: `ta-plain-${suffix}@example.com`, emailVerified: true });
+        await store.upsertUser({ uid: plainUid, email: `ta-plain-${suffix}@example.com`, roles: [] });
+        await server.deleteUser({
+          scopeId: GLOBAL_SCOPE,
+          actor: { uid: "u-ta-staff" },
+          targetUid: plainUid,
+          confirmTargetEmail: `ta-plain-${suffix}@example.com`
+        });
+        expect(await store.getUser(plainUid)).toBeNull();
       } finally {
         server.close();
       }

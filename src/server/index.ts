@@ -125,8 +125,11 @@ export interface AdminAuthAdapter {
   deleteUser?(uid: string): Promise<void>;
   /** Revokes the user's refresh tokens (required by `revokeUserSessions`). */
   revokeRefreshTokens?(uid: string): Promise<void>;
-  /** Reads a user's current custom claims (used to check admin status of actors not verified by `checkAuth`). */
-  getUser?(uid: string): Promise<{ uid: string; customClaims?: Record<string, any> | null }>;
+  /**
+   * Required: reads a user's current custom claims, which decide whether hand-built actors and the targets of user
+   * management are admins. Firebase Admin's `Auth` provides it.
+   */
+  getUser(uid: string): Promise<{ uid: string; customClaims?: Record<string, any> | null }>;
 }
 
 /**
@@ -355,6 +358,11 @@ export function createLanyardServer<
     revocationResubscribeDelayMs = 1000
   } = config;
   assertStoreMatchesPolicyPlacement(store, policy.cardFields);
+  if (typeof adminAuth?.getUser !== "function") {
+    throw new Error(
+      "createLanyardServer requires adminAuth.getUser to read users' admin claims (Firebase Admin's Auth has it)"
+    );
+  }
   for (const method of ["patchUser", "patchScopeMember"] as const) {
     if (typeof (store as any)[method] !== "function") {
       throw new Error(
@@ -439,12 +447,33 @@ export function createLanyardServer<
 
   /** Whether Firebase currently gives `uid` the admin claim. Fails closed if it can't be confirmed. */
   async function firebaseClaimIsAdmin(uid: string): Promise<boolean> {
-    if (typeof adminAuth.getUser !== "function") return false;
     try {
       const record = await adminAuth.getUser(uid);
       return record?.customClaims?.admin === true;
     } catch {
       return false;
+    }
+  }
+
+  /**
+   * Whether a *target* may be a system admin, for guards that stop non-admins from managing admins. Uses the current
+   * Firebase claim (the store's directory flag isn't authoritative), and fails closed the other way from actor checks:
+   * if the claim can't be read, the target is treated as an admin. A target with no Firebase account can't be one.
+   */
+  async function targetMayBeAdmin(uid: string): Promise<boolean> {
+    try {
+      const record = await adminAuth.getUser(uid);
+      return record?.customClaims?.admin === true;
+    } catch (error: any) {
+      return error?.code !== "auth/user-not-found";
+    }
+  }
+
+  /** Throws unless the actor is an admin or the target can't be one (see `targetMayBeAdmin`). */
+  async function assertMayManageTarget(actorIsAdmin: boolean, targetUid: string, action: string): Promise<void> {
+    if (actorIsAdmin) return;
+    if (await targetMayBeAdmin(targetUid)) {
+      throw new Error(`Forbidden: Non-system administrators cannot ${action} a system administrator`);
     }
   }
 
@@ -1327,9 +1356,7 @@ export function createLanyardServer<
       if (!existing) {
         throw new Error(`Target user '${params.targetUid}' not found`);
       }
-      if (!isAdmin && !isSelf && existing.isSystemAdmin === true) {
-        throw new Error("Forbidden: Non-system administrators cannot modify a system administrator");
-      }
+      if (!isSelf) await assertMayManageTarget(isAdmin, params.targetUid, "modify");
 
       const fields = profileFieldsToWrite(params.patch || {}, existing);
       // Only the edited fields are written, so roles or admin status changed since `existing` was read stay changed
@@ -1356,6 +1383,7 @@ export function createLanyardServer<
     if (!existing) {
       throw new Error(`Target member '${params.targetUid}' not found in scope '${params.scopeId}'`);
     }
+    if (!isSelf) await assertMayManageTarget(isAdmin, params.targetUid, "modify");
 
     await store.patchScopeMember(params.scopeId, params.targetUid, profileFieldsToWrite(params.patch || {}, existing));
     return (await store.getScopeMember(params.scopeId, params.targetUid))!;
@@ -1414,9 +1442,7 @@ export function createLanyardServer<
       if (!existing) {
         throw new Error(`Target user '${params.targetUid}' not found`);
       }
-      if (!isAdmin && existing.isSystemAdmin === true) {
-        throw new Error("Forbidden: Non-system administrators cannot modify a system administrator");
-      }
+      await assertMayManageTarget(isAdmin, params.targetUid, "modify");
 
       const updated: UserRecord<TRole, TCapability, TPreferences, TAttributes> = {
         ...existing,
@@ -1439,6 +1465,7 @@ export function createLanyardServer<
     if (!existing) {
       throw new Error(`Target member '${params.targetUid}' not found in scope '${params.scopeId}'`);
     }
+    await assertMayManageTarget(isAdmin, params.targetUid, "modify");
 
     const updated: ScopedMember<TRole, TCapability, TPreferences, TAttributes> = {
       ...existing,
@@ -1498,9 +1525,7 @@ export function createLanyardServer<
           throw new Error(`Target user '${params.targetUid}' not found`);
         }
       } else {
-        if (!isSelf && !isAdmin && targetUser.isSystemAdmin === true) {
-          throw new Error("Forbidden: Non-system administrators cannot delete a system administrator");
-        }
+        if (!isSelf) await assertMayManageTarget(isAdmin, params.targetUid, "delete");
         const targetEmail = (targetUser.email || "").toLowerCase().trim();
         if (!targetEmail || targetEmail !== cleanConfirmEmail) {
           throw new Error(
@@ -1532,6 +1557,7 @@ export function createLanyardServer<
         throw new Error(`Target member '${params.targetUid}' not found in scope '${params.scopeId}'`);
       }
     } else {
+      if (!isSelf) await assertMayManageTarget(isAdmin, params.targetUid, "remove");
       const targetEmail = (targetMember.email || "").toLowerCase().trim();
       if (!targetEmail || targetEmail !== cleanConfirmEmail) {
         throw new Error(
