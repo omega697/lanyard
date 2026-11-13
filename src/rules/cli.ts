@@ -19,6 +19,8 @@ Generates the Lanyard Firestore security rules for a PermissionPolicy.
   --scopes <name>        scopeCollection (default: "workspaces")
   --members <name>       membersSubcollection (default: "members")
   --meta <name>          metaCollection, Lanyard's metadata (default: "lanyard_meta")
+  --require-verified-email <true|false>
+                         Require email_verified for signed-in access (default: true)
   --write <rules file>   Replace the block between the lanyard-rules markers in this file
   --check <rules file>   Exit with an error if that block is out of date
   (with neither --write nor --check, the generated block is printed)
@@ -44,6 +46,13 @@ export const defaultRulesCliIo: RulesCliIo = {
   stderr: (text) => process.stderr.write(text)
 };
 
+function parseBooleanFlag(value: string | undefined, flag: string): boolean | undefined {
+  if (value === undefined) return undefined;
+  if (value === "true") return true;
+  if (value === "false") return false;
+  throw new Error(`${flag} must be 'true' or 'false'`);
+}
+
 function parseArgs(argv: readonly string[]): Map<string, string> {
   const args = new Map<string, string>();
   for (let i = 0; i < argv.length; i++) {
@@ -59,7 +68,18 @@ function parseArgs(argv: readonly string[]): Map<string, string> {
     args.set(flag.slice(2), value);
     i++;
   }
-  const known = new Set(["help", "policy", "export", "users", "scopes", "members", "meta", "write", "check"]);
+  const known = new Set([
+    "help",
+    "policy",
+    "export",
+    "users",
+    "scopes",
+    "members",
+    "meta",
+    "require-verified-email",
+    "write",
+    "check"
+  ]);
   for (const key of args.keys()) {
     if (!known.has(key)) throw new Error(`Unknown option '--${key}'`);
   }
@@ -99,7 +119,8 @@ export async function runRulesCli(argv: readonly string[], io: RulesCliIo = defa
       usersCollection: args.get("users"),
       scopeCollection: args.get("scopes"),
       membersSubcollection: args.get("members"),
-      metaCollection: args.get("meta")
+      metaCollection: args.get("meta"),
+      requireVerifiedEmail: parseBooleanFlag(args.get("require-verified-email"), "--require-verified-email")
     };
 
     const checkPath = args.get("check");

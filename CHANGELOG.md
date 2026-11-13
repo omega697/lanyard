@@ -29,6 +29,12 @@
 
 ### Breaking changes
 
+- **Generated Firestore rules enforce revocations on `isAdmin()` and require a verified email by default.**
+  - `isAdmin()` now checks that the token was issued after the revocation epoch (`request.auth.token.iat * 1000 > revocationEpochMs() + 2000`) and that its session hasn't been revoked (`request.auth.token.auth_time * 1000 > sessionRevokedAtMs() + 2000`), so a demoted or signed-out admin loses Firestore admin access at once instead of when their token expires.
+  - `isSignedIn()` now requires `request.auth.token.get('email_verified', false) == true` by default, matching `checkAuth`. Pass `requireVerifiedEmail: false` to `generateFirestoreRules` (or `--require-verified-email false` to `lanyard-rules`) only if your app deliberately serves unverified users.
+
+  Regenerate your rules.
+
 - **The Firebase `admin` claim is the only admin authority.** Admin status used to be resolved from the store first
   (`users/{uid}.isSystemAdmin`, then `system_admins`) with the token claim as a fallback, and `checkAuth`/`requireAdmin`
   auto-provisioned an admin record (`syncAdminProfileIfNeeded`) for anyone they judged an admin. Together those let a

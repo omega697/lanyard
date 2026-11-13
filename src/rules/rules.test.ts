@@ -32,6 +32,35 @@ function matchBlock(rules: string, path: string): string {
 }
 
 describe("generateFirestoreRules", () => {
+  /** Returns the body of a generated rules function, e.g. `isAdmin`. */
+  function fnBody(rules: string, name: string): string {
+    const start = rules.indexOf(`function ${name}(`);
+    expect(start).toBeGreaterThanOrEqual(0);
+    return rules.slice(start, rules.indexOf("\n    }", start));
+  }
+
+  it("makes isAdmin() refuse admin tokens issued before the revocation epoch or from a revoked session", () => {
+    const rules = generateFirestoreRules(makePolicy(), { metaCollection: "app_meta" });
+    const isAdmin = fnBody(rules, "isAdmin");
+    expect(isAdmin).toContain("request.auth.token.get('admin', false) == true");
+    expect(isAdmin).toContain("request.auth.token.iat * 1000 > revocationEpochMs() + 2000");
+    expect(isAdmin).toContain("request.auth.token.auth_time * 1000 > sessionRevokedAtMs() + 2000");
+    expect(fnBody(rules, "revocationEpochMs")).toContain("/databases/$(database)/documents/app_meta/revocation");
+    expect(fnBody(rules, "revocationEpochMs")).toContain("'lastRevocationAtMs'");
+    expect(fnBody(rules, "sessionRevokedAtMs")).toContain(
+      "/databases/$(database)/documents/app_meta/session_revocations"
+    );
+    expect(fnBody(rules, "sessionRevokedAtMs")).toContain("'revokedAtMs'");
+  });
+
+  it("requires a verified email in isSignedIn() by default, with an explicit opt-out", () => {
+    expect(fnBody(generateFirestoreRules(makePolicy()), "isSignedIn")).toContain(
+      "request.auth.token.get('email_verified', false) == true"
+    );
+    const lenient = fnBody(generateFirestoreRules(makePolicy(), { requireVerifiedEmail: false }), "isSignedIn");
+    expect(lenient).not.toContain("email_verified");
+    expect(lenient).toContain("request.auth != null");
+  });
   it("lets signed-in clients read only the revocation epoch from Lanyard's metadata collection", () => {
     const rules = generateFirestoreRules(makePolicy());
     expect(matchBlock(rules, "/lanyard_meta/revocation")).toContain("allow get: if isSignedIn();");

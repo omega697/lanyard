@@ -420,12 +420,14 @@ describe.skipIf(!emulatorsAvailable)(
         db: adminDb,
         defaultRoles: ["attendee"],
         usersCollection: "users_st",
+        metaCollection: "lanyard_meta_st",
         encryptionKey: "emulator-test-master-encryption-key"
       });
       const clientStore = new FirestoreClientStore<Role, Cap, Prefs, Attrs>({
         db: clientDb,
         defaultRoles: ["attendee"],
-        usersCollection: "users_st"
+        usersCollection: "users_st",
+        metaCollection: "lanyard_meta_st"
       });
 
       const server = createLanyardServer<Role, Cap, Prefs, Attrs, HiddenAttrs, Secrets>({
@@ -1180,6 +1182,7 @@ ${block}
         const unsubUser = memberStore.subscribeToUser("u-member", (u) => userEvents.push(u));
         const unsubPrefs = memberStore.subscribeToPreferences("u-member", (p) => prefEvents.push(p));
 
+        await clientGetDoc(clientDoc(memberClient.db, "users", "u-member"));
         await new Promise((r) => setTimeout(r, 150));
         expect(userEvents.at(-1)?.uid).toBe("u-member");
         expect(userEvents.at(-1)?.roles).toEqual(["member"]);
@@ -1832,7 +1835,7 @@ ${block}
         await terminate(sysAdminClient.db);
         await deleteClientApp(sysAdminClient.app);
       }
-    });
+    }, 30_000);
 
     // Grounds the revocation design in real Firebase Auth behavior instead of assumptions. Runs last because it
     // replaces the emulator's security rules.
@@ -1935,13 +1938,7 @@ service cloud.firestore {
       }
     }, 30_000);
 
-    // --- Known vulnerabilities, reproduced with real Auth emulator tokens ---
-    // Each test asserts the SECURE outcome and is marked `it.fails` while the attack still works. The commit that
-    // fixes a vulnerability must flip its test to `it`, so a fix that doesn't stop the attack can't land. `it.fails`
-    // also passes when a test breaks for an unrelated reason, so run with LANYARD_SHOW_VULNERABILITIES=1 to execute
-    // them as ordinary tests and confirm each fails at its secure-outcome assertion.
-    const knownVulnerability = process.env.LANYARD_SHOW_VULNERABILITIES ? it : it.fails;
-
+    // --- Attack reproductions, verified against real Auth emulator tokens ---
     async function signInEmulatorUser(uid: string, email: string, claims?: Record<string, unknown>) {
       await adminAuth.createUser({ uid, email, emailVerified: true });
       if (claims) await adminAuth.setCustomUserClaims(uid, claims);
@@ -2272,59 +2269,97 @@ ${generateFirestoreRules(createPermissionPolicy({}), { usersCollection, metaColl
       }
     }, 60_000);
 
-    knownVulnerability(
-      "KNOWN VULNERABILITY: generated rules keep honoring a demoted admin's stale claim",
-      async () => {
-        const usersCollection = `users_rules_${Date.now()}`;
-        const rules = `rules_version = '2';
+    it("FIXED: generated rules reject a demoted admin's stale claim, a revoked admin session, and an unverified user", async () => {
+      const suffix = Date.now();
+      const usersCollection = `users_rules_${suffix}`;
+      const metaCollection = `meta_rules_${suffix}`;
+      const rules = `rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
-${generateFirestoreRules(createPermissionPolicy({}), { usersCollection })}
+${generateFirestoreRules(createPermissionPolicy({}), { usersCollection, metaCollection })}
   }
 }
 `;
-        const rulesRes = await fetch(
-          `http://127.0.0.1:${emulatorPort}/emulator/v1/projects/${projectId}:securityRules`,
-          {
-            method: "PUT",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ rules: { files: [{ name: "firestore.rules", content: rules }] } })
-          }
-        );
-        expect(rulesRes.status).toBe(200);
-        await adminDb.doc(`${usersCollection}/u-rules-victim/private/preferences`).set({ theme: "dark" });
+      const rulesRes = await fetch(`http://127.0.0.1:${emulatorPort}/emulator/v1/projects/${projectId}:securityRules`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ rules: { files: [{ name: "firestore.rules", content: rules }] } })
+      });
+      expect(rulesRes.status).toBe(200);
+      await adminDb.doc(`${usersCollection}/u-rules-victim/private/preferences`).set({ theme: "dark" });
 
-        const store = new FirestoreServerStore({
-          db: adminDb,
-          usersCollection,
-          metaCollection: `meta_rules_${Date.now()}`
-        });
-        const server = createLanyardServer({ adminAuth: adminAuth as any, store });
-        await adminAuth.createUser({
-          uid: "u-rules-other-admin",
-          email: "rules-other-admin@example.com",
-          emailVerified: true
-        });
-        await adminAuth.setCustomUserClaims("u-rules-other-admin", { admin: true });
-        const demoted = await signInEmulatorUser("u-rules-admin", "rules-admin@example.com", { admin: true });
-        try {
-          // As an admin they can read another user's private preferences
-          await clientGetDoc(clientDoc(demoted.db, `${usersCollection}/u-rules-victim/private/preferences`));
-          await server.setSystemAdminStatus({
-            email: "rules-admin@example.com",
-            isAdmin: false,
-            actor: { uid: "u-rules-other-admin", isAdmin: true }
-          });
+      const store = new FirestoreServerStore({
+        db: adminDb,
+        usersCollection,
+        metaCollection
+      });
+      const server = createLanyardServer({ adminAuth: adminAuth as any, store });
+      await adminAuth.createUser({
+        uid: "u-rules-other-admin",
+        email: "rules-other-admin@example.com",
+        emailVerified: true
+      });
+      await adminAuth.setCustomUserClaims("u-rules-other-admin", { admin: true });
+      const demoted = await signInEmulatorUser("u-rules-admin", "rules-admin@example.com", { admin: true });
+      const revokedAdmin = await signInEmulatorUser("u-rules-revoked-admin", "rules-revoked-admin@example.com", {
+        admin: true
+      });
+      await adminAuth.createUser({
+        uid: "u-rules-unverified",
+        email: "rules-unverified@example.com",
+        emailVerified: false,
+        password: "emulator-test-password"
+      });
+      const unverifiedApp = initializeClientApp({ projectId, apiKey: "fake-api-key" }, `client-u-rules-unverified`);
+      const unverifiedAuth = getClientAuth(unverifiedApp);
+      connectAuthEmulator(unverifiedAuth, `http://127.0.0.1:${authEmulatorPort}`, { disableWarnings: true });
+      await signInWithEmailAndPassword(unverifiedAuth, "rules-unverified@example.com", "emulator-test-password");
+      const unverifiedDb = getClientFirestore(unverifiedApp);
+      connectFirestoreEmulator(unverifiedDb, "127.0.0.1", emulatorPort);
+      await adminDb.doc(`${usersCollection}/u-rules-unverified`).set({ uid: "u-rules-unverified" });
 
-          // Secure outcome: denied right after demotion. Today the stale claim keeps working for up to an hour.
-          await expect(
-            clientGetDoc(clientDoc(demoted.db, `${usersCollection}/u-rules-victim/private/preferences`))
-          ).rejects.toMatchObject({ code: "permission-denied" });
-        } finally {
-          await demoted.close();
-        }
-      },
-      30_000
-    );
+      try {
+        // 1. Demotion: as an admin they can read another user's private preferences until setSystemAdminStatus demotes them
+        await clientGetDoc(clientDoc(demoted.db, `${usersCollection}/u-rules-victim/private/preferences`));
+        await crossSecondBoundary();
+        await server.setSystemAdminStatus({
+          email: "rules-admin@example.com",
+          isAdmin: false,
+          actor: { uid: "u-rules-other-admin" }
+        });
+
+        // Denied right after demotion, even though the client still holds the un-refreshed admin:true token
+        await expect(
+          clientGetDoc(clientDoc(demoted.db, `${usersCollection}/u-rules-victim/private/preferences`))
+        ).rejects.toMatchObject({ code: "permission-denied" });
+
+        // 2. Session revocation: wait past the demotion's epoch skew, refresh the second admin so their iat is fresh,
+        //    then revoke their sessions. Even if they refresh again (new iat, same auth_time), rules deny them.
+        await new Promise((resolve) => setTimeout(resolve, REVOCATION_CLOCK_SKEW_MS + 1100));
+        await revokedAdmin.user.getIdToken(true);
+        await clientGetDoc(clientDoc(revokedAdmin.db, `${usersCollection}/u-rules-victim/private/preferences`));
+        await crossSecondBoundary();
+        await server.revokeUserSessions({ uid: "u-rules-revoked-admin", actor: { uid: "u-rules-other-admin" } });
+        await expect(
+          clientGetDoc(clientDoc(revokedAdmin.db, `${usersCollection}/u-rules-victim/private/preferences`))
+        ).rejects.toMatchObject({ code: "permission-denied" });
+        await crossSecondBoundary();
+        await revokedAdmin.user.getIdToken(true).catch(() => null);
+        await expect(
+          clientGetDoc(clientDoc(revokedAdmin.db, `${usersCollection}/u-rules-victim/private/preferences`))
+        ).rejects.toMatchObject({ code: "permission-denied" });
+
+        // 3. Unverified email: by default (requireVerifiedEmail: true), even isOwner(uid) reads/writes are denied
+        await expect(
+          clientGetDoc(clientDoc(unverifiedDb, `${usersCollection}/u-rules-unverified`))
+        ).rejects.toMatchObject({ code: "permission-denied" });
+      } finally {
+        server.close();
+        await terminate(unverifiedDb);
+        await deleteClientApp(unverifiedApp);
+        await revokedAdmin.close();
+        await demoted.close();
+      }
+    }, 30_000);
   }
 );
