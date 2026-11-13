@@ -616,6 +616,15 @@ export interface UserProfilePatch {
   photoUrl?: string | null;
 }
 
+/**
+ * Fields trusted server code can change on an existing user or member record with `patchUser` /
+ * `patchScopeMember`: the profile fields plus the (verified) email. Never roles, admin status, attributes, or
+ * preferences, so a sync or profile edit can't write back a stale copy of them.
+ */
+export interface StoredProfileFieldsPatch extends UserProfilePatch {
+  email?: string;
+}
+
 /** Message of the error thrown when a profile patch tries to set `email`. */
 export const PROFILE_EMAIL_NOT_WRITABLE_MESSAGE =
   "email can't be changed through a profile update: it's synced from the user's verified Firebase Auth email";
@@ -979,6 +988,12 @@ export interface LanyardServerStore<
   getUser?(uid: string): Promise<UserRecord<TRole, TCapability, TPreferences, TAttributes> | null>;
   listUsers?(): Promise<UserRecord<TRole, TCapability, TPreferences, TAttributes>[]>;
   upsertUser?(user: UserRecord<TRole, TCapability, TPreferences, TAttributes>): Promise<void>;
+  /**
+   * Required: Changes only the given profile fields (and email) of an existing `users/{uid}` record, leaving everything
+   * else, notably roles and `isSystemAdmin`, untouched; throws if the user doesn't exist. Syncs and profile edits use
+   * this so they can never write back a stale copy of a field another request just changed.
+   */
+  patchUser(uid: string, fields: StoredProfileFieldsPatch): Promise<void>;
   deleteUser?(uid: string): Promise<void>;
   updateUserAttributes?(
     uid: string,
@@ -1032,6 +1047,8 @@ export interface LanyardServerStore<
     scopeId: string,
     member: ScopedMember<TRole, TCapability, TPreferences, TAttributes>
   ): Promise<void>;
+  /** Required: Like `patchUser`, for an existing member of `scopeId`; throws if they aren't a member. */
+  patchScopeMember(scopeId: string, uid: string, fields: StoredProfileFieldsPatch): Promise<void>;
   updateScopeMemberAttributes?(
     scopeId: string,
     uid: string,

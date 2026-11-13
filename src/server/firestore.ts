@@ -20,6 +20,7 @@ import {
   TIER_METADATA_KEY,
   type ScopedMember,
   type SecretCipher,
+  type StoredProfileFieldsPatch,
   type SystemAdminProfile,
   type UserRecord
 } from "../core/index.js";
@@ -516,6 +517,35 @@ export class FirestoreServerStore<
       ...(Object.keys(cardAttributes).length > 0 ? { attributes: cardAttributes } : {})
     });
     await this.userDocRef(cleanUid).set(payload, { merge: true });
+  }
+
+  /**
+   * Card fields for a `patchUser`/`patchScopeMember` call: only the given profile fields (sanitized) and, when it lives
+   * on the card, the email.
+   */
+  private profilePatchCardFields(fields: StoredProfileFieldsPatch): Record<string, any> {
+    return stripUndefinedFields({
+      firstName: typeof fields.firstName === "string" ? fields.firstName : undefined,
+      lastName: typeof fields.lastName === "string" ? fields.lastName : undefined,
+      displayName: typeof fields.displayName === "string" ? fields.displayName : undefined,
+      ...(fields.photoUrl !== undefined ? { photoUrl: sanitizeAvatarUrl(fields.photoUrl) } : {}),
+      ...this.cardEmailField(fields.email),
+      updatedAt: new Date().toISOString()
+    });
+  }
+
+  async patchUser(uid: string, fields: StoredProfileFieldsPatch): Promise<void> {
+    const cleanUid = assertValidFirestoreDocId(uid, "uid");
+    // update() fails if the card doesn't exist, so a patch never creates a phantom user
+    await this.userDocRef(cleanUid).update(this.profilePatchCardFields(fields));
+    await this.writeAttributesTier(cleanUid, null, undefined, fields.email);
+  }
+
+  async patchScopeMember(scopeId: string, uid: string, fields: StoredProfileFieldsPatch): Promise<void> {
+    const cleanScopeId = assertValidFirestoreDocId(scopeId, "scopeId");
+    const cleanUid = assertValidFirestoreDocId(uid, "uid");
+    await this.memberDocRef(cleanScopeId, cleanUid).update(this.profilePatchCardFields(fields));
+    await this.writeAttributesTier(cleanUid, cleanScopeId, undefined, fields.email);
   }
 
   async updateUserAttributes(

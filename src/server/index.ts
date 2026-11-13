@@ -19,6 +19,7 @@ import {
   type ScopeId,
   type ScopedMember,
   type SystemAdminProfile,
+  type StoredProfileFieldsPatch,
   type UserProfilePatch,
   type UserRecord,
   type VerifiedEmailChangeEvent
@@ -207,6 +208,29 @@ function formatClientAuthError(error: unknown): { error: string; code?: typeof E
   return { error: "Unauthorized: Invalid or expired authentication token" };
 }
 
+/**
+ * The profile fields a patch changes, trimmed and sanitized. When only the first or last name changes, `displayName`
+ * is recomputed from the resulting names (falling back to the current display name if both are empty).
+ */
+function profileFieldsToWrite(
+  patch: UserProfilePatch,
+  existing: { firstName?: string; lastName?: string; displayName?: string }
+): StoredProfileFieldsPatch {
+  const fields: StoredProfileFieldsPatch = {};
+  if (typeof patch.firstName === "string") fields.firstName = patch.firstName.trim();
+  if (typeof patch.lastName === "string") fields.lastName = patch.lastName.trim();
+  if (typeof patch.displayName === "string") {
+    fields.displayName = patch.displayName.trim();
+  } else if (fields.firstName !== undefined || fields.lastName !== undefined) {
+    const firstName = fields.firstName ?? existing.firstName;
+    const lastName = fields.lastName ?? existing.lastName;
+    const computed = [firstName, lastName].filter(Boolean).join(" ").trim();
+    if (computed || existing.displayName !== undefined) fields.displayName = computed || existing.displayName;
+  }
+  if (patch.photoUrl !== undefined) fields.photoUrl = sanitizeAvatarUrl(patch.photoUrl);
+  return fields;
+}
+
 export class GoogleAuthService implements AuthService {
   constructor(
     private readonly adminAuth: Pick<AdminAuthAdapter, "verifyIdToken">,
@@ -304,6 +328,13 @@ export function createLanyardServer<
     revocationResubscribeDelayMs = 1000
   } = config;
   assertStoreMatchesPolicyPlacement(store, policy.cardFields);
+  for (const method of ["patchUser", "patchScopeMember"] as const) {
+    if (typeof (store as any)[method] !== "function") {
+      throw new Error(
+        `Lanyard server store must implement ${method}() (syncs and profile edits write only the fields they change)`
+      );
+    }
+  }
   for (const method of [
     "getRevocationEpoch",
     "bumpRevocationEpoch",
@@ -442,8 +473,7 @@ export function createLanyardServer<
           userRecord &&
           user.email &&
           user.emailVerified === true &&
-          (userRecord.email || "").toLowerCase() !== user.email.toLowerCase() &&
-          (typeof onVerifiedEmailChange === "function" || typeof store.upsertUser === "function")
+          (userRecord.email || "").toLowerCase() !== user.email.toLowerCase()
         ) {
           const syncKey = `${user.uid}:${user.email.toLowerCase()}`;
           let syncPromise = inFlightEmailSyncs.get(syncKey);
@@ -459,15 +489,9 @@ export function createLanyardServer<
                   previousEmail
                 });
               }
-              if (typeof store.upsertUser === "function") {
-                const updatedRecord = {
-                  ...userRecord,
-                  email: nextEmail,
-                  updatedAt: new Date().toISOString()
-                };
-                await store.upsertUser(updatedRecord);
-                req.userRecord = updatedRecord;
-              }
+              // Only the email is written, so a role or admin change made since userRecord was read can't be undone
+              await store.patchUser(user.uid, { email: nextEmail });
+              req.userRecord = { ...userRecord, email: nextEmail };
             })().finally(() => {
               inFlightEmailSyncs.delete(syncKey);
             });
@@ -561,10 +585,9 @@ export function createLanyardServer<
             });
           }
 
-          if (userRecord && req.user.photoUrl && userRecord.photoUrl !== req.user.photoUrl && store.upsertUser) {
-            const updated = { ...userRecord, photoUrl: req.user.photoUrl };
-            req.userRecord = updated;
-            await store.upsertUser(updated);
+          if (userRecord && req.user.photoUrl && userRecord.photoUrl !== req.user.photoUrl) {
+            req.userRecord = { ...userRecord, photoUrl: req.user.photoUrl };
+            await store.patchUser(req.user.uid, { photoUrl: req.user.photoUrl });
           }
 
           next();
@@ -599,9 +622,8 @@ export function createLanyardServer<
         }
 
         if (member && req.user.photoUrl && member.photoUrl !== req.user.photoUrl) {
-          const updated = { ...member, photoUrl: req.user.photoUrl };
-          req.scopeMember = updated;
-          await store.upsertScopeMember(scopeId, updated);
+          req.scopeMember = { ...member, photoUrl: req.user.photoUrl };
+          await store.patchScopeMember(scopeId, req.user.uid, { photoUrl: req.user.photoUrl });
         }
 
         next();
@@ -652,10 +674,9 @@ export function createLanyardServer<
             });
           }
 
-          if (userRecord && req.user.photoUrl && userRecord.photoUrl !== req.user.photoUrl && store.upsertUser) {
-            const updated = { ...userRecord, photoUrl: req.user.photoUrl };
-            req.userRecord = updated;
-            await store.upsertUser(updated);
+          if (userRecord && req.user.photoUrl && userRecord.photoUrl !== req.user.photoUrl) {
+            req.userRecord = { ...userRecord, photoUrl: req.user.photoUrl };
+            await store.patchUser(req.user.uid, { photoUrl: req.user.photoUrl });
           }
 
           next();
@@ -690,9 +711,8 @@ export function createLanyardServer<
         }
 
         if (member && req.user.photoUrl && member.photoUrl !== req.user.photoUrl) {
-          const updated = { ...member, photoUrl: req.user.photoUrl };
-          req.scopeMember = updated;
-          await store.upsertScopeMember(scopeId, updated);
+          req.scopeMember = { ...member, photoUrl: req.user.photoUrl };
+          await store.patchScopeMember(scopeId, req.user.uid, { photoUrl: req.user.photoUrl });
         }
 
         next();
@@ -1216,7 +1236,7 @@ export function createLanyardServer<
   }
 
   /**
-   * Updates a user's profile fields (`firstName`, `lastName`, `displayName`, `photoUrl`, `email`) in
+   * Updates a user's profile fields (`firstName`, `lastName`, `displayName`, `photoUrl`; never the email) in
    * `GLOBAL_SCOPE` (`users/{targetUid}`) or a specific tenant `scopeId` after verifying the caller (`actor`)
    * is the user themselves, holds the `write` capability in `userCapabilities` within that scope,
    * or is an active system admin. When `scopeId === GLOBAL_SCOPE`, also syncs `displayName` to Firebase Auth.
@@ -1259,8 +1279,8 @@ export function createLanyardServer<
     const actorUid = params.actor.uid;
 
     if (params.scopeId === GLOBAL_SCOPE) {
-      if (typeof store.getUser !== "function" || typeof store.upsertUser !== "function") {
-        throw new Error("Backing store does not implement getUser / upsertUser");
+      if (typeof store.getUser !== "function") {
+        throw new Error("Backing store does not implement getUser");
       }
       const isSelf = actorUid === params.targetUid;
       if (!isSelf && !policy.canWriteUser(actorGlobalRecord, isAdmin)) {
@@ -1274,31 +1294,15 @@ export function createLanyardServer<
         throw new Error("Forbidden: Non-system administrators cannot modify a system administrator");
       }
 
-      const patch = params.patch || {};
-      const firstName = typeof patch.firstName === "string" ? patch.firstName.trim() : existing.firstName;
-      const lastName = typeof patch.lastName === "string" ? patch.lastName.trim() : existing.lastName;
-      const computedDisplayName = [firstName, lastName].filter(Boolean).join(" ").trim();
-      const displayName =
-        typeof patch.displayName === "string"
-          ? patch.displayName.trim()
-          : typeof patch.firstName === "string" || typeof patch.lastName === "string"
-            ? computedDisplayName || existing.displayName
-            : existing.displayName;
-      const photoUrl = patch.photoUrl !== undefined ? sanitizeAvatarUrl(patch.photoUrl) : existing.photoUrl;
-
-      const updated: UserRecord<TRole, TCapability, TPreferences, TAttributes> = {
-        ...existing,
-        uid: params.targetUid,
-        ...(firstName !== undefined ? { firstName } : {}),
-        ...(lastName !== undefined ? { lastName } : {}),
-        ...(displayName !== undefined ? { displayName } : {}),
-        ...(photoUrl !== undefined ? { photoUrl } : {}),
-        updatedAt: new Date().toISOString()
-      };
-
-      await store.upsertUser(updated);
-      if (displayName && displayName !== existing.displayName && typeof adminAuth.updateUser === "function") {
-        await adminAuth.updateUser(params.targetUid, { displayName }).catch(() => {});
+      const fields = profileFieldsToWrite(params.patch || {}, existing);
+      // Only the edited fields are written, so roles or admin status changed since `existing` was read stay changed
+      await store.patchUser(params.targetUid, fields);
+      if (
+        fields.displayName &&
+        fields.displayName !== existing.displayName &&
+        typeof adminAuth.updateUser === "function"
+      ) {
+        await adminAuth.updateUser(params.targetUid, { displayName: fields.displayName }).catch(() => {});
       }
       return (await store.getUser(params.targetUid))!;
     }
@@ -1316,28 +1320,7 @@ export function createLanyardServer<
       throw new Error(`Target member '${params.targetUid}' not found in scope '${params.scopeId}'`);
     }
 
-    const patch = params.patch || {};
-    const firstName = typeof patch.firstName === "string" ? patch.firstName.trim() : existing.firstName;
-    const lastName = typeof patch.lastName === "string" ? patch.lastName.trim() : existing.lastName;
-    const computedDisplayName = [firstName, lastName].filter(Boolean).join(" ").trim();
-    const displayName =
-      typeof patch.displayName === "string"
-        ? patch.displayName.trim()
-        : typeof patch.firstName === "string" || typeof patch.lastName === "string"
-          ? computedDisplayName || existing.displayName
-          : existing.displayName;
-    const photoUrl = patch.photoUrl !== undefined ? sanitizeAvatarUrl(patch.photoUrl) : existing.photoUrl;
-
-    const updated: ScopedMember<TRole, TCapability, TPreferences, TAttributes> = {
-      ...existing,
-      uid: params.targetUid,
-      ...(firstName !== undefined ? { firstName } : {}),
-      ...(lastName !== undefined ? { lastName } : {}),
-      ...(displayName !== undefined ? { displayName } : {}),
-      ...(photoUrl !== undefined ? { photoUrl } : {})
-    };
-
-    await store.upsertScopeMember(params.scopeId, updated);
+    await store.patchScopeMember(params.scopeId, params.targetUid, profileFieldsToWrite(params.patch || {}, existing));
     return (await store.getScopeMember(params.scopeId, params.targetUid))!;
   }
 

@@ -15,6 +15,7 @@ import type {
   SessionRevocationsListener,
   ScopedMember,
   SecretCipher,
+  StoredProfileFieldsPatch,
   SubscribeToMembersOptions,
   SubscribeToUsersOptions,
   SystemAdminProfile,
@@ -557,6 +558,41 @@ export class InMemoryLanyardStore<
     };
     this.users.set(user.uid, merged);
     this.notifyUserListeners(user.uid);
+  }
+
+  /** Applies a `patchUser`/`patchScopeMember` field patch to a card, routing a private email to its tier. */
+  private applyProfileFieldsPatch<
+    R extends
+      | UserRecord<TRole, TCapability, TPreferences, TAttributes>
+      | ScopedMember<TRole, TCapability, TPreferences, TAttributes>
+  >(card: R, scopeId: string | null, uid: string, fields: StoredProfileFieldsPatch): R {
+    this.writeAttributesTier(scopeId, uid, {}, fields.email);
+    return {
+      ...card,
+      ...(typeof fields.firstName === "string" ? { firstName: fields.firstName } : {}),
+      ...(typeof fields.lastName === "string" ? { lastName: fields.lastName } : {}),
+      ...(typeof fields.displayName === "string" ? { displayName: fields.displayName } : {}),
+      ...(fields.photoUrl !== undefined ? { photoUrl: sanitizeAvatarUrl(fields.photoUrl) } : {}),
+      ...(this.cardFields.email && typeof fields.email === "string" ? { email: fields.email } : {}),
+      updatedAt: new Date().toISOString()
+    };
+  }
+
+  async patchUser(uid: string, fields: StoredProfileFieldsPatch): Promise<void> {
+    assertValidResourceId(uid, "uid");
+    const existing = this.users.get(uid);
+    if (!existing) throw new Error(`User '${uid}' does not exist.`);
+    this.users.set(uid, this.applyProfileFieldsPatch(existing, null, uid, fields));
+    this.notifyUserListeners(uid);
+  }
+
+  async patchScopeMember(scopeId: string, uid: string, fields: StoredProfileFieldsPatch): Promise<void> {
+    assertValidResourceId(scopeId, "scopeId");
+    assertValidResourceId(uid, "uid");
+    const existing = this.scopeMembers.get(scopeId)?.get(uid);
+    if (!existing) throw new Error(`Member '${uid}' does not exist in scope '${scopeId}'.`);
+    this.scopeMembers.get(scopeId)!.set(uid, this.applyProfileFieldsPatch(existing, scopeId, uid, fields));
+    this.notifyMembershipListeners(scopeId, uid);
   }
 
   async updateUserAttributes(

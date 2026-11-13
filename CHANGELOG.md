@@ -29,6 +29,19 @@
 
 ### Breaking changes
 
+- **Syncs and profile edits write only the fields they change, so they can't undo a revocation.** `checkAuth`'s
+  verified-email sync, the avatar sync in `requireRole` / `requireCapability`, and `updateUserProfile` used to write
+  back the whole record they had read. That record included `roles` and `isSystemAdmin`. If an admin revoked a role
+  or demoted the user while the request was in flight, the stale copy restored them (and, with read-time default
+  roles, persisted those).
+
+  Server stores now require `patchUser(uid, fields)` and `patchScopeMember(scopeId, uid, fields)`:
+  - they change only profile fields and email (`StoredProfileFieldsPatch`), never roles, admin status, attributes or
+    preferences;
+  - they throw if the record doesn't exist, rather than creating one;
+  - `FirestoreServerStore` and `InMemoryLanyardStore` implement them, and `createLanyardServer` throws if a store
+    lacks them.
+
 - **Email is server-owned: clients never write it.** Only provisioning (`upsertUserByEmail`) and the server's
   verified-email sync in `checkAuth` write a user's stored email. Before, the client wrote it too, which caused two
   problems:

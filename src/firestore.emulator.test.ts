@@ -2663,6 +2663,79 @@ ${generateFirestoreRules(createPermissionPolicy({}), { usersCollection, metaColl
       }
     }, 30_000);
 
+    it("FIXED: an avatar or email sync that read a user before a role revocation or demotion doesn't undo it on real Firestore", async () => {
+      const suffix = Date.now();
+      type Role = "member" | "manager";
+      const policy = createPermissionPolicy<Role, "edit">({
+        roles: { member: { capabilities: [] }, manager: { inherits: ["member"], capabilities: ["edit"] } }
+      });
+      const store = new FirestoreServerStore<Role, "edit">({
+        db: adminDb,
+        usersCollection: `users_lost_update_${suffix}`,
+        scopeCollection: `orgs_lost_update_${suffix}`,
+        metaCollection: `meta_lost_update_${suffix}`
+      });
+      await store.upsertUser({ uid: "u-lu", email: "lu-old@example.com", roles: ["manager"], isSystemAdmin: true });
+      await store.upsertScopeMember("org-1", { uid: "u-lu", email: "lu-old@example.com", roles: ["manager"] });
+      const server = createLanyardServer({
+        adminAuth: adminAuth as any,
+        store,
+        policy,
+        authService: {
+          async verifyToken() {
+            const t = Math.floor(Date.now() / 1000);
+            return {
+              uid: "u-lu",
+              email: "lu-new@example.com",
+              emailVerified: true,
+              photoUrl: "https://example.com/lu.png",
+              isAdmin: false,
+              tokenIssuedAtSeconds: t,
+              authTimeSeconds: t - 60
+            };
+          }
+        }
+      });
+      /** The next read of `method` returns what it read before `interleave` ran (a concurrent admin change). */
+      const interleaveAfterNextRead = (method: "getUser" | "getScopeMember", interleave: () => Promise<void>) => {
+        const original = (store as any)[method].bind(store);
+        vi.spyOn(store, method).mockImplementationOnce(async (...args: any[]) => {
+          const snapshot = await original(...args);
+          await interleave();
+          return snapshot;
+        });
+      };
+      try {
+        // checkAuth's verified-email sync read the record, then the user was demoted and lost their role
+        interleaveAfterNextRead("getUser", async () => {
+          await store.revokeUserRoles("u-lu", ["manager"]);
+          await store.deleteSystemAdmin("u-lu");
+        });
+        const authed = await runMiddleware(server.checkAuth, "unused");
+        expect(authed.nextCalled).toBe(true);
+        let stored = await store.getUser("u-lu");
+        expect(stored?.email).toBe("lu-new@example.com");
+        expect(stored?.roles).toEqual([]);
+        expect(stored?.isSystemAdmin).toBe(false);
+
+        // requireRole's scoped avatar sync read the member, then their scope role was revoked
+        await store.grantScopeRoles("org-1", "u-lu", ["manager"]);
+        interleaveAfterNextRead("getScopeMember", () => store.revokeScopeRoles("org-1", "u-lu", ["manager"]));
+        authed.req.params = { scopeId: "org-1" };
+        await runMiddleware(server.requireRole("member"), "unused", authed.req);
+        const member = await store.getScopeMember("org-1", "u-lu");
+        expect(member?.photoUrl).toBe("https://example.com/lu.png");
+        expect(member?.roles).toEqual([]);
+
+        // patchUser/patchScopeMember never create records
+        await expect(store.patchUser("u-nobody", { firstName: "X" })).rejects.toThrow();
+        await expect(store.patchScopeMember("org-1", "u-nobody", { firstName: "X" })).rejects.toThrow();
+        expect((await adminDb.doc(`users_lost_update_${suffix}/u-nobody`).get()).exists).toBe(false);
+      } finally {
+        server.close();
+      }
+    }, 30_000);
+
     it("FIXED: with cardFields.email, an owner can't put a different address on their card", async () => {
       const usersCollection = `users_card_email_${Date.now()}`;
       const policy = createPermissionPolicy({ cardFields: { email: true } });
