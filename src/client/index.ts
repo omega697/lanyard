@@ -21,6 +21,8 @@ import {
 } from "firebase/auth";
 import {
   EMAIL_NOT_VERIFIED_ERROR_CODE,
+  EmailLinkInvalidError,
+  EmailLinkMismatchError,
   EmailNotVerifiedError,
   GLOBAL_SCOPE,
   REVOCATION_CLOCK_SKEW_MS,
@@ -139,6 +141,19 @@ export interface AuthState {
   user: LanyardUser | null;
   isReady: boolean;
 }
+
+/**
+ * Outcome of `completePasswordlessSignIn`:
+ * - `signed-in`: the link was completed;
+ * - `needs-email`: a valid link, but no usable email on this device: ask the user for the address it was sent to;
+ * - `signed-in-as-other`: someone (`currentEmail`) is already signed in, so the link wasn't used: ask before switching;
+ * - `not-a-link`: the URL isn't a sign-in link (an ordinary page load).
+ */
+export type PasswordlessSignInResult =
+  | { status: "signed-in"; user: LanyardUser }
+  | { status: "needs-email" }
+  | { status: "signed-in-as-other"; currentEmail: string }
+  | { status: "not-a-link" };
 
 export interface MembershipsState<
   TRole extends string = string,
@@ -614,11 +629,10 @@ export function createLanyardClient<
   // Wire up Firebase Auth listener if an Auth instance is provided
   if (auth && typeof onAuthStateChanged === "function") {
     try {
-      // Auto-handle magic email link or verifyEmail action code on boot
+      // Auto-handle a verifyEmail action code on boot. Magic sign-in links are never completed automatically: the app
+      // calls completePasswordlessSignIn() and handles each outcome (such as asking for the email).
       if (typeof window !== "undefined") {
-        if (isSignInWithEmailLink(auth, window.location.href)) {
-          completePasswordlessSignIn().catch(() => {});
-        } else if (window.location.search.includes("mode=verifyEmail")) {
+        if (window.location.search.includes("mode=verifyEmail")) {
           const params = new URLSearchParams(window.location.search);
           const oobCode = params.get("oobCode");
           if (oobCode) {
@@ -690,10 +704,12 @@ export function createLanyardClient<
       throw new Error("Please enter a valid email address.");
     }
 
+    // The link never carries the email: completing it uses the email stored below, or asks the user (see
+    // completePasswordlessSignIn)
     const defaultUrl =
       typeof window !== "undefined"
-        ? `${window.location.origin}${window.location.pathname}?email=${encodeURIComponent(targetEmail)}${window.location.hash}`
-        : `http://localhost:5173/?email=${encodeURIComponent(targetEmail)}`;
+        ? `${window.location.origin}${window.location.pathname}${window.location.hash}`
+        : "http://localhost:5173/";
 
     const actionCodeSettings = {
       url: redirectUrl ? validateRedirectUrl(redirectUrl) : defaultUrl,
@@ -707,40 +723,79 @@ export function createLanyardClient<
     }
   }
 
-  async function completePasswordlessSignIn(providedEmail?: string, href?: string): Promise<LanyardUser | null> {
-    if (!auth) throw new Error("Firebase Auth is not initialized");
-    const targetHref = href || (typeof window !== "undefined" ? window.location.href : "");
-    if (!targetHref || !isSignInWithEmailLink(auth, targetHref)) return null;
-
-    let urlEmail: string | null = null;
+  /** Removes the sign-in link's parameters from the address bar, so a reload doesn't retry a finished link. */
+  function clearSignInLinkFromAddressBar(): void {
+    if (typeof window === "undefined" || typeof window.history?.replaceState !== "function") return;
     try {
-      const parsedUrl = new URL(targetHref);
-      urlEmail = parsedUrl.searchParams.get("email");
+      const url = new URL(window.location.href);
+      for (const key of ["apiKey", "oobCode", "mode", "lang", "continueUrl", "tenantId", "email"]) {
+        url.searchParams.delete(key);
+      }
+      window.history.replaceState(window.history.state, "", `${url.pathname}${url.search}${url.hash}`);
     } catch {}
+  }
 
-    const email =
-      providedEmail ||
-      urlEmail ||
-      (typeof localStorage !== "undefined" ? localStorage.getItem(emailForSignInKey) : null) ||
-      auth.currentUser?.email;
+  /**
+   * Completes a magic sign-in link (`href`, default: the current page) and reports the outcome; call it when the app
+   * starts. The email comes only from `email` (typed by the user) or the one this device stored when it requested the
+   * link, never from the link itself: otherwise anyone could sign a visitor into their own account by sending them one
+   * of their links. When neither is available, or the stored email belongs to a different link, it resolves
+   * `{ status: "needs-email" }` and the app should ask the user for the address the link was sent to (never prefilled)
+   * and call this again with `{ email }`. If someone is already signed in, it doesn't replace their session; it resolves
+   * `{ status: "signed-in-as-other" }` so the app can ask before switching accounts (sign out, then call this again).
+   *
+   * Throws `EmailLinkMismatchError` when a typed email doesn't match the link (the link stays usable) and
+   * `EmailLinkInvalidError` when the link has expired or was already used.
+   */
+  async function completePasswordlessSignIn(
+    options: { email?: string; href?: string } = {}
+  ): Promise<PasswordlessSignInResult> {
+    if (!auth) throw new Error("Firebase Auth is not initialized");
+    const fromAddressBar = !options.href;
+    const targetHref = options.href || (typeof window !== "undefined" ? window.location.href : "");
+    if (!targetHref || !isSignInWithEmailLink(auth, targetHref)) return { status: "not-a-link" };
 
-    if (!email) return null;
+    // On page load currentUser stays null until Firebase restores the saved session, so wait for it before deciding
+    // nobody is signed in (otherwise the link would replace a signed-in user's session)
+    await auth.authStateReady();
+    const currentEmail = auth.currentUser?.email;
+    if (auth.currentUser) {
+      return { status: "signed-in-as-other", currentEmail: currentEmail ? currentEmail.toLowerCase().trim() : "" };
+    }
 
-    const result = await signInWithEmailLink(auth, email.toLowerCase().trim(), targetHref);
+    const typedEmail = options.email?.toLowerCase().trim();
+    const storedEmail = typeof localStorage !== "undefined" ? localStorage.getItem(emailForSignInKey) : null;
+    const email = typedEmail || storedEmail?.toLowerCase().trim();
+    if (!email) return { status: "needs-email" };
+
+    let result: Awaited<ReturnType<typeof signInWithEmailLink>>;
+    try {
+      result = await signInWithEmailLink(auth, email, targetHref);
+    } catch (error: any) {
+      if (error?.code === "auth/invalid-email") {
+        if (typedEmail) throw new EmailLinkMismatchError();
+        // This device's stored email belongs to a different link (e.g. someone else's): forget it and ask the user
+        if (typeof localStorage !== "undefined") localStorage.removeItem(emailForSignInKey);
+        return { status: "needs-email" };
+      }
+      if (error?.code === "auth/invalid-action-code" || error?.code === "auth/expired-action-code") {
+        if (fromAddressBar) clearSignInLinkFromAddressBar();
+        throw new EmailLinkInvalidError();
+      }
+      throw error;
+    }
     if (typeof localStorage !== "undefined") {
       localStorage.removeItem(emailForSignInKey);
     }
-    if (result?.user) {
-      let claims: Record<string, any> = {};
-      try {
-        const tokenResult = await result.user.getIdTokenResult();
-        claims = tokenResult?.claims || {};
-      } catch {}
-      const normalized = normalizeFirebaseUser(result.user, claims);
-      setActiveUser(normalized);
-      return normalized;
-    }
-    return null;
+    if (fromAddressBar) clearSignInLinkFromAddressBar();
+    let claims: Record<string, any> = {};
+    try {
+      const tokenResult = await result.user.getIdTokenResult();
+      claims = tokenResult?.claims || {};
+    } catch {}
+    const normalized = normalizeFirebaseUser(result.user, claims);
+    setActiveUser(normalized);
+    return { status: "signed-in", user: normalized };
   }
 
   async function signOut(): Promise<void> {
@@ -795,9 +850,7 @@ export function createLanyardClient<
     }
 
     const defaultUrl =
-      typeof window !== "undefined"
-        ? `${window.location.origin}${window.location.pathname}?email=${encodeURIComponent(targetEmail)}`
-        : `http://localhost:5173/?email=${encodeURIComponent(targetEmail)}`;
+      typeof window !== "undefined" ? `${window.location.origin}${window.location.pathname}` : "http://localhost:5173/";
 
     await verifyBeforeUpdateEmail(auth.currentUser, targetEmail, {
       url: redirectUrl ? validateRedirectUrl(redirectUrl) : defaultUrl,

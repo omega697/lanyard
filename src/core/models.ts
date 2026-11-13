@@ -22,6 +22,15 @@ export const TOKEN_STALE_ERROR_CODE = "auth/token-stale";
 export const SESSION_REVOKED_ERROR_CODE = "auth/session-revoked";
 
 /**
+ * `code` of `EmailLinkMismatchError`: the email the user entered isn't the one the sign-in link was sent to. The link is
+ * still usable, so the app can ask again.
+ */
+export const EMAIL_LINK_MISMATCH_ERROR_CODE = "auth/email-link-mismatch";
+
+/** `code` of `EmailLinkInvalidError`: the sign-in link has expired or was already used. The user needs a new one. */
+export const EMAIL_LINK_INVALID_ERROR_CODE = "auth/email-link-invalid";
+
+/**
  * Margin applied when comparing token times (one-second granularity, issued by Google's clock) with revocation times
  * (recorded by the server's clock): tokens issued within this margin after a revocation are still treated as revoked.
  */

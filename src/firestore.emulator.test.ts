@@ -18,8 +18,12 @@ import {
   connectAuthEmulator,
   getAuth as getClientAuth,
   GoogleAuthProvider,
+  isSignInWithEmailLink,
+  sendSignInLinkToEmail,
   signInWithCredential,
   signInWithEmailAndPassword,
+  signInWithEmailLink,
+  signOut as clientSignOut,
   type Auth as ClientAuth
 } from "firebase/auth";
 import {
@@ -37,12 +41,17 @@ import {
   updateDoc as clientUpdateDoc,
   type Firestore as ClientFirestore
 } from "firebase/firestore";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { FirestoreClientStore } from "./client/firestore.js";
 import { createLanyardClient } from "./client/index.js";
 import {
   createPermissionPolicy,
+  EMAIL_LINK_INVALID_ERROR_CODE,
+  EMAIL_LINK_MISMATCH_ERROR_CODE,
+  EmailLinkInvalidError,
+  EmailLinkMismatchError,
   GLOBAL_SCOPE,
+  InMemoryLanyardStore,
   REVOCATION_CLOCK_SKEW_MS,
   SESSION_REVOKED_ERROR_CODE,
   SessionRevokedError,
@@ -1935,6 +1944,167 @@ service cloud.firestore {
       } finally {
         await terminate(db);
         await deleteClientApp(app);
+      }
+    }, 30_000);
+
+    /** A client Auth instance connected to the Auth emulator, with no one signed in. */
+    function emulatorClientAuth(name: string) {
+      const app = initializeClientApp({ projectId, apiKey: "fake-api-key" }, `${name}-${Date.now()}`);
+      const auth = getClientAuth(app);
+      connectAuthEmulator(auth, `http://127.0.0.1:${authEmulatorPort}`, { disableWarnings: true });
+      return { app, auth };
+    }
+
+    /**
+     * The most recent email action link the Auth emulator "sent" to `email`: the raw link, its continue URL, and the URL
+     * the app's page actually opens with (`handleCodeInApp`), which is the continue URL with the action parameters added.
+     */
+    async function latestEmailLink(email: string, requestType = "EMAIL_SIGNIN") {
+      const res = await fetch(`http://127.0.0.1:${authEmulatorPort}/emulator/v1/projects/${projectId}/oobCodes`);
+      const { oobCodes } = (await res.json()) as {
+        oobCodes: { email: string; requestType: string; oobLink: string; oobCode: string }[];
+      };
+      const code = oobCodes.filter((c) => c.email === email && c.requestType === requestType).at(-1);
+      if (!code) {
+        const seen = oobCodes.map((c) => `${c.requestType} to ${c.email}`).join(", ");
+        throw new Error(`No ${requestType} link was sent to ${email} (sent: ${seen})`);
+      }
+      const linkParams = new URL(code.oobLink).searchParams;
+      const continueUrl = linkParams.get("continueUrl");
+      const landing = new URL(continueUrl ?? "http://localhost:5173/");
+      for (const key of ["apiKey", "oobCode", "mode", "lang"]) {
+        const value = linkParams.get(key);
+        if (value) landing.searchParams.set(key, value);
+      }
+      return { link: code.oobLink, continueUrl, landingUrl: landing.toString() };
+    }
+
+    // Grounds the magic-link design: what Firebase does when a link is completed with the wrong email or reused
+    it("behaves as Lanyard's magic-link design assumes: completing with the wrong email fails without using up the link, and a used link can't be reused", async () => {
+      const { app, auth } = emulatorClientAuth("client-email-link-grounding");
+      try {
+        await sendSignInLinkToEmail(auth, "link-owner@example.com", {
+          url: "http://localhost:5173/finish",
+          handleCodeInApp: true
+        });
+        const { link } = await latestEmailLink("link-owner@example.com");
+        expect(isSignInWithEmailLink(auth, link)).toBe(true);
+
+        // The wrong email is rejected, and nobody is signed in
+        const mismatch = await signInWithEmailLink(auth, "someone-else@example.com", link).catch((e) => e);
+        expect(mismatch?.code).toBe("auth/invalid-email");
+        expect(auth.currentUser).toBeNull();
+
+        // The rejected attempt didn't consume the link: the right email still completes it
+        const { user } = await signInWithEmailLink(auth, "link-owner@example.com", link);
+        expect(user.email).toBe("link-owner@example.com");
+        await clientSignOut(auth);
+
+        // A link that was used can't be used again, and that's a different error from a mismatch
+        const reused = await signInWithEmailLink(auth, "link-owner@example.com", link).catch((e) => e);
+        expect(reused?.code).toBe("auth/invalid-action-code");
+        expect(auth.currentUser).toBeNull();
+      } finally {
+        await deleteClientApp(app);
+      }
+    }, 30_000);
+
+    it("FIXED: a magic link signs the visitor in only with an email from this device or the user, never one from the link (login CSRF)", async () => {
+      class MemoryLocalStorage {
+        private map = new Map<string, string>();
+        getItem = (k: string) => this.map.get(k) ?? null;
+        setItem = (k: string, v: string) => void this.map.set(k, String(v));
+        removeItem = (k: string) => void this.map.delete(k);
+      }
+      vi.stubGlobal("localStorage", new MemoryLocalStorage());
+      const attacker = emulatorClientAuth("client-csrf-attacker");
+      const victim = emulatorClientAuth("client-csrf-victim");
+      const newLanyard = (auth: ClientAuth, storageKeyPrefix: string) =>
+        createLanyardClient({ auth, store: new InMemoryLanyardStore(), defaultPreferences: {}, storageKeyPrefix });
+      const attackerLanyard = newLanyard(attacker.auth, "attacker");
+      const victimLanyard = newLanyard(victim.auth, "victim");
+      try {
+        // The attacker requests a sign-in link for their own address. Lanyard no longer puts the address in it...
+        await attackerLanyard.sendPasswordlessEmailLink("csrf-attacker@example.com");
+        const { continueUrl, landingUrl } = await latestEmailLink("csrf-attacker@example.com");
+        expect(new URL(continueUrl!).searchParams.has("email")).toBe(false);
+        // ...but they can add it themselves to the page URL before sending the link to the victim
+        const attackLink = `${landingUrl}&email=${encodeURIComponent("csrf-attacker@example.com")}`;
+
+        // 1. A victim with no stored email isn't signed in; the app must ask them for the address
+        expect(await victimLanyard.completePasswordlessSignIn({ href: attackLink })).toEqual({ status: "needs-email" });
+        expect(victim.auth.currentUser).toBeNull();
+
+        // 2. A victim who requested their own link on this device: the stored email doesn't match the attacker's link,
+        //    so it's dropped and the app asks again, rather than failing in a way that looks like the victim's fault
+        localStorage.setItem("victim_emailForSignIn", "csrf-victim@example.com");
+        expect(await victimLanyard.completePasswordlessSignIn({ href: attackLink })).toEqual({ status: "needs-email" });
+        expect(localStorage.getItem("victim_emailForSignIn")).toBeNull();
+        expect(victim.auth.currentUser).toBeNull();
+
+        // 3. A typed address that doesn't match is a typed error, and the link stays usable
+        const mismatch = await victimLanyard
+          .completePasswordlessSignIn({ href: attackLink, email: "csrf-victim@example.com" })
+          .catch((e) => e);
+        expect(mismatch).toBeInstanceOf(EmailLinkMismatchError);
+        expect(mismatch.code).toBe(EMAIL_LINK_MISMATCH_ERROR_CODE);
+        expect(victim.auth.currentUser).toBeNull();
+
+        // 4. A victim who is already signed in keeps their session: the app must ask before switching accounts
+        await signInWithCredential(
+          victim.auth,
+          GoogleAuthProvider.credential(
+            JSON.stringify({ sub: "u-csrf-victim", email: "csrf-victim@example.com", email_verified: true })
+          )
+        );
+        expect(await victimLanyard.completePasswordlessSignIn({ href: attackLink })).toEqual({
+          status: "signed-in-as-other",
+          currentEmail: "csrf-victim@example.com"
+        });
+        expect(victim.auth.currentUser?.email).toBe("csrf-victim@example.com");
+        await victimLanyard.signOut();
+
+        // The link's real owner, typing their own address, signs in; a used link can't be replayed
+        const owner = await victimLanyard.completePasswordlessSignIn({
+          href: attackLink,
+          email: "CSRF-Attacker@Example.com "
+        });
+        expect(owner).toMatchObject({ status: "signed-in", user: { email: "csrf-attacker@example.com" } });
+        await victimLanyard.signOut();
+        const replay = await victimLanyard
+          .completePasswordlessSignIn({ href: attackLink, email: "csrf-attacker@example.com" })
+          .catch((e) => e);
+        expect(replay).toBeInstanceOf(EmailLinkInvalidError);
+        expect(replay.code).toBe(EMAIL_LINK_INVALID_ERROR_CODE);
+
+        // Not a sign-in link at all
+        expect(
+          await victimLanyard.completePasswordlessSignIn({ href: "http://localhost:5173/?email=x%40y.z" })
+        ).toEqual({ status: "not-a-link" });
+      } finally {
+        attackerLanyard.destroy();
+        victimLanyard.destroy();
+        vi.unstubAllGlobals();
+        await deleteClientApp(attacker.app);
+        await deleteClientApp(victim.app);
+      }
+    }, 30_000);
+
+    it("FIXED: change-email links don't carry the new address", async () => {
+      const user = await signInEmulatorUser("u-change-email", "change-email@example.com");
+      const lanyard = createLanyardClient({
+        auth: user.auth,
+        store: new InMemoryLanyardStore(),
+        defaultPreferences: {}
+      });
+      try {
+        await lanyard.sendEmailUpdateVerification("changed-email@example.com");
+        // The emulator files the link under the account's current address
+        const { continueUrl } = await latestEmailLink("change-email@example.com", "VERIFY_AND_CHANGE_EMAIL");
+        expect(new URL(continueUrl!).searchParams.has("email")).toBe(false);
+      } finally {
+        lanyard.destroy();
+        await user.close();
       }
     }, 30_000);
 

@@ -332,10 +332,23 @@ const unsubNotes = lanyard.subscribeToCustomDoc(activeWorkspaceId, "shiftNotes",
 // Social OAuth (Google, Microsoft, GitHub)
 await lanyard.loginWithSocialProvider("google");
 
-// Passwordless Magic Email Link
+// Passwordless Magic Email Link (the link never carries the address; this device remembers it)
 await lanyard.sendPasswordlessEmailLink("user@example.com");
-// On redirect landing page (also auto-detected on boot):
-await lanyard.completePasswordlessSignIn();
+
+// When the app starts (including on the page the link opens), complete any sign-in link and handle the outcome
+const result = await lanyard.completePasswordlessSignIn();
+switch (result.status) {
+  case "signed-in": // done
+    break;
+  case "needs-email": // opened on a device that didn't request it: ask for the address (never prefill it), then
+    // await lanyard.completePasswordlessSignIn({ email: typedEmail });
+    // which throws EmailLinkMismatchError (ask again) or EmailLinkInvalidError (expired or used: request a new link)
+    break;
+  case "signed-in-as-other": // someone else (result.currentEmail) is signed in: ask before signing them out
+    break;
+  case "not-a-link": // an ordinary page load
+    break;
+}
 
 // Account Linking
 await lanyard.linkSocialProvider("github");

@@ -1,7 +1,13 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import * as firebaseAuth from "firebase/auth";
 import * as firebaseFirestore from "firebase/firestore";
-import { createPermissionPolicy, GLOBAL_SCOPE, InMemoryLanyardStore } from "../core/index.js";
+import {
+  createPermissionPolicy,
+  EmailLinkInvalidError,
+  EmailLinkMismatchError,
+  GLOBAL_SCOPE,
+  InMemoryLanyardStore
+} from "../core/index.js";
 import {
   createLanyardClient,
   formatExistingAccountError,
@@ -216,9 +222,45 @@ describe("lanyard/client unit tests", () => {
     expect(authUsersObserved).toEqual([null, "u-1", "u-admin", null]);
   });
 
+  it("waits for Firebase to restore a saved session before completing a magic link, so it never replaces it", async () => {
+    const store = new InMemoryLanyardStore<TestRole, TestCap, TestPrefs>();
+    const restoredUser = {
+      uid: "u-restored",
+      email: "restored@example.com",
+      emailVerified: true,
+      providerData: [],
+      getIdTokenResult: vi.fn().mockResolvedValue({ claims: {} })
+    };
+    // On page load, currentUser is null until Firebase has read the persisted session
+    const fakeAuth: any = {
+      currentUser: null,
+      authStateReady: vi.fn(async () => {
+        await new Promise((r) => setTimeout(r, 0));
+        fakeAuth.currentUser = restoredUser;
+      })
+    };
+    vi.mocked(firebaseAuth.onAuthStateChanged).mockImplementation(() => () => {});
+    vi.mocked(firebaseAuth.isSignInWithEmailLink).mockReturnValue(true);
+    localStorage.setItem("bootapp_emailForSignIn", "other@example.com");
+    const client = createLanyardClient<TestRole, TestCap, TestPrefs>({
+      auth: fakeAuth,
+      store,
+      defaultPreferences: DEFAULT_PREFS,
+      storageKeyPrefix: "bootapp"
+    });
+
+    expect(await client.completePasswordlessSignIn({ href: "https://app.example.com/?oobCode=123" })).toEqual({
+      status: "signed-in-as-other",
+      currentEmail: "restored@example.com"
+    });
+    expect(fakeAuth.authStateReady).toHaveBeenCalled();
+    expect(firebaseAuth.signInWithEmailLink).not.toHaveBeenCalled();
+  });
+
   it("handles OAuth login, magic email links, and account linking", async () => {
     const store = new InMemoryLanyardStore<TestRole, TestCap, TestPrefs>();
     const fakeAuth: any = {
+      authStateReady: async () => {},
       currentUser: {
         uid: "u-social",
         email: "social@example.com",
@@ -262,7 +304,7 @@ describe("lanyard/client unit tests", () => {
     );
     expect(localStorage.getItem("testapp_emailForSignIn")).toBe("magic@example.com");
 
-    vi.mocked(firebaseAuth.isSignInWithEmailLink).mockReturnValueOnce(true);
+    vi.mocked(firebaseAuth.isSignInWithEmailLink).mockReturnValue(true);
     vi.mocked(firebaseAuth.signInWithEmailLink).mockResolvedValueOnce({
       user: {
         uid: "u-magic",
@@ -272,9 +314,24 @@ describe("lanyard/client unit tests", () => {
         getIdTokenResult: vi.fn().mockResolvedValue({ claims: {} })
       }
     } as any);
-    const magicUser = await client.completePasswordlessSignIn(undefined, "https://app.example.com/?oobCode=123");
-    expect(magicUser?.uid).toBe("u-magic");
+    // Someone is already signed in: the link isn't used, so the app can ask before switching accounts
+    expect(await client.completePasswordlessSignIn({ href: "https://app.example.com/?oobCode=123" })).toEqual({
+      status: "signed-in-as-other",
+      currentEmail: "social@example.com"
+    });
+    expect(firebaseAuth.signInWithEmailLink).not.toHaveBeenCalled();
+    const signedInUser = fakeAuth.currentUser;
+    fakeAuth.currentUser = null;
+    const magicResult = await client.completePasswordlessSignIn({ href: "https://app.example.com/?oobCode=123" });
+    expect(magicResult).toMatchObject({ status: "signed-in", user: { uid: "u-magic" } });
+    expect(firebaseAuth.signInWithEmailLink).toHaveBeenCalledWith(
+      fakeAuth,
+      "magic@example.com",
+      "https://app.example.com/?oobCode=123"
+    );
     expect(localStorage.getItem("testapp_emailForSignIn")).toBeNull();
+    fakeAuth.currentUser = signedInUser;
+    vi.mocked(firebaseAuth.isSignInWithEmailLink).mockReset();
 
     // 4. Link / Unlink Social Provider, getSignInMethodsForEmail, sendEmailUpdateVerification
     vi.mocked(firebaseAuth.linkWithPopup).mockResolvedValueOnce({
@@ -680,9 +737,9 @@ describe("lanyard/client unit tests", () => {
     expect(syncSpy).toHaveBeenCalledTimes(1);
   });
 
-  it("auto-completes magic email link and mode=verifyEmail action codes on client boot", async () => {
+  it("auto-applies mode=verifyEmail action codes on boot, but never completes a magic sign-in link on its own", async () => {
     const store = new InMemoryLanyardStore<TestRole, TestCap, TestPrefs>();
-    const fakeAuth: any = { currentUser: null };
+    const fakeAuth: any = { currentUser: null, authStateReady: async () => {} };
 
     vi.mocked(firebaseAuth.onAuthStateChanged).mockImplementation(() => () => {});
 
@@ -710,7 +767,6 @@ describe("lanyard/client unit tests", () => {
       addEventListener: vi.fn(),
       removeEventListener: vi.fn()
     });
-    vi.mocked(firebaseAuth.isSignInWithEmailLink).mockReturnValueOnce(false);
     vi.mocked(firebaseAuth.applyActionCode).mockResolvedValueOnce(undefined);
 
     const clientVerify = createLanyardClient<TestRole, TestCap, TestPrefs>({
@@ -726,15 +782,19 @@ describe("lanyard/client unit tests", () => {
     clientVerify.destroy();
     fakeAuth.currentUser = null;
 
-    // 2. Boot with magic email link (?mode=signIn&oobCode=MAGIC_123&email=boot%40example.com)
+    // 2. Boot with someone else's magic sign-in link that carries their email (login CSRF): nothing signs in on
+    //    construction, the link's email is never used, and completing from the address bar needs the user's email
+    const magicHref = "https://app.example.com/?mode=signIn&oobCode=MAGIC_123&email=attacker%40evil.example#profile";
+    const replaceState = vi.fn();
     vi.stubGlobal("window", {
       location: {
-        href: "https://app.example.com/?mode=signIn&oobCode=MAGIC_123&email=boot%40example.com",
-        search: "?mode=signIn&oobCode=MAGIC_123&email=boot%40example.com",
+        href: magicHref,
+        search: "?mode=signIn&oobCode=MAGIC_123&email=attacker%40evil.example",
         origin: "https://app.example.com",
         pathname: "/",
-        hash: ""
+        hash: "#profile"
       },
+      history: { state: null, replaceState },
       addEventListener: vi.fn(),
       removeEventListener: vi.fn()
     });
@@ -755,13 +815,21 @@ describe("lanyard/client unit tests", () => {
       defaultPreferences: DEFAULT_PREFS
     });
     await new Promise((r) => setTimeout(r, 0));
-    expect(firebaseAuth.signInWithEmailLink).toHaveBeenCalledWith(
-      fakeAuth,
-      "boot@example.com",
-      "https://app.example.com/?mode=signIn&oobCode=MAGIC_123&email=boot%40example.com"
-    );
+    expect(firebaseAuth.signInWithEmailLink).not.toHaveBeenCalled();
+    expect(clientMagic.authStore.get().user).toBeNull();
+
+    expect(await clientMagic.completePasswordlessSignIn()).toEqual({ status: "needs-email" });
+    expect(firebaseAuth.signInWithEmailLink).not.toHaveBeenCalled();
+    expect(replaceState).not.toHaveBeenCalled();
+
+    // The user types the address the link was sent to; afterwards the link's parameters leave the address bar
+    const typed = await clientMagic.completePasswordlessSignIn({ email: " Boot@Example.com" });
+    expect(typed).toMatchObject({ status: "signed-in", user: { uid: "u-boot-magic" } });
+    expect(firebaseAuth.signInWithEmailLink).toHaveBeenCalledWith(fakeAuth, "boot@example.com", magicHref);
     expect(clientMagic.authStore.get().user?.uid).toBe("u-boot-magic");
+    expect(replaceState).toHaveBeenCalledWith(null, "", "/#profile");
     clientMagic.destroy();
+    vi.mocked(firebaseAuth.isSignInWithEmailLink).mockReset();
     vi.unstubAllGlobals();
   });
 
@@ -1110,14 +1178,14 @@ describe("lanyard/client unit tests", () => {
     // 3. Uninitialized auth guards & fallbacks
     await expect(clientNoPolicy.loginWithSocialProvider("google")).rejects.toThrow(/not initialized/);
     await expect(clientNoPolicy.sendPasswordlessEmailLink("a@b.com")).rejects.toThrow(/not initialized/);
-    await expect(clientNoPolicy.completePasswordlessSignIn("a@b.com")).rejects.toThrow(/not initialized/);
+    await expect(clientNoPolicy.completePasswordlessSignIn({ email: "a@b.com" })).rejects.toThrow(/not initialized/);
     await expect(clientNoPolicy.linkSocialProvider("google")).rejects.toThrow(/No authenticated user/);
     await expect(clientNoPolicy.unlinkSocialProvider("google.com")).rejects.toThrow(/No authenticated user/);
     await expect(clientNoPolicy.sendEmailUpdateVerification("a@b.com")).rejects.toThrow(/No authenticated user/);
     expect(await clientNoPolicy.getSignInMethodsForEmail("a@b.com")).toEqual([]);
 
     // Auth with localStorage email fallback on completePasswordlessSignIn, failed fetchSignInMethodsForEmail, and failed dev login fetch
-    const fakeAuth: any = { currentUser: null };
+    const fakeAuth: any = { currentUser: null, authStateReady: async () => {} };
     vi.mocked(firebaseAuth.onAuthStateChanged).mockImplementation(() => () => {});
     const clientWithAuth = createLanyardClient<TestRole, TestCap, TestPrefs>({
       auth: fakeAuth,
@@ -1126,17 +1194,19 @@ describe("lanyard/client unit tests", () => {
       storageKeyPrefix: "retryapp"
     });
 
-    // completePasswordlessSignIn when link is not a sign-in link or when no email is found anywhere -> null
+    // completePasswordlessSignIn when the URL is not a sign-in link, or when no email is stored or typed
     vi.mocked(firebaseAuth.isSignInWithEmailLink).mockReturnValueOnce(false);
-    expect(await clientWithAuth.completePasswordlessSignIn(undefined, "https://app.example.com/")).toBeNull();
+    expect(await clientWithAuth.completePasswordlessSignIn({ href: "https://app.example.com/" })).toEqual({
+      status: "not-a-link"
+    });
 
     vi.mocked(firebaseAuth.isSignInWithEmailLink).mockReturnValue(true);
     localStorage.removeItem("retryapp_emailForSignIn");
-    expect(
-      await clientWithAuth.completePasswordlessSignIn(undefined, "https://app.example.com/?oobCode=123")
-    ).toBeNull();
+    expect(await clientWithAuth.completePasswordlessSignIn({ href: "https://app.example.com/?oobCode=123" })).toEqual({
+      status: "needs-email"
+    });
 
-    // Stored email in localStorage is used when URL lacks ?email=
+    // The email this device stored when it requested the link is used
     localStorage.setItem("retryapp_emailForSignIn", "stored@example.com");
     vi.mocked(firebaseAuth.signInWithEmailLink).mockResolvedValueOnce({
       user: {
@@ -1147,12 +1217,35 @@ describe("lanyard/client unit tests", () => {
         getIdTokenResult: vi.fn().mockResolvedValue({ claims: {} })
       }
     } as any);
-    const completedStored = await clientWithAuth.completePasswordlessSignIn(
-      undefined,
-      "https://app.example.com/?oobCode=123"
-    );
-    expect(completedStored?.email).toBe("stored@example.com");
+    const completedStored = await clientWithAuth.completePasswordlessSignIn({
+      href: "https://app.example.com/?oobCode=123"
+    });
+    expect(completedStored).toMatchObject({ status: "signed-in", user: { email: "stored@example.com" } });
     expect(localStorage.getItem("retryapp_emailForSignIn")).toBeNull();
+
+    // Firebase errors map to typed errors; a stored email for a different link is forgotten and the app asks instead
+    const firebaseError = (code: string) => Object.assign(new Error(code), { code });
+    vi.mocked(firebaseAuth.signInWithEmailLink).mockRejectedValueOnce(firebaseError("auth/invalid-email"));
+    await expect(
+      clientWithAuth.completePasswordlessSignIn({ href: "https://app.example.com/?oobCode=123", email: "x@y.z" })
+    ).rejects.toBeInstanceOf(EmailLinkMismatchError);
+    localStorage.setItem("retryapp_emailForSignIn", "stale@example.com");
+    vi.mocked(firebaseAuth.signInWithEmailLink).mockRejectedValueOnce(firebaseError("auth/invalid-email"));
+    expect(await clientWithAuth.completePasswordlessSignIn({ href: "https://app.example.com/?oobCode=123" })).toEqual({
+      status: "needs-email"
+    });
+    expect(localStorage.getItem("retryapp_emailForSignIn")).toBeNull();
+    for (const code of ["auth/invalid-action-code", "auth/expired-action-code"]) {
+      vi.mocked(firebaseAuth.signInWithEmailLink).mockRejectedValueOnce(firebaseError(code));
+      await expect(
+        clientWithAuth.completePasswordlessSignIn({ href: "https://app.example.com/?oobCode=123", email: "x@y.z" })
+      ).rejects.toBeInstanceOf(EmailLinkInvalidError);
+    }
+    vi.mocked(firebaseAuth.signInWithEmailLink).mockRejectedValueOnce(firebaseError("auth/network-request-failed"));
+    await expect(
+      clientWithAuth.completePasswordlessSignIn({ href: "https://app.example.com/?oobCode=123", email: "x@y.z" })
+    ).rejects.toMatchObject({ code: "auth/network-request-failed" });
+    vi.mocked(firebaseAuth.isSignInWithEmailLink).mockReset();
 
     // getSignInMethodsForEmail catches errors and returns []
     vi.mocked(firebaseAuth.fetchSignInMethodsForEmail).mockRejectedValueOnce(new Error("Network error"));

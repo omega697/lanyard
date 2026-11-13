@@ -29,6 +29,26 @@
 
 ### Breaking changes
 
+- **Magic sign-in links never trust an email taken from the link, and are never completed automatically.** The
+  client used to complete a sign-in link as soon as it was created, preferring an `email` query parameter (which
+  `sendPasswordlessEmailLink` itself added to every link) over this device's stored email. So anyone could sign a
+  visitor into their own account just by sending them one of their sign-in links (login CSRF). Now:
+  - `sendPasswordlessEmailLink` and `sendEmailUpdateVerification` no longer put the address in the link;
+  - nothing is completed on construction: call `completePasswordlessSignIn(options?: { email?, href? })` when the app
+    starts. It takes the email only from `options.email` (typed by the user) or this device's stored one, and resolves
+    a `PasswordlessSignInResult`: `{ status: "signed-in", user }`, `{ status: "needs-email" }` (ask for the address the
+    link was sent to, never prefilled, then call again with `{ email }`), `{ status: "signed-in-as-other",
+currentEmail }` (someone is already signed in; their session is left alone) or `{ status: "not-a-link" }`;
+  - a typed email that doesn't match throws `EmailLinkMismatchError` (the link stays usable); an expired or used link
+    throws `EmailLinkInvalidError`; both are in `lanyard/core` with `code`s `EMAIL_LINK_MISMATCH_ERROR_CODE` and
+    `EMAIL_LINK_INVALID_ERROR_CODE`. A stored email that doesn't match the link is forgotten and reported as
+    `needs-email`;
+  - it no longer falls back to the signed-in user's email, and after completing from the address bar it removes the
+    link's parameters from the URL.
+
+  The positional `(providedEmail?, href?)` signature is gone, so old calls fail to compile instead of misbehaving.
+  Cross-device sign-in now needs the email prompt.
+
 - **`getOrProvisionUidByEmail` refuses existing accounts whose email isn't verified.** If an account for the address already exists in Firebase Auth (`getUserByEmail`), `getOrProvisionUidByEmail` (and therefore `upsertUserByEmail`, `grantRolesByEmail`, and `setSystemAdminStatus` when promoting) now requires `emailVerified === true` on that record and throws `EmailNotVerifiedError` otherwise. Without this, an attacker who registered someone else's email address with an unverified sign-in method before they were invited would receive the roles or admin claim meant for them. `AdminAuthAdapter.getUserByEmail` test doubles that return existing accounts must include `emailVerified: true`.
 
 - **Generated Firestore rules enforce revocations on `isAdmin()` and require a verified email by default.**
