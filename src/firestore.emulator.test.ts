@@ -1805,5 +1805,101 @@ ${block}
         await deleteClientApp(sysAdminClient.app);
       }
     });
+
+    // Grounds the revocation design in real Firebase Auth behavior instead of assumptions. Runs last because it
+    // replaces the emulator's security rules.
+    it("behaves as Lanyard's revocation design assumes: stale claims persist until a forced refresh, rules can read the token's iat, and session revocation is keyed on auth_time", async () => {
+      const uid = "u-revocation-grounding";
+      const email = "revocation-grounding@example.com";
+      await adminAuth.createUser({ uid, email, emailVerified: true });
+      await adminAuth.setCustomUserClaims(uid, { admin: true });
+
+      const app = initializeClientApp({ projectId, apiKey: "fake-api-key" }, `client-${uid}`);
+      const auth = getClientAuth(app);
+      connectAuthEmulator(auth, `http://127.0.0.1:${authEmulatorPort}`, { disableWarnings: true });
+      const db = getClientFirestore(app);
+      connectFirestoreEmulator(db, "127.0.0.1", emulatorPort);
+      try {
+        const { user } = await signInWithCredential(
+          auth,
+          GoogleAuthProvider.credential(JSON.stringify({ sub: uid, email, email_verified: true }))
+        );
+        const adminToken = await user.getIdTokenResult();
+        expect(adminToken.claims.admin).toBe(true);
+        const adminTokenIat = Number(adminToken.claims.iat);
+
+        // 1. The problem: after demotion the already-issued token still says admin:true, and the Admin SDK's default
+        //    verification (no revocation check) still accepts it with the stale claim.
+        await adminAuth.setCustomUserClaims(uid, { admin: false });
+        expect((await user.getIdTokenResult()).claims.admin).toBe(true);
+        expect((await adminAuth.verifyIdToken(adminToken.token)).admin).toBe(true);
+
+        // 2. A forced refresh picks up the new claim without signing the user out, and the new token is issued no
+        //    earlier than the old one. iat has one-second granularity, so a token minted in the same second as a
+        //    revocation can't be told apart from one minted just before it.
+        await new Promise((resolve) => setTimeout(resolve, 1100));
+        const demotedToken = await user.getIdTokenResult(true);
+        expect(demotedToken.claims.admin).toBe(false);
+        const demotedTokenIat = Number(demotedToken.claims.iat);
+        expect(Number.isInteger(demotedTokenIat)).toBe(true);
+        expect(demotedTokenIat).toBeGreaterThan(adminTokenIat);
+
+        // 3. Firestore rules can read request.auth.token.iat (seconds) and compare it to a stored value
+        const rulesRes = await fetch(
+          `http://127.0.0.1:${emulatorPort}/emulator/v1/projects/${projectId}:securityRules`,
+          {
+            method: "PUT",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              rules: {
+                files: [
+                  {
+                    name: "firestore.rules",
+                    content: `rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    match /iat_probe/{issuedAfterSeconds} {
+      allow get: if request.auth != null && request.auth.token.iat > int(issuedAfterSeconds);
+    }
+  }
+}
+`
+                  }
+                ]
+              }
+            })
+          }
+        );
+        expect(rulesRes.status).toBe(200);
+        await clientGetDoc(clientDoc(db, "iat_probe", String(demotedTokenIat - 1)));
+        await expect(clientGetDoc(clientDoc(db, "iat_probe", String(demotedTokenIat + 3600)))).rejects.toMatchObject({
+          code: "permission-denied"
+        });
+
+        // 4. Session revocation is keyed on auth_time (the sign-in time), not iat. After revokeRefreshTokens the old
+        //    token fails verification with the revocation check. Production Firebase documents that the refresh itself
+        //    then fails, but the Auth emulator still mints a token, so neither the emulator nor a design may rely on
+        //    refresh failing. Any token minted after the revocation keeps the original auth_time (with a newer iat),
+        //    and the Admin SDK's revocation check rejects it. So iat alone can't detect a revoked session: a refreshed
+        //    token's iat is newer than the revocation.
+        await adminAuth.revokeRefreshTokens(uid);
+        await expect(adminAuth.verifyIdToken(demotedToken.token, true)).rejects.toMatchObject({
+          code: "auth/id-token-revoked"
+        });
+        // Cross a second boundary first: iat has one-second granularity
+        await new Promise((resolve) => setTimeout(resolve, 1100));
+        const afterRevoke = await user.getIdTokenResult(true).catch(() => null);
+        if (afterRevoke) {
+          expect(Number(afterRevoke.claims.auth_time)).toBe(Number(demotedToken.claims.auth_time));
+          expect(Number(afterRevoke.claims.iat)).toBeGreaterThan(demotedTokenIat);
+          await expect(adminAuth.verifyIdToken(afterRevoke.token, true)).rejects.toMatchObject({
+            code: "auth/id-token-revoked"
+          });
+        }
+      } finally {
+        await terminate(db);
+        await deleteClientApp(app);
+      }
+    }, 30_000);
   }
 );
