@@ -19,6 +19,7 @@ import {
   type SessionRevocationsListener,
   TIER_METADATA_KEY,
   type ScopedMember,
+  type ScopedMemberUpsert,
   type SecretCipher,
   type StoredProfileFieldsPatch,
   type SystemAdminProfile,
@@ -70,10 +71,8 @@ function assertValidFirestoreDocId(id: string | null | undefined, label: string)
   return valid;
 }
 
-export interface FirestoreServerStoreConfig<TRole extends string = string> {
+export interface FirestoreServerStoreConfig<_TRole extends string = string> {
   db: Firestore;
-  /** Optional default roles assigned if a stored document does not have a `roles` field (defaults to `[]`). */
-  defaultRoles?: readonly TRole[];
   /** Canonical users collection name (defaults to `"users"`). */
   usersCollection?: string;
   scopeCollection?: string;
@@ -117,7 +116,6 @@ export class FirestoreServerStore<
   TSecrets extends Record<string, any> = Record<string, any>
 > implements LanyardServerStore<TRole, TCapability, TPreferences, TAttributes, THiddenAttributes, TSecrets> {
   private readonly db: Firestore;
-  private readonly defaultRoles: readonly TRole[];
   private readonly usersCollection: string;
   private readonly scopeCollection: string;
   private readonly membersSubcollection: string;
@@ -127,7 +125,6 @@ export class FirestoreServerStore<
 
   constructor(config: FirestoreServerStoreConfig<TRole>) {
     this.db = config.db;
-    this.defaultRoles = Object.freeze(Array.from(new Set(config.defaultRoles || [])));
     this.usersCollection = assertValidFirestoreDocId(config.usersCollection || "users", "usersCollection");
     this.scopeCollection = assertValidFirestoreDocId(config.scopeCollection || "workspaces", "scopeCollection");
     this.membersSubcollection = assertValidFirestoreDocId(
@@ -225,11 +222,9 @@ export class FirestoreServerStore<
     }, onError);
   }
 
+  /** A record's stored roles exactly as stored (deduplicated); a missing `roles` field means none. */
   private extractRoles(data: Record<string, any>): TRole[] {
-    if (Array.isArray(data.roles) && data.roles.length > 0) {
-      return Array.from(new Set(data.roles as TRole[]));
-    }
-    return [...this.defaultRoles];
+    return Array.isArray(data.roles) ? Array.from(new Set(data.roles as TRole[])) : [];
   }
 
   private userDocRef(uid: string) {
@@ -458,7 +453,9 @@ export class FirestoreServerStore<
       ...(data.lastSeen !== undefined ? { lastSeen: data.lastSeen } : {}),
       ...(typeof data.isSystemAdmin === "boolean" ? { isSystemAdmin: data.isSystemAdmin } : {}),
       ...(data.addedBy !== undefined ? { addedBy: data.addedBy } : {}),
-      roles: this.extractRoles(data),
+      // A card with no roles field (e.g. one a user created themselves) has none, and reads as undefined so that
+      // provisioning can still give it the policy's default roles
+      ...(Array.isArray(data.roles) ? { roles: this.extractRoles(data) } : {}),
       ...(data.attributes && typeof data.attributes === "object" && !Array.isArray(data.attributes)
         ? { attributes: sanitizeObjectPatch<TAttributes>(data.attributes) }
         : {}),
@@ -617,7 +614,8 @@ export class FirestoreServerStore<
       if (!fallbackUser) {
         throw new Error(`User '${cleanUid}' does not exist`);
       }
-      const initialRoles = roles.length > 0 ? Array.from(new Set(roles)) : [...this.defaultRoles];
+      // Grants never add default roles: a new record gets exactly the granted roles
+      const initialRoles = Array.from(new Set(roles));
       const created: UserRecord<TRole, TCapability, TPreferences, TAttributes> = {
         ...fallbackUser,
         ...(fallbackUser.photoUrl !== undefined ? { photoUrl: sanitizeAvatarUrl(fallbackUser.photoUrl) } : {}),
@@ -775,7 +773,7 @@ export class FirestoreServerStore<
    */
   async upsertScopeMember(
     scopeId: string,
-    member: ScopedMember<TRole, TCapability, TPreferences, TAttributes>
+    member: ScopedMemberUpsert<TRole, TCapability, TPreferences, TAttributes>
   ): Promise<void> {
     const cleanScopeId = assertValidFirestoreDocId(scopeId, "scopeId");
     const cleanUid = assertValidFirestoreDocId(member.uid, "uid");
@@ -791,7 +789,8 @@ export class FirestoreServerStore<
       ...(card.photoUrl !== undefined ? { photoUrl: sanitizeAvatarUrl(card.photoUrl) } : {}),
       uid: cleanUid,
       scopeId: cleanScopeId,
-      roles: Array.from(new Set(card.roles || [])),
+      // Omitted roles leave the stored roles untouched (merge write)
+      ...(card.roles !== undefined ? { roles: Array.from(new Set(card.roles)) } : {}),
       ...(Object.keys(cardAttributes).length > 0 ? { attributes: cardAttributes } : {})
     });
     await this.memberDocRef(cleanScopeId, cleanUid).set(payload, { merge: true });
@@ -880,7 +879,8 @@ export class FirestoreServerStore<
       if (!fallbackMember) {
         throw new Error(`Member '${uid}' does not exist in scope '${scopeId}'`);
       }
-      const initialRoles = roles.length > 0 ? Array.from(new Set(roles)) : [...this.defaultRoles];
+      // Grants never add default roles: a new record gets exactly the granted roles
+      const initialRoles = Array.from(new Set(roles));
       const created: ScopedMember<TRole, TCapability, TPreferences, TAttributes> = {
         ...fallbackMember,
         ...(fallbackMember.photoUrl !== undefined ? { photoUrl: sanitizeAvatarUrl(fallbackMember.photoUrl) } : {}),

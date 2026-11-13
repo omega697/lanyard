@@ -447,8 +447,7 @@ describe("lanyard/client unit tests", () => {
   it("tests FirestoreClientStore subscriptions, avatar sync, and presence heartbeats", async () => {
     const fakeDb: any = {};
     const store = new FirestoreClientStore<TestRole, TestCap, TestPrefs>({
-      db: fakeDb,
-      defaultRoles: ["member"]
+      db: fakeDb
     });
 
     // 1. subscribeToPreferences + savePreferences on the self-only users/{uid}/private/preferences tier doc
@@ -1043,8 +1042,7 @@ describe("lanyard/client unit tests", () => {
 
     // 3. FirestoreClientStore rejects path traversal and reserved __.*__ document IDs
     const fsStore = new FirestoreClientStore<TestRole, TestCap, TestPrefs>({
-      db: {} as any,
-      defaultRoles: ["member"]
+      db: {} as any
     });
     expect(() => fsStore.subscribeToScopeMembers("ws-1/../../system_admins", () => {})).toThrow(/Invalid scopeId/);
     expect(() => fsStore.subscribeToScopeMembers("__reserved__", () => {})).toThrow(/reserved Firestore document ID/);
@@ -1257,7 +1255,6 @@ describe("lanyard/client unit tests", () => {
 
     const fsStore = new FirestoreClientStore<TestRole, TestCap, TestPrefs>({
       db: { type: "custom-fs" } as any,
-      defaultRoles: ["member"],
       usersCollection: "custom_users",
       scopeCollection: "custom_scopes",
       membersSubcollection: "custom_members"
@@ -1290,8 +1287,7 @@ describe("lanyard/client unit tests", () => {
   it("multiplexes FirestoreClientStore users/{uid} listeners (1 onSnapshot per UID) and strips unauthorized fields on updateUserProfile", async () => {
     const fakeDb: any = {};
     const fsStore = new FirestoreClientStore<TestRole, TestCap, TestPrefs, { pointsAllTime: number }>({
-      db: fakeDb,
-      defaultRoles: ["member"]
+      db: fakeDb
     });
 
     let emitSnapshot!: (snap: any) => void;

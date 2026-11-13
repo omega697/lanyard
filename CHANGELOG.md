@@ -29,6 +29,30 @@
 
 ### Breaking changes
 
+- **Default roles only seed a newly provisioned record; revoking every role leaves none.** Before:
+  - the Firestore stores substituted their `defaultRoles` option whenever a stored `roles` field was empty or
+    missing, so revoking all of a user's roles quietly gave them the defaults back on the server and the client,
+    while the generated rules (which read stored roles) denied them;
+  - a bare card a user created for themselves read as holding the defaults;
+  - grants on a new doc and `upsertUserByEmail` persisted the substituted defaults;
+  - `createPermissionPolicy` silently defaulted to the root role when `defaultRoles` was omitted, and fell back to it
+    when every listed role was misspelled.
+
+  Now:
+  - the `defaultRoles` option is removed from `FirestoreServerStore` and `FirestoreClientStore`, and stores return
+    roles exactly as stored (a user card with no `roles` field has `roles: undefined`, which grants nothing);
+  - `policy.defaultRoles` defaults to `[]`, an unknown name throws, and it's applied only by `upsertUserByEmail` when
+    it creates a record (or fills in a user card that has never had roles, atomically, so a concurrent grant isn't
+    lost) without explicit roles;
+  - grants never add defaults;
+  - `upsertUserByEmail` writes only the fields it's given, never the roles or admin status it read;
+  - `upsertScopeMember` accepts a member without `roles` (`ScopedMemberUpsert`), meaning "leave them as they are";
+  - `shouldTrackPresence` no longer assumes defaults for a record without roles.
+
+  **Migrating:** delete `defaultRoles` from your store configs; TypeScript flags it. If you relied on the implicit
+  root-role default, list `defaultRoles` explicitly. Existing records whose roles were persisted from substituted
+  defaults can't be told apart from real grants, so audit them if your stores had a non-empty `defaultRoles`.
+
 - **The client's `authStore.user.isAdmin` is always the Firebase claim.** The client used to overwrite it with the
   user's stored `isSystemAdmin` whenever the record changed, so a stale directory entry made a non-admin (or a demoted
   admin) look like an admin in the UI until something refreshed it. The server and generated rules never trusted the

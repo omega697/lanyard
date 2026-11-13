@@ -44,11 +44,12 @@ const TEST_POLICY = createPermissionPolicy<TestRole, TestCapability>({
 
 describe("lanyard/core unit tests", () => {
   describe("Custom PermissionPolicy (Generic TRole & TCapability)", () => {
-    it("supports empty roles configuration and respects explicit or root defaultRoles", () => {
+    it("supports empty roles configuration and uses exactly the listed defaultRoles (none if omitted)", () => {
       const emptyRolesPolicy = createPermissionPolicy({ roles: {} as any });
       expect(emptyRolesPolicy.defaultRoles).toEqual([]);
       expect(emptyRolesPolicy.assignableRoles).toEqual([]);
-      expect(TEST_POLICY.defaultRoles).toEqual(["member"]);
+      // No defaultRoles listed means none, rather than an implicit root role
+      expect(TEST_POLICY.defaultRoles).toEqual([]);
 
       const explicitDefault = createPermissionPolicy<TestRole, TestCapability>({
         roles: {
@@ -907,14 +908,20 @@ describe("lanyard/core unit tests", () => {
       });
       expect(customDefaultPolicy.defaultRoles).toEqual(["lead"]);
 
+      // A misspelled default role is an error, not a silent fallback to some other role
+      expect(() =>
+        createPermissionPolicy<"lead" | "viewer", "read">({
+          roles: { lead: { inherits: ["viewer"] }, viewer: {} },
+          defaultRoles: ["nonexistent" as any]
+        })
+      ).toThrow(/Invalid defaultRoles 'nonexistent'/);
       const fallbackDefaultPolicy = createPermissionPolicy<"lead" | "viewer", "read">({
         roles: {
           lead: { inherits: ["viewer"] },
           viewer: {}
-        },
-        defaultRoles: ["nonexistent" as any]
+        }
       });
-      expect(fallbackDefaultPolicy.defaultRoles).toEqual(["viewer"]);
+      expect(fallbackDefaultPolicy.defaultRoles).toEqual([]);
 
       // hasAllCapabilities quantifier semantics on empty array vs null member
       const viewerMember: ScopedMember<"lead" | "viewer", "read"> = {
@@ -1036,8 +1043,8 @@ describe("lanyard/core unit tests", () => {
         }
       });
 
-      // Abstract role `staff_base` is skipped when selecting `defaultRoles` and excluded from `assignableRoles`
-      expect(dagPolicy.defaultRoles).toEqual(["attendee"]);
+      // Abstract role `staff_base` is excluded from `assignableRoles`; no defaultRoles are listed, so there are none
+      expect(dagPolicy.defaultRoles).toEqual([]);
       expect(dagPolicy.assignableRoles).toEqual([
         "attendee",
         "scanner",

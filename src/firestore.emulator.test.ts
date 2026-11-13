@@ -429,14 +429,12 @@ describe.skipIf(!emulatorsAvailable)(
 
       const serverStore = new FirestoreServerStore<Role, Cap, Prefs, Attrs, HiddenAttrs, Secrets>({
         db: adminDb,
-        defaultRoles: ["attendee"],
         usersCollection: "users_st",
         metaCollection: "lanyard_meta_st",
         encryptionKey: "emulator-test-master-encryption-key"
       });
       const clientStore = new FirestoreClientStore<Role, Cap, Prefs, Attrs>({
         db: clientDb,
-        defaultRoles: ["attendee"],
         usersCollection: "users_st",
         metaCollection: "lanyard_meta_st"
       });
@@ -849,10 +847,11 @@ describe.skipIf(!emulatorsAvailable)(
       expect(await serverStore.getUser("prefs-only-uid")).toBeNull();
       expect((await adminDb.doc("users_st/prefs-only-uid").get()).exists).toBe(false);
 
-      // ...while a profile-only stub card created via FirestoreClientStore resolves to `defaultRole` ("attendee") on server
+      // ...while a profile-only stub card a user creates for themselves holds no roles: stores never substitute
+      // default roles, so it can't do anything a role grants until the server provisions it
       await clientStore.updateUserProfile("prefs-only-uid", { firstName: "Stubby" });
       const stubUser = await serverStore.getUser("prefs-only-uid");
-      expect(stubUser?.roles).toEqual(["attendee"]);
+      expect(stubUser?.roles).toBeUndefined();
       expect(stubUser?.preferences).toEqual({ theme: "dark" });
 
       let stubAllowedAsAttendee = false;
@@ -863,7 +862,7 @@ describe.skipIf(!emulatorsAvailable)(
           stubAllowedAsAttendee = true;
         }
       );
-      expect(stubAllowedAsAttendee).toBe(true);
+      expect(stubAllowedAsAttendee).toBe(false);
 
       // 12. Unscoped directory subscription (`client.subscribeToUsers(GLOBAL_SCOPE, cb)`) on real Firestore
       const directoryUsers = await new Promise<any[]>((resolve) => {
@@ -950,7 +949,6 @@ describe.skipIf(!emulatorsAvailable)(
         { geminiKey: string }
       >({
         db: adminDb,
-        defaultRoles: ["member"],
         usersCollection: "users_mt",
         scopeCollection: "orgs_mt",
         membersSubcollection: "members_mt",
@@ -958,7 +956,6 @@ describe.skipIf(!emulatorsAvailable)(
       });
       const clientStore = new FirestoreClientStore<Role, Cap, Record<string, any>, { quotaTier: string }>({
         db: clientDb,
-        defaultRoles: ["member"],
         usersCollection: "users_mt",
         scopeCollection: "orgs_mt",
         membersSubcollection: "members_mt"
@@ -1165,7 +1162,6 @@ ${block}
           { geminiKey: string }
         >({
           db: adminDb,
-          defaultRoles: ["member"],
           usersCollection: "users",
           scopeCollection: "workspaces",
           membersSubcollection: "members",
@@ -1174,7 +1170,6 @@ ${block}
 
         const memberStore = new FirestoreClientStore<Role, Cap, Prefs, { badge: string }>({
           db: memberClient.db,
-          defaultRoles: ["member"],
           usersCollection: "users",
           scopeCollection: "workspaces",
           membersSubcollection: "members"
@@ -1196,7 +1191,8 @@ ${block}
         await clientGetDoc(clientDoc(memberClient.db, "users", "u-member"));
         await new Promise((r) => setTimeout(r, 150));
         expect(userEvents.at(-1)?.uid).toBe("u-member");
-        expect(userEvents.at(-1)?.roles).toEqual(["member"]);
+        // The card has no roles field: it holds no roles (stores never substitute defaults)
+        expect(userEvents.at(-1)?.roles).toEqual([]);
         expect(userEvents.at(-1)?.preferences).toBeUndefined();
         expect(prefEvents.at(-1)).toEqual({ compactMode: true });
 
@@ -1391,7 +1387,8 @@ ${block}
         await serverStore.grantUserRoles("u-member", ["manager"]);
         expect((await serverStore.getUser("u-member"))?.roles).toEqual([" manager".trim()]);
         await serverStore.revokeUserRoles("u-member", ["manager"]);
-        expect((await serverStore.getUser("u-member"))?.roles).toEqual(["member"]);
+        // Revoking their only role leaves them with none (no default roles substituted on read)
+        expect((await serverStore.getUser("u-member"))?.roles).toEqual([]);
 
         unsubMemberships();
         unsubRoster();
@@ -1617,7 +1614,6 @@ ${block}
         // Attack H: Only scope staff can list a scope's attributes tiers (include: ["attributes"])
         const mgrStore = new FirestoreClientStore<Role, Cap, Prefs, { badge: string }>({
           db: mgrClient.db,
-          defaultRoles: ["member"],
           usersCollection: "users",
           scopeCollection: "workspaces",
           membersSubcollection: "members"
@@ -2793,6 +2789,73 @@ ${generateFirestoreRules(createPermissionPolicy({}), { usersCollection, metaColl
           confirmTargetEmail: `ta-plain-${suffix}@example.com`
         });
         expect(await store.getUser(plainUid)).toBeNull();
+      } finally {
+        server.close();
+      }
+    }, 30_000);
+
+    it("FIXED: on real Firestore, a user whose roles were all revoked has no roles, rather than getting defaults back", async () => {
+      const suffix = Date.now();
+      type Role = "member" | "staff";
+      const policy = createPermissionPolicy<Role, "edit">({
+        roles: { member: { capabilities: [] }, staff: { inherits: ["member"], capabilities: ["edit"] } },
+        defaultRoles: ["staff"]
+      });
+      const config = {
+        usersCollection: `users_defaults_${suffix}`,
+        scopeCollection: `orgs_defaults_${suffix}`,
+        metaCollection: `meta_defaults_${suffix}`,
+        // Stores used to take a defaultRoles option that they substituted for empty or missing roles on read
+        defaultRoles: ["staff"]
+      };
+      const store = new FirestoreServerStore<Role, "edit">({ db: adminDb, ...config } as any);
+      const clientStore = new FirestoreClientStore<Role, "edit">({ db: clientDb, ...config } as any);
+      const server = createLanyardServer({ adminAuth: adminAuth as any, store, policy });
+      // Earlier tests leave security rules loaded; this one reads with the client SDK, so open its collections
+      const rulesRes = await fetch(`http://127.0.0.1:${emulatorPort}/emulator/v1/projects/${projectId}:securityRules`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          rules: {
+            files: [
+              {
+                name: "firestore.rules",
+                content: `rules_version = '2';\nservice cloud.firestore {\n  match /databases/{database}/documents {\n    match /{document=**} { allow read, write: if true; }\n  }\n}\n`
+              }
+            ]
+          }
+        })
+      });
+      expect(rulesRes.status).toBe(200);
+      try {
+        await store.upsertUser({ uid: "u-def", email: "def@example.com", roles: ["staff"] });
+        await store.upsertScopeMember("org-1", { uid: "u-def", email: "def@example.com", roles: ["staff"] });
+        await store.revokeUserRoles("u-def", ["staff"]);
+        await store.revokeScopeRoles("org-1", "u-def", ["staff"]);
+
+        // Server reads, client reads, and authorization all agree with the stored (empty) roles, as the rules do
+        expect((await store.getUser("u-def"))?.roles).toEqual([]);
+        expect((await store.getScopeMember("org-1", "u-def"))?.roles).toEqual([]);
+        const clientCard = await new Promise<any>((resolve) => {
+          const unsubscribe = clientStore.subscribeToUser("u-def", (u) => {
+            unsubscribe();
+            resolve(u);
+          });
+        });
+        expect(clientCard?.roles).toEqual([]);
+        let allowed = false;
+        await server.requireCapability("edit", GLOBAL_SCOPE)(
+          { user: { uid: "u-def", email: "def@example.com", emailVerified: true, isAdmin: false } } as any,
+          { status: () => ({ json: () => undefined }) } as any,
+          () => {
+            allowed = true;
+          }
+        );
+        expect(allowed).toBe(false);
+
+        // A grant of no roles to a new member gives them none, even though the policy lists defaults
+        await store.grantScopeRoles("org-1", "u-volunteer", [], { uid: "u-volunteer", email: "v@example.com" } as any);
+        expect((await store.getScopeMember("org-1", "u-volunteer"))?.roles).toEqual([]);
       } finally {
         server.close();
       }

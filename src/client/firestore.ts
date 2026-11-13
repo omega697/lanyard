@@ -64,10 +64,8 @@ function assertValidFirestoreDocId(id: string | null | undefined, label: string)
   return valid;
 }
 
-export interface FirestoreClientStoreConfig<TRole extends string = string> {
+export interface FirestoreClientStoreConfig<_TRole extends string = string> {
   db: Firestore;
-  /** Optional default roles assigned if a stored document does not have a `roles` field (defaults to `[]`). */
-  defaultRoles?: readonly TRole[];
   /** Canonical users collection name (defaults to `"users"`). */
   usersCollection?: string;
   scopeCollection?: string;
@@ -115,7 +113,6 @@ export class FirestoreClientStore<
   TAttributes extends Record<string, any> = Record<string, any>
 > implements LanyardClientStore<TRole, TCapability, TPreferences, TAttributes> {
   private readonly db: Firestore;
-  private readonly defaultRoles: readonly TRole[];
   private readonly usersCollection: string;
   private readonly scopeCollection: string;
   private readonly membersSubcollection: string;
@@ -129,7 +126,6 @@ export class FirestoreClientStore<
 
   constructor(config: FirestoreClientStoreConfig<TRole>) {
     this.db = config.db;
-    this.defaultRoles = Object.freeze(Array.from(new Set(config.defaultRoles || [])));
     this.usersCollection = assertValidFirestoreDocId(config.usersCollection || "users", "usersCollection");
     this.scopeCollection = assertValidFirestoreDocId(config.scopeCollection || "workspaces", "scopeCollection");
     this.membersSubcollection = assertValidFirestoreDocId(
@@ -160,11 +156,9 @@ export class FirestoreClientStore<
     );
   }
 
+  /** A record's roles exactly as stored (deduplicated); a missing `roles` field means none. */
   private extractRoles(data: Record<string, any>): TRole[] {
-    if (Array.isArray(data.roles) && data.roles.length > 0) {
-      return Array.from(new Set(data.roles as TRole[]));
-    }
-    return [...this.defaultRoles];
+    return Array.isArray(data.roles) ? Array.from(new Set(data.roles as TRole[])) : [];
   }
 
   private parseUserRecord(

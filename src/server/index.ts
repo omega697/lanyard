@@ -1003,48 +1003,55 @@ export function createLanyardServer<
       }
       const existing = await store.getUser(uid);
       const now = new Date().toISOString();
-      const resolvedRoles = params.roles
-        ? Array.from(new Set(params.roles))
-        : (existing?.roles ?? [...policy.defaultRoles]);
+      // Default roles only seed a record that has never had roles; otherwise roles are written only when given, so a
+      // revocation (or a role or admin change made since `existing` was read) is never overwritten. An existing card
+      // that had no roles when read gets the defaults through grantUserRoles, an atomic union, so a role granted
+      // meanwhile isn't lost. (In the rare race where roles were granted and then all revoked meanwhile, the defaults
+      // are still added, since a union can't tell "never had roles" from "had them revoked".)
+      const roles = params.roles ? Array.from(new Set(params.roles)) : !existing ? [...policy.defaultRoles] : undefined;
+      const fillInDefaults =
+        !params.roles && existing && existing.roles === undefined && policy.defaultRoles.length > 0;
 
+      // Only the fields this call sets are written; the store merges them into the existing record
       const record: UserRecord<TRole, TCapability, TPreferences, TAttributes> = {
-        ...(existing || {}),
         uid,
         email: cleanEmail,
-        firstName: params.firstName?.trim() ?? existing?.firstName,
-        lastName: params.lastName?.trim() ?? existing?.lastName,
-        displayName: params.firstName || params.lastName ? displayName : existing?.displayName || displayName,
-        roles: resolvedRoles,
-        ...(params.preferences ? { preferences: { ...(existing?.preferences || {}), ...params.preferences } } : {}),
-        ...(params.attributes ? { attributes: { ...(existing?.attributes || {}), ...params.attributes } } : {}),
-        createdAt: existing?.createdAt || now,
+        ...(params.firstName !== undefined ? { firstName: params.firstName.trim() } : {}),
+        ...(params.lastName !== undefined ? { lastName: params.lastName.trim() } : {}),
+        ...(params.firstName || params.lastName || !existing?.displayName ? { displayName } : {}),
+        ...(roles !== undefined ? { roles } : {}),
+        ...(params.preferences ? { preferences: params.preferences } : {}),
+        ...(params.attributes ? { attributes: params.attributes } : {}),
+        ...(existing?.createdAt ? {} : { createdAt: now }),
         updatedAt: now
       };
 
       await store.upsertUser(record);
+      if (fillInDefaults) {
+        if (typeof store.grantUserRoles !== "function")
+          throw new Error("Backing store does not implement grantUserRoles");
+        await store.grantUserRoles(uid, policy.defaultRoles);
+      }
       return (await store.getUser(uid))!;
     }
 
     const existing = await store.getScopeMember(params.scopeId, uid);
-    const resolvedRoles = params.roles
-      ? Array.from(new Set(params.roles))
-      : (existing?.roles ?? [...policy.defaultRoles]);
-    const member: ScopedMember<TRole, TCapability, TPreferences, TAttributes> = {
-      ...(existing || {}),
+    const roles = params.roles ? Array.from(new Set(params.roles)) : existing ? undefined : [...policy.defaultRoles];
+    const member = {
       uid,
       email: cleanEmail,
-      firstName: params.firstName?.trim() ?? existing?.firstName,
-      lastName: params.lastName?.trim() ?? existing?.lastName,
-      displayName: params.firstName || params.lastName ? displayName : existing?.displayName || displayName,
-      roles: resolvedRoles,
+      ...(params.firstName !== undefined ? { firstName: params.firstName.trim() } : {}),
+      ...(params.lastName !== undefined ? { lastName: params.lastName.trim() } : {}),
+      ...(params.firstName || params.lastName || !existing?.displayName ? { displayName } : {}),
+      ...(roles !== undefined ? { roles } : {}),
       scopeId: params.scopeId,
-      scopeName: params.scopeName ?? existing?.scopeName,
-      ...(params.preferences ? { preferences: { ...(existing?.preferences || {}), ...params.preferences } } : {}),
-      ...(params.attributes ? { attributes: { ...(existing?.attributes || {}), ...params.attributes } } : {})
+      ...(params.scopeName !== undefined ? { scopeName: params.scopeName } : {}),
+      ...(params.preferences ? { preferences: params.preferences } : {}),
+      ...(params.attributes ? { attributes: params.attributes } : {})
     };
 
     await store.upsertScopeMember(params.scopeId, member);
-    return (await store.getScopeMember(params.scopeId, uid)) || member;
+    return (await store.getScopeMember(params.scopeId, uid))!;
   }
 
   /**

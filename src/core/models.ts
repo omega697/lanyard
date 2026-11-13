@@ -255,10 +255,9 @@ export interface PermissionPolicyConfig<TRole extends string = string, TCapabili
    */
   roles?: Record<TRole, RoleDefinition<TRole, TCapability>>;
   /**
-   * Default roles assigned when provisioning a user/member without explicit roles
-   * or when reading a document missing a `roles` field.
-   * If omitted, defaults to `[rootConcreteRole]` when `roles` are defined, or `[]` when `roles` is empty/omitted.
-   * Pass `[]` explicitly if defined roles are privileged-only and regular users should start with no roles.
+   * Roles a newly provisioned user or member starts with when trusted server code creates their record
+   * (`upsertUserByEmail`) without explicit roles. Defaults to `[]`. They're never substituted for a record's stored
+   * roles, and grants never add them, so revoking every role leaves a user with none.
    */
   defaultRoles?: readonly TRole[];
   /**
@@ -705,6 +704,14 @@ export interface SystemAdminProfile {
   updatedAt?: string;
 }
 
+/** A member card to upsert: a `ScopedMember` whose `roles` may be omitted to leave existing roles unchanged. */
+export type ScopedMemberUpsert<
+  TRole extends string = string,
+  TCapability extends string = string,
+  TPreferences extends Record<string, any> = Record<string, any>,
+  TAttributes extends Record<string, any> = Record<string, any>
+> = Omit<ScopedMember<TRole, TCapability, TPreferences, TAttributes>, "roles"> & { roles?: TRole[] };
+
 /**
  * Membership record for a user within a specific tenant/scope (e.g., `workspaces/{scopeId}/members/{uid}`).
  *
@@ -1043,9 +1050,13 @@ export interface LanyardServerStore<
     uid: string
   ): Promise<ScopedMember<TRole, TCapability, TPreferences, TAttributes> | null>;
   listScopeMembers(scopeId: string): Promise<ScopedMember<TRole, TCapability, TPreferences, TAttributes>[]>;
+  /**
+   * Upserts a member card, merging into the existing one. Omitting `roles` leaves an existing member's roles as they
+   * are (and gives a new member none), so callers never have to write back roles they read.
+   */
   upsertScopeMember(
     scopeId: string,
-    member: ScopedMember<TRole, TCapability, TPreferences, TAttributes>
+    member: ScopedMemberUpsert<TRole, TCapability, TPreferences, TAttributes>
   ): Promise<void>;
   /** Required: Like `patchUser`, for an existing member of `scopeId`; throws if they aren't a member. */
   patchScopeMember(scopeId: string, uid: string, fields: StoredProfileFieldsPatch): Promise<void>;

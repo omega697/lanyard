@@ -363,26 +363,13 @@ export function createPermissionPolicy<TRole extends string = string, TCapabilit
     explicitCapabilities ?? Array.from(referencedCapabilitySet)
   );
 
-  // Default to explicit config.defaultRoles or [rootConcreteRole] (or [] when no roles are defined)
-  const rootConcreteRole =
-    assignableEntries.length > 0
-      ? (assignableEntries.find(([, def]) => !Array.isArray(def.inherits) || def.inherits.length === 0)?.[0] ??
-        assignableEntries[0][0])
-      : undefined;
-  let resolvedDefaultRoles: TRole[];
-  if (Array.isArray(config.defaultRoles)) {
-    const valid = Array.from(
-      new Set(config.defaultRoles.filter((r): r is TRole => typeof r === "string" && Object.hasOwn(roles, r)))
-    );
-    if (config.defaultRoles.length === 0) {
-      resolvedDefaultRoles = [];
-    } else if (valid.length > 0) {
-      resolvedDefaultRoles = valid;
-    } else {
-      resolvedDefaultRoles = rootConcreteRole !== undefined ? [rootConcreteRole] : [];
+  // Default roles are only what a newly provisioned record starts with: exactly the listed roles, or none
+  const resolvedDefaultRoles: TRole[] = [];
+  for (const r of Array.isArray(config.defaultRoles) ? config.defaultRoles : []) {
+    if (typeof r !== "string" || !Object.hasOwn(roles, r)) {
+      throw new Error(`Invalid defaultRoles '${String(r)}': role is not defined in roles.`);
     }
-  } else {
-    resolvedDefaultRoles = rootConcreteRole !== undefined ? [rootConcreteRole] : [];
+    if (!resolvedDefaultRoles.includes(r as TRole)) resolvedDefaultRoles.push(r as TRole);
   }
   const defaultRoles: readonly TRole[] = Object.freeze(resolvedDefaultRoles);
 
@@ -469,7 +456,7 @@ export function createPermissionPolicy<TRole extends string = string, TCapabilit
   ): boolean {
     if (isSystemAdmin) return true;
     if (!member || typeof member !== "object") return false;
-    const effectiveRoles = member.roles === undefined ? defaultRoles : Array.isArray(member.roles) ? member.roles : [];
+    const effectiveRoles = Array.isArray(member.roles) ? member.roles : [];
     return effectiveRoles.some(
       (role: TRole) =>
         typeof role === "string" && Object.hasOwn(roles, role) && Boolean(roles[role as TRole]?.trackPresence)

@@ -14,6 +14,7 @@ import type {
   RevocationEpochListener,
   SessionRevocationsListener,
   ScopedMember,
+  ScopedMemberUpsert,
   SecretCipher,
   StoredProfileFieldsPatch,
   SubscribeToMembersOptions,
@@ -754,7 +755,7 @@ export class InMemoryLanyardStore<
 
   async upsertScopeMember(
     scopeId: string,
-    member: ScopedMember<TRole, TCapability, TPreferences, TAttributes>
+    member: ScopedMemberUpsert<TRole, TCapability, TPreferences, TAttributes>
   ): Promise<void> {
     assertValidResourceId(scopeId, "scopeId");
     assertValidResourceId(member.uid, "uid");
@@ -778,7 +779,8 @@ export class InMemoryLanyardStore<
           ? { photoUrl: existing.photoUrl }
           : {}),
       scopeId,
-      roles: Array.from(new Set(card.roles || [])),
+      // Omitted roles leave an existing member's roles untouched (a new member gets none)
+      roles: card.roles !== undefined ? Array.from(new Set(card.roles)) : existing?.roles ? [...existing.roles] : [],
       ...(Object.keys(cardAttributes).length > 0
         ? { attributes: { ...(existing?.attributes || {}), ...cardAttributes } }
         : existing?.attributes !== undefined

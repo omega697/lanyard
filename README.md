@@ -138,7 +138,7 @@ export const workspacePolicy = createPermissionPolicy<WorkspaceRole, WorkspaceCa
       capabilities: []
     }
   },
-  defaultRoles: ["member"],
+  defaultRoles: ["member"], // What a user provisioned by upsertUserByEmail without explicit roles starts with
   userCapabilities: {
     read: "edit_content", // Roles with 'edit_content' can view other users' profiles
     write: "invite_members", // Roles with 'invite_members' can update/delete non-admin users
@@ -213,7 +213,6 @@ export interface UserPrefs {
 const store = new FirestoreClientStore<WorkspaceRole, WorkspaceCapability, UserPrefs>({
   db,
   policy: workspacePolicy, // Field placement (cardFields) must match the client's policy
-  defaultRoles: workspacePolicy.defaultRoles,
   scopeCollection: "workspaces",
   membersSubcollection: "members"
 });
@@ -393,7 +392,6 @@ import { workspacePolicy, type WorkspaceRole, type WorkspaceCapability } from ".
 const store = new FirestoreServerStore<WorkspaceRole, WorkspaceCapability>({
   db,
   policy: workspacePolicy, // Field placement (cardFields) must match the server's policy
-  defaultRoles: workspacePolicy.defaultRoles,
   scopeCollection: "workspaces",
   membersSubcollection: "members",
   encryptionKey: process.env.LANYARD_ENCRYPTION_KEY // Master key for AES-256-GCM encrypted secrets
