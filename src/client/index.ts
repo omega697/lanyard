@@ -20,7 +20,14 @@ import {
   type AuthProvider
 } from "firebase/auth";
 import {
+  EMAIL_NOT_VERIFIED_ERROR_CODE,
+  EmailNotVerifiedError,
   GLOBAL_SCOPE,
+  REVOCATION_CLOCK_SKEW_MS,
+  SESSION_REVOKED_ERROR_CODE,
+  SessionRevokedError,
+  TOKEN_STALE_ERROR_CODE,
+  TokenStaleError,
   createWritableStore,
   formatExistingAccountError,
   isValidEmail,
@@ -166,6 +173,11 @@ export interface LanyardClientConfig<
    * deduplication key so the callback will be retried on the next snapshot/session.
    */
   onVerifiedEmailChange?: (event: VerifiedEmailChangeEvent) => void | Promise<void>;
+  /**
+   * How long `authorizedFetch` waits before refreshing a second time when a freshly refreshed token is still reported
+   * stale (it can share a second with the revocation), in milliseconds. Defaults to `REVOCATION_CLOCK_SKEW_MS + 1000`.
+   */
+  staleTokenRetryDelayMs?: number;
 }
 
 /**
@@ -186,7 +198,8 @@ export function createLanyardClient<
     defaultPreferences,
     policy,
     storageKeyPrefix = "lanyard",
-    onVerifiedEmailChange
+    onVerifiedEmailChange,
+    staleTokenRetryDelayMs = REVOCATION_CLOCK_SKEW_MS + 1000
   } = config;
   assertStoreMatchesPolicyPlacement(store, resolveCardFields(policy));
 
@@ -769,6 +782,81 @@ export function createLanyardClient<
     const normalized = normalizeFirebaseUser(auth.currentUser || user, tokenResult?.claims || {});
     setActiveUser(normalized);
     return normalized.emailVerified;
+  }
+
+  // --- Authorized API Requests ---
+
+  /** Forces a token refresh and publishes the refreshed claims (e.g. `isAdmin` after a demotion) to `authStore`. */
+  async function refreshTokenAndClaims(user: User): Promise<string> {
+    const tokenResult = await user.getIdTokenResult(true);
+    const current = authStoreInternal.get().user;
+    if (current && current.uid === user.uid) {
+      const refreshed = normalizeFirebaseUser(user, tokenResult?.claims || {});
+      if (refreshed.isAdmin !== current.isAdmin) {
+        authStoreInternal.set({ user: { ...current, isAdmin: refreshed.isAdmin }, isReady: true });
+      }
+    }
+    return tokenResult.token;
+  }
+
+  async function errorCodeOf(res: Response): Promise<string | undefined> {
+    if (res.status !== 401) return undefined;
+    try {
+      const body = await res.clone().json();
+      return typeof body?.code === "string" ? body.code : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  function withBearer(
+    input: RequestInfo | URL,
+    init: RequestInit | undefined,
+    token: string
+  ): [RequestInfo | URL, RequestInit | undefined] {
+    if (typeof Request !== "undefined" && input instanceof Request) {
+      const headers = new Headers(input.headers);
+      if (init?.headers) new Headers(init.headers).forEach((value, key) => headers.set(key, value));
+      headers.set("Authorization", `Bearer ${token}`);
+      return [new Request(input, { ...init, headers }), undefined];
+    }
+    const headers = new Headers(init?.headers);
+    headers.set("Authorization", `Bearer ${token}`);
+    return [input, { ...init, headers }];
+  }
+
+  /**
+   * `fetch` with the signed-in user's ID token attached, handling Lanyard's auth responses so apps don't compare
+   * strings:
+   * - `401 auth/token-stale` (the token predates a revocation, e.g. a demotion): forces a token refresh, publishes the
+   *   refreshed claims to `authStore`, and retries. If the new token shares a second with the revocation and is still
+   *   stale, it waits `staleTokenRetryDelayMs` and tries once more, then throws `TokenStaleError`.
+   * - `401 auth/session-revoked`: signs the user out locally and throws `SessionRevokedError`.
+   * - `401 auth/email-not-verified`: throws `EmailNotVerifiedError`.
+   *
+   * Every other response is returned as-is. Request bodies must be replayable (strings, `FormData`, `Blob`, or a
+   * `Request`, which is cloned before sending), because a stale-token retry sends them again.
+   */
+  async function authorizedFetch(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
+    const user = auth?.currentUser;
+    if (!auth || !user) throw new Error("No authenticated user.");
+    const original = typeof Request !== "undefined" && input instanceof Request ? input.clone() : input;
+
+    let token = await user.getIdToken();
+    for (let attempt = 0; ; attempt++) {
+      const requestInput = typeof Request !== "undefined" && original instanceof Request ? original.clone() : original;
+      const res = await fetch(...withBearer(requestInput, init, token));
+      const code = await errorCodeOf(res);
+      if (code === SESSION_REVOKED_ERROR_CODE) {
+        await firebaseSignOut(auth);
+        throw new SessionRevokedError();
+      }
+      if (code === EMAIL_NOT_VERIFIED_ERROR_CODE) throw new EmailNotVerifiedError();
+      if (code !== TOKEN_STALE_ERROR_CODE) return res;
+      if (attempt === 2) throw new TokenStaleError();
+      if (attempt === 1) await new Promise((resolve) => setTimeout(resolve, staleTokenRetryDelayMs));
+      token = await refreshTokenAndClaims(user);
+    }
   }
 
   // --- Self-Service Profile & Preferences (Unified with Explicit ScopeId) ---
@@ -1517,6 +1605,7 @@ export function createLanyardClient<
     sendEmailUpdateVerification,
     sendEmailVerificationLink,
     refreshEmailVerification,
+    authorizedFetch,
     updatePreferences,
     updateProfile,
     getRoles,

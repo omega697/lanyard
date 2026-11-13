@@ -1,6 +1,7 @@
 import type { NextFunction, Request, Response } from "express";
 import {
   EMAIL_NOT_VERIFIED_ERROR_CODE,
+  EmailNotVerifiedError,
   GLOBAL_SCOPE,
   REVOCATION_CLOCK_SKEW_MS,
   SESSION_REVOKED_ERROR_CODE,
@@ -109,15 +110,9 @@ export interface AdminAuthAdapter {
 /**
  * Thrown by `GoogleAuthService.verifyToken` when the token's email isn't verified. `checkAuth` turns it into a 401
  * whose JSON body carries `code: EMAIL_NOT_VERIFIED_ERROR_CODE`; custom middleware can check `code` the same way.
+ * Defined in `lanyard/core` so browser code can check `instanceof` too.
  */
-export class EmailNotVerifiedError extends Error {
-  readonly code = EMAIL_NOT_VERIFIED_ERROR_CODE;
-
-  constructor() {
-    super("Token email must be verified");
-    this.name = "EmailNotVerifiedError";
-  }
-}
+export { EmailNotVerifiedError };
 
 const SAFE_AUTH_ERROR_PREFIXES = ["Token must contain an email claim", "Token email must be verified"];
 

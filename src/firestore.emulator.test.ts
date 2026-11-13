@@ -5,6 +5,7 @@ import { createRequire } from "node:module";
 import { createServer } from "node:net";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
+import express from "express";
 import {
   deleteApp as deleteAdminApp,
   initializeApp as initializeAdminApp,
@@ -42,7 +43,10 @@ import { createLanyardClient } from "./client/index.js";
 import {
   createPermissionPolicy,
   GLOBAL_SCOPE,
+  REVOCATION_CLOCK_SKEW_MS,
   SESSION_REVOKED_ERROR_CODE,
+  SessionRevokedError,
+  TOKEN_STALE_ERROR_CODE,
   type LanyardReadable
 } from "./core/index.js";
 import { FirestoreServerStore } from "./server/firestore.js";
@@ -1946,6 +1950,7 @@ service cloud.firestore {
       );
       return {
         user,
+        auth,
         db,
         async close() {
           await terminate(db);
@@ -2118,6 +2123,67 @@ service cloud.firestore {
         await signedOut.close();
       }
     }, 30_000);
+
+    it("authorizedFetch end to end: a call with a token that predates a revocation is transparently refreshed and retried without signing out, and a revoked session signs the user out", async () => {
+      const suffix = Date.now();
+      const store = new FirestoreServerStore({
+        db: adminDb,
+        usersCollection: `users_fetch_${suffix}`,
+        metaCollection: `meta_fetch_${suffix}`
+      });
+      const server = createLanyardServer({ adminAuth: productionLikeAdminAuth(), store });
+      const app = express();
+      // Echoes when the token the server accepted was issued
+      app.get("/me", server.checkAuth as any, (req: any, res) => {
+        res.json({ uid: req.user.uid, tokenIssuedAtSeconds: req.user.tokenIssuedAtSeconds });
+      });
+      const httpServer = await new Promise<HttpServer>((resolve) => {
+        const s = app.listen(0, "127.0.0.1", () => resolve(s));
+      });
+      const url = `http://127.0.0.1:${(httpServer.address() as { port: number }).port}/me`;
+
+      const user = await signInEmulatorUser("u-fetch", "fetch@example.com", { admin: true });
+      const lanyard = createLanyardClient({
+        auth: user.auth,
+        store: new FirestoreClientStore({ db: user.db, usersCollection: `users_fetch_${suffix}` }),
+        defaultPreferences: {}
+      });
+      try {
+        expect((await lanyard.authorizedFetch(url)).status).toBe(200);
+
+        // A revocation (here: a claim change plus an epoch bump, as a demotion will do) supersedes the current token
+        await crossSecondBoundary();
+        await adminAuth.setCustomUserClaims("u-fetch", { admin: false });
+        const epoch = await store.bumpRevocationEpoch(Date.now());
+        const staleToken = await user.user.getIdToken();
+        let check = await runMiddleware(server.checkAuth, staleToken);
+        for (let i = 0; i < 50 && check.nextCalled; i++) {
+          await new Promise((resolve) => setTimeout(resolve, 100));
+          check = await runMiddleware(server.checkAuth, staleToken);
+        }
+        expect(check.body).toMatchObject({ code: TOKEN_STALE_ERROR_CODE });
+
+        // The app's call succeeds anyway: refused as stale, refreshed past the revocation, retried
+        const res = await lanyard.authorizedFetch(url);
+        expect(res.status).toBe(200);
+        const body = await res.json();
+        expect(body.tokenIssuedAtSeconds * 1000).toBeGreaterThan(epoch + REVOCATION_CLOCK_SKEW_MS);
+        expect((await user.user.getIdTokenResult()).claims.admin).toBe(false);
+        expect(user.auth.currentUser?.uid).toBe("u-fetch");
+
+        // Signing them out everywhere: the next call signs them out locally and throws a typed error
+        await crossSecondBoundary();
+        await server.revokeUserSessions({ uid: "u-fetch", actor: { uid: "u-fetch" } });
+        const error = await lanyard.authorizedFetch(url).catch((e) => e);
+        expect(error).toBeInstanceOf(SessionRevokedError);
+        expect(user.auth.currentUser).toBeNull();
+      } finally {
+        lanyard.destroy();
+        server.close();
+        await new Promise<void>((resolve) => httpServer.close(() => resolve()));
+        await user.close();
+      }
+    }, 60_000);
 
     knownVulnerability(
       "KNOWN VULNERABILITY: generated rules keep honoring a demoted admin's stale claim",

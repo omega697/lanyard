@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+### New
+
+- **`authorizedFetch(input, init)` on the client** sends a request with the signed-in user's ID token and handles
+  Lanyard's auth responses, so apps don't compare strings or retry by hand:
+  - `401 auth/token-stale`: forces a token refresh, publishes the refreshed claims (such as `isAdmin` after a demotion)
+    to `authStore`, and retries; if the new token still shares a second with the revocation it waits
+    `staleTokenRetryDelayMs` (default `REVOCATION_CLOCK_SKEW_MS + 1000`) and tries once more, then throws
+    `TokenStaleError`;
+  - `401 auth/session-revoked`: signs the user out locally and throws `SessionRevokedError`;
+  - `401 auth/email-not-verified`: throws `EmailNotVerifiedError`.
+
+  Other responses are returned as-is. Request bodies must be replayable. `EmailNotVerifiedError` moves to
+  `lanyard/core` (still exported from `lanyard/server`) alongside the new `SessionRevokedError` and `TokenStaleError`,
+  each with a `code`, so browser code can check `instanceof`.
+
 ### Breaking changes
 
 - **`checkAuth` enforces revocations, and requires token times.** It now rejects, before any store lookup:
