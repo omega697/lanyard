@@ -14,10 +14,15 @@ import {
 } from "firebase/firestore";
 import {
   assertValidResourceId,
+  DEFAULT_LANYARD_META_COLLECTION,
+  readStoredRevocationEpoch,
+  REVOCATION_EPOCH_DOC_ID,
+  REVOCATION_EPOCH_FIELD,
   sanitizeAvatarUrl,
   type CardFieldsPlacement,
   type LanyardClientStore,
   type LanyardStorePlacementSource,
+  type RevocationEpochListener,
   TIER_METADATA_KEY,
   type SubscribeToMembersOptions,
   type ScopedMember,
@@ -66,6 +71,8 @@ export interface FirestoreClientStoreConfig<TRole extends string = string> {
   usersCollection?: string;
   scopeCollection?: string;
   membersSubcollection?: string;
+  /** Collection holding Lanyard's metadata documents, such as the revocation epoch (defaults to `"lanyard_meta"`). */
+  metaCollection?: string;
   /**
    * The app's `PermissionPolicy`, describing which fields (`cardFields`) live on the card rather than in their
    * private tier. Omit only if the policy doesn't set `cardFields`; `createLanyardClient` throws if they disagree.
@@ -111,6 +118,7 @@ export class FirestoreClientStore<
   private readonly usersCollection: string;
   private readonly scopeCollection: string;
   private readonly membersSubcollection: string;
+  private readonly metaCollection: string;
   readonly cardFields: CardFieldsPlacement;
 
   private readonly userWatchers = new Map<
@@ -127,7 +135,28 @@ export class FirestoreClientStore<
       config.membersSubcollection || "members",
       "membersSubcollection"
     );
+    this.metaCollection = assertValidFirestoreDocId(
+      config.metaCollection || DEFAULT_LANYARD_META_COLLECTION,
+      "metaCollection"
+    );
     this.cardFields = resolveCardFields(config.policy);
+  }
+
+  subscribeToRevocationEpoch(onChange: RevocationEpochListener, onError: (error: unknown) => void): () => void {
+    return onSnapshot(
+      doc(this.db, this.metaCollection, REVOCATION_EPOCH_DOC_ID),
+      (snap) => {
+        let epoch: number | null;
+        try {
+          epoch = readStoredRevocationEpoch(snap.data(), REVOCATION_EPOCH_FIELD);
+        } catch (error) {
+          onError(error);
+          return;
+        }
+        onChange(epoch);
+      },
+      onError
+    );
   }
 
   private extractRoles(data: Record<string, any>): TRole[] {

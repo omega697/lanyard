@@ -156,6 +156,24 @@ export function assertValidResourceId(id: string | null | undefined, label = "id
   return id;
 }
 
+/** Asserts that `atMs` is a valid revocation epoch: a non-negative integer number of epoch milliseconds. */
+export function assertValidRevocationEpoch(atMs: unknown): number {
+  if (typeof atMs !== "number" || !Number.isSafeInteger(atMs) || atMs < 0) {
+    throw new Error("Invalid revocation epoch: must be a non-negative integer number of epoch milliseconds");
+  }
+  return atMs;
+}
+
+/**
+ * Reads the revocation epoch from a stored document's data: `null` when the document or field is absent. Throws on a
+ * malformed value rather than guessing, so callers fail closed.
+ */
+export function readStoredRevocationEpoch(data: Record<string, any> | undefined, field: string): number | null {
+  const value = data?.[field];
+  if (value === undefined || value === null) return null;
+  return assertValidRevocationEpoch(value);
+}
+
 /**
  * Sanitizes a raw avatar URL string, stripping empty strings, `"null"`/`"undefined"` literals,
  * oversized payloads (`> 2048` chars), protocol-relative URLs (`//evil.com`), SVG data URIs

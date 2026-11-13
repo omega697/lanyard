@@ -1,10 +1,16 @@
 import { FieldValue, type Firestore } from "firebase-admin/firestore";
 import {
   assertValidResourceId,
+  assertValidRevocationEpoch,
+  DEFAULT_LANYARD_META_COLLECTION,
+  readStoredRevocationEpoch,
+  REVOCATION_EPOCH_DOC_ID,
+  REVOCATION_EPOCH_FIELD,
   sanitizeAvatarUrl,
   type CardFieldsPlacement,
   type LanyardServerStore,
   type LanyardStorePlacementSource,
+  type RevocationEpochListener,
   TIER_METADATA_KEY,
   type ScopedMember,
   type SecretCipher,
@@ -65,6 +71,8 @@ export interface FirestoreServerStoreConfig<TRole extends string = string> {
   usersCollection?: string;
   scopeCollection?: string;
   membersSubcollection?: string;
+  /** Collection holding Lanyard's metadata documents, such as the revocation epoch (defaults to `"lanyard_meta"`). */
+  metaCollection?: string;
   /**
    * Master encryption key used to encrypt and decrypt write-only secrets at rest (`private/secrets`)
    * with AES-256-GCM. Defaults to `process.env.MASTER_ENCRYPTION_KEY` if set.
@@ -106,6 +114,7 @@ export class FirestoreServerStore<
   private readonly usersCollection: string;
   private readonly scopeCollection: string;
   private readonly membersSubcollection: string;
+  private readonly metaCollection: string;
   private readonly cipher?: SecretCipher;
   readonly cardFields: CardFieldsPlacement;
 
@@ -117,6 +126,10 @@ export class FirestoreServerStore<
     this.membersSubcollection = assertValidFirestoreDocId(
       config.membersSubcollection || "members",
       "membersSubcollection"
+    );
+    this.metaCollection = assertValidFirestoreDocId(
+      config.metaCollection || DEFAULT_LANYARD_META_COLLECTION,
+      "metaCollection"
     );
     const key = config.encryptionKey || process.env.MASTER_ENCRYPTION_KEY;
     this.cipher = config.cipher ?? (key ? createSecretCipher(key) : undefined);
@@ -131,6 +144,41 @@ export class FirestoreServerStore<
     throw new Error(
       "Cannot encrypt or decrypt secrets: configure 'encryptionKey', 'cipher', or MASTER_ENCRYPTION_KEY on FirestoreServerStore."
     );
+  }
+
+  // --- Revocation Epoch ---
+
+  private revocationEpochRef() {
+    return this.db.collection(this.metaCollection).doc(REVOCATION_EPOCH_DOC_ID);
+  }
+
+  async getRevocationEpoch(): Promise<number | null> {
+    const snap = await this.revocationEpochRef().get();
+    return readStoredRevocationEpoch(snap.data(), REVOCATION_EPOCH_FIELD);
+  }
+
+  async bumpRevocationEpoch(atMs: number): Promise<number> {
+    assertValidRevocationEpoch(atMs);
+    const ref = this.revocationEpochRef();
+    return this.db.runTransaction(async (tx) => {
+      const current = readStoredRevocationEpoch((await tx.get(ref)).data(), REVOCATION_EPOCH_FIELD);
+      const next = Math.max(current ?? 0, atMs);
+      if (next !== current) tx.set(ref, { [REVOCATION_EPOCH_FIELD]: next }, { merge: true });
+      return next;
+    });
+  }
+
+  subscribeToRevocationEpoch(onChange: RevocationEpochListener, onError: (error: unknown) => void): () => void {
+    return this.revocationEpochRef().onSnapshot((snap) => {
+      let epoch: number | null;
+      try {
+        epoch = readStoredRevocationEpoch(snap.data(), REVOCATION_EPOCH_FIELD);
+      } catch (error) {
+        onError(error);
+        return;
+      }
+      onChange(epoch);
+    }, onError);
   }
 
   private extractRoles(data: Record<string, any>): TRole[] {

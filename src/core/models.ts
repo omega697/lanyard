@@ -729,6 +729,19 @@ export interface SubscribeToUsersOptions extends SubscribeToMembersOptions {
 }
 
 /**
+ * Receives a store's revocation epoch: the time (epoch milliseconds) of the most recent revocation Lanyard recorded,
+ * or `null` if nothing has been revoked. ID tokens issued before it are treated as stale and must be refreshed.
+ */
+export type RevocationEpochListener = (epochMs: number | null) => void;
+
+/** Default collection holding Lanyard's own metadata documents (such as the revocation epoch). */
+export const DEFAULT_LANYARD_META_COLLECTION = "lanyard_meta";
+/** Document id of the revocation epoch within the Lanyard metadata collection. */
+export const REVOCATION_EPOCH_DOC_ID = "revocation";
+/** Field of the revocation epoch document holding the epoch, in epoch milliseconds. */
+export const REVOCATION_EPOCH_FIELD = "lastRevocationAtMs";
+
+/**
  * Storage-agnostic client adapter interface.
  *
  * Consuming applications can pass `FirestoreClientStore` (from `lanyard/client/firestore`),
@@ -747,6 +760,12 @@ export interface LanyardClientStore<
   subscribeToPreferences(uid: string, onChange: (prefs: Partial<TPreferences>) => void): () => void;
   /** Persist a partial update to a user's global preferences. */
   savePreferences(uid: string, patch: Partial<TPreferences>): Promise<void>;
+  /**
+   * Required: Subscribe to the revocation epoch (see {@link RevocationEpochListener}). Must emit the current value
+   * promptly after subscribing, then every change; report failures through `onError`. Returns an unsubscribe function.
+   * Verify implementations with `assertRevocationEpochConformance` from `lanyard/testing`.
+   */
+  subscribeToRevocationEpoch(onChange: RevocationEpochListener, onError: (error: unknown) => void): () => void;
   /** Optional: Persist a partial update to a user's tenant-scoped preferences within `scopeId`. */
   saveScopePreferences?(scopeId: string, uid: string, patch: Partial<TPreferences>): Promise<void>;
   /**
@@ -873,6 +892,21 @@ export interface LanyardServerStore<
   getCustomDoc?(name: string, uid: string, scopeId: string | null): Promise<Record<string, any>>;
   /** Optional: Merges `patch` into an app-defined custom document. */
   updateCustomDoc?(name: string, uid: string, scopeId: string | null, patch: Record<string, any>): Promise<void>;
+
+  // --- Revocation epoch (required; verify with `assertRevocationEpochConformance` from `lanyard/testing`) ---
+  /** Required: Resolves the revocation epoch (see {@link RevocationEpochListener}), or `null` if none is recorded. */
+  getRevocationEpoch(): Promise<number | null>;
+  /**
+   * Required: Records a revocation at `atMs` (non-negative integer epoch milliseconds; rejects anything else).
+   * Monotonic: the stored epoch becomes the larger of its current value and `atMs`, atomically under concurrent
+   * callers. Resolves the epoch stored afterwards.
+   */
+  bumpRevocationEpoch(atMs: number): Promise<number>;
+  /**
+   * Required: Subscribe to the revocation epoch. Must emit the current value promptly after subscribing, then every
+   * change; report failures through `onError`. Returns an unsubscribe function.
+   */
+  subscribeToRevocationEpoch(onChange: RevocationEpochListener, onError: (error: unknown) => void): () => void;
 
   // --- Global User (`users/{uid}`) & System Admin Operations ---
   getUser?(uid: string): Promise<UserRecord<TRole, TCapability, TPreferences, TAttributes> | null>;

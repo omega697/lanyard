@@ -33,6 +33,10 @@
     "./rules": {
       "types": "./dist/rules/index.d.ts",
       "import": "./dist/rules/index.js"
+    },
+    "./testing": {
+      "types": "./dist/testing/index.d.ts",
+      "import": "./dist/testing/index.js"
     }
   },
   "bin": {

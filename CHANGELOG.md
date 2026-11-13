@@ -4,6 +4,16 @@
 
 ### Breaking changes
 
+- **Stores must implement the revocation epoch.** `LanyardServerStore` now requires `getRevocationEpoch()`,
+  `bumpRevocationEpoch(atMs)` and `subscribeToRevocationEpoch(onChange, onError)`, and `LanyardClientStore` requires
+  `subscribeToRevocationEpoch(onChange, onError)`. The epoch is the time (epoch milliseconds) of the most recent
+  revocation, or `null` if there hasn't been one; it only moves forward and rejects anything but non-negative integer
+  milliseconds. It is the foundation for immediate revocation: ID tokens issued before it will be treated as stale.
+  `FirestoreServerStore`, `FirestoreClientStore` and `InMemoryLanyardStore` implement it (Firestore keeps it in
+  `lanyard_meta/revocation`, configurable with the new `metaCollection` option, and a malformed stored value fails
+  closed). Custom stores must add these methods; verify them with `assertRevocationEpochConformance` from the new
+  `lanyard/testing` entry point.
+
 - **Admin checks fail closed when the backing store is unreachable.** `checkAuth` used to keep the token's `admin`
   claim as `req.user.isAdmin` if `store.getUser`/`store.getSystemAdmin` threw, and `requireAdmin` let the request
   through on the same claim. Because a demotion only lands in the token when it's refreshed (up to an hour later), a

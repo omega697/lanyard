@@ -1,10 +1,11 @@
-import { assertValidResourceId, sanitizeAvatarUrl } from "./formatters.js";
+import { assertValidResourceId, assertValidRevocationEpoch, sanitizeAvatarUrl } from "./formatters.js";
 import type {
   CardFieldsPlacement,
   EncryptedSecretData,
   LanyardClientStore,
   LanyardServerStore,
   LanyardStorePlacementSource,
+  RevocationEpochListener,
   ScopedMember,
   SecretCipher,
   SubscribeToMembersOptions,
@@ -178,6 +179,32 @@ export class InMemoryLanyardStore<
     string,
     Set<(members: ScopedMember<TRole, TCapability, TPreferences, TAttributes>[]) => void>
   >();
+  private revocationEpoch: number | null = null;
+  private revocationEpochListeners = new Set<RevocationEpochListener>();
+
+  // --- Revocation Epoch (shared by client and server sides) ---
+
+  async getRevocationEpoch(): Promise<number | null> {
+    return this.revocationEpoch;
+  }
+
+  async bumpRevocationEpoch(atMs: number): Promise<number> {
+    assertValidRevocationEpoch(atMs);
+    const next = Math.max(this.revocationEpoch ?? 0, atMs);
+    if (next !== this.revocationEpoch) {
+      this.revocationEpoch = next;
+      for (const listener of [...this.revocationEpochListeners]) listener(next);
+    }
+    return next;
+  }
+
+  subscribeToRevocationEpoch(onChange: RevocationEpochListener, _onError: (error: unknown) => void): () => void {
+    this.revocationEpochListeners.add(onChange);
+    onChange(this.revocationEpoch);
+    return () => {
+      this.revocationEpochListeners.delete(onChange);
+    };
+  }
 
   // --- Client Store Methods ---
 

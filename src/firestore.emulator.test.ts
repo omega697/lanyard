@@ -43,6 +43,7 @@ import { createPermissionPolicy, GLOBAL_SCOPE, type LanyardReadable } from "./co
 import { FirestoreServerStore } from "./server/firestore.js";
 import { createLanyardServer, isEncryptedSecretData } from "./server/index.js";
 import { generateFirestoreRules } from "./rules/index.js";
+import { assertRevocationEpochConformance } from "./testing/index.js";
 
 /**
  * Resolves the Cloud Firestore Emulator jar: `FIRESTORE_EMULATOR_JAR` if set, otherwise the newest
@@ -285,6 +286,31 @@ describe.skipIf(!emulatorsAvailable)(
         delete process.env.FIREBASE_AUTH_EMULATOR_HOST;
       }
     });
+
+    it("FirestoreServerStore and FirestoreClientStore conform to the revocation epoch contract on real Firestore", async () => {
+      // Runs before any test loads security rules, so the client reads the epoch document under open emulator rules
+      const metaCollection = `lanyard_meta_conformance_${Date.now()}`;
+      await assertRevocationEpochConformance({
+        serverStore: new FirestoreServerStore({ db: adminDb, metaCollection }),
+        clientStore: new FirestoreClientStore({ db: clientDb, metaCollection })
+      });
+
+      // A malformed stored epoch fails closed: reads reject and subscriptions report an error instead of a value
+      const corruptCollection = `${metaCollection}_corrupt`;
+      await adminDb.doc(`${corruptCollection}/revocation`).set({ lastRevocationAtMs: "not-a-number" });
+      const corruptStore = new FirestoreServerStore({ db: adminDb, metaCollection: corruptCollection });
+      await expect(corruptStore.getRevocationEpoch()).rejects.toThrow(/Invalid revocation epoch/);
+      const subscriptionError = await new Promise<unknown>((resolve) => {
+        const unsubscribe = corruptStore.subscribeToRevocationEpoch(
+          () => {},
+          (error) => {
+            unsubscribe();
+            resolve(error);
+          }
+        );
+      });
+      expect(String(subscriptionError)).toMatch(/Invalid revocation epoch/);
+    }, 30_000);
 
     it("enforces single-tenant multi-role hierarchy, sibling role isolation, field-level attributes/hiddenAttributes, AES-256-GCM encrypted secrets, and live client reactivity on real Firestore", async () => {
       type Role = "attendee" | "scanner" | "merch_seller" | "auditor" | "moderator";
