@@ -47,7 +47,7 @@ type FakeAdminAuth = AdminAuthAdapter & {
 };
 
 function createFakeAdminAuth(): FakeAdminAuth {
-  const usersByEmail = new Map<string, { uid: string; email: string; displayName?: string }>();
+  const usersByEmail = new Map<string, { uid: string; email: string; emailVerified?: boolean; displayName?: string }>();
   const claimsByUid = new Map<string, Record<string, any> | null>();
   const deletedUids = new Set<string>();
   const updatedUsersByUid = new Map<string, { displayName?: string | null; photoURL?: string | null }>();
@@ -133,6 +133,7 @@ function createFakeAdminAuth(): FakeAdminAuth {
       const rec = {
         uid: `provisioned-uid-${counter++}`,
         email: clean,
+        emailVerified: props.emailVerified === true,
         displayName: props.displayName
       };
       usersByEmail.set(clean, rec);
@@ -3437,5 +3438,61 @@ describe("lanyard/server unit tests", () => {
       badges: ["early-bird"],
       points: 42
     });
+  });
+
+  it("refuses to provision or grant roles/admin to an existing account whose email is not verified (H3)", async () => {
+    const adminAuth = createFakeAdminAuth();
+    // Simulate an attacker pre-registering an unverified account (e.g. via email/password) before the victim is invited
+    await adminAuth.createUser({ email: "squatted@example.com", emailVerified: false });
+    adminAuth.claimsByUid.set("u-root-admin", { admin: true });
+    (adminAuth as any).getUser = async (uid: string) => ({ uid, customClaims: adminAuth.claimsByUid.get(uid) ?? null });
+
+    const store = new InMemoryLanyardStore<TestRole, TestCap>();
+    const server = createLanyardServer<TestRole, TestCap>({
+      adminAuth,
+      store,
+      policy: TEST_POLICY
+    });
+
+    await expect(server.getOrProvisionUidByEmail({ email: "squatted@example.com" })).rejects.toBeInstanceOf(
+      EmailNotVerifiedError
+    );
+    await expect(
+      server.upsertUserByEmail({ scopeId: GLOBAL_SCOPE, email: "squatted@example.com", roles: ["manager"] })
+    ).rejects.toBeInstanceOf(EmailNotVerifiedError);
+    await expect(
+      server.grantRolesByEmail({ scopeId: "ws-1", email: "squatted@example.com", roles: ["owner"] })
+    ).rejects.toBeInstanceOf(EmailNotVerifiedError);
+    await expect(
+      server.setSystemAdminStatus({
+        email: "squatted@example.com",
+        isAdmin: true,
+        actor: { uid: "u-root-admin" }
+      })
+    ).rejects.toBeInstanceOf(EmailNotVerifiedError);
+
+    // Also fails closed when getUserByEmail omits emailVerified altogether, or on the createUser race path
+    vi.spyOn(adminAuth, "getUserByEmail").mockResolvedValueOnce({
+      uid: "u-missing-flag",
+      email: "missing@example.com"
+    });
+    await expect(server.getOrProvisionUidByEmail({ email: "missing@example.com" })).rejects.toBeInstanceOf(
+      EmailNotVerifiedError
+    );
+
+    vi.spyOn(adminAuth, "getUserByEmail")
+      .mockRejectedValueOnce(Object.assign(new Error("not found"), { code: "auth/user-not-found" }))
+      .mockResolvedValueOnce({ uid: "u-race-squatted", email: "race@example.com", emailVerified: false });
+    vi.spyOn(adminAuth, "createUser").mockRejectedValueOnce(
+      Object.assign(new Error("already exists"), { code: "auth/email-already-exists" })
+    );
+    await expect(server.getOrProvisionUidByEmail({ email: "race@example.com" })).rejects.toBeInstanceOf(
+      EmailNotVerifiedError
+    );
+
+    expect(await store.listUsers()).toEqual([]);
+    expect(await store.listScopeMembers("ws-1")).toEqual([]);
+    expect(await store.listSystemAdmins()).toEqual([]);
+    server.close();
   });
 });

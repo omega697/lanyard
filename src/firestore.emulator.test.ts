@@ -2353,6 +2353,19 @@ ${generateFirestoreRules(createPermissionPolicy({}), { usersCollection, metaColl
         await expect(
           clientGetDoc(clientDoc(unverifiedDb, `${usersCollection}/u-rules-unverified`))
         ).rejects.toMatchObject({ code: "permission-denied" });
+
+        // 4. H3: an unverified account pre-registered under someone's address cannot receive roles or admin status
+        await expect(
+          server.upsertUserByEmail({ scopeId: GLOBAL_SCOPE, email: "rules-unverified@example.com", roles: [] })
+        ).rejects.toMatchObject({ code: "auth/email-not-verified" });
+        await expect(
+          server.setSystemAdminStatus({
+            email: "rules-unverified@example.com",
+            isAdmin: true,
+            actor: { uid: "u-rules-other-admin" }
+          })
+        ).rejects.toMatchObject({ code: "auth/email-not-verified" });
+        expect((await adminAuth.getUser("u-rules-unverified")).customClaims?.admin).not.toBe(true);
       } finally {
         server.close();
         await terminate(unverifiedDb);

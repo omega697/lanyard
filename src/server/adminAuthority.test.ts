@@ -176,7 +176,9 @@ describe("the Firebase admin claim is the only admin authority", () => {
 });
 
 describe("setSystemAdminStatus authorizes its actor (H2)", () => {
-  function fakeAuthWithAccounts(accounts: Record<string, { uid: string; claims?: Record<string, any> }>) {
+  function fakeAuthWithAccounts(
+    accounts: Record<string, { uid: string; emailVerified?: boolean; claims?: Record<string, any> }>
+  ) {
     const claims = new Map(Object.values(accounts).map((a) => [a.uid, { ...(a.claims || {}) }]));
     const created: string[] = [];
     const adminAuth = {
@@ -186,13 +188,18 @@ describe("setSystemAdminStatus authorizes its actor (H2)", () => {
       getUserByEmail: async (email: string) => {
         const account = accounts[email.toLowerCase()];
         if (!account) throw Object.assign(new Error("User not found"), { code: "auth/user-not-found" });
-        return { uid: account.uid, email, customClaims: claims.get(account.uid) };
+        return {
+          uid: account.uid,
+          email,
+          emailVerified: account.emailVerified ?? true,
+          customClaims: claims.get(account.uid)
+        };
       },
-      createUser: vi.fn(async (props: { email: string }) => {
+      createUser: vi.fn(async (props: { email: string; emailVerified?: boolean }) => {
         created.push(props.email);
         const uid = `created-${created.length}`;
-        accounts[props.email.toLowerCase()] = { uid };
-        return { uid, email: props.email };
+        accounts[props.email.toLowerCase()] = { uid, emailVerified: props.emailVerified === true };
+        return { uid, email: props.email, emailVerified: props.emailVerified === true };
       }),
       setCustomUserClaims: vi.fn(async (uid: string, c: Record<string, any> | null) => {
         claims.set(uid, { ...(c || {}) });

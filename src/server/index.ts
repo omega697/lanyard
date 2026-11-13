@@ -89,14 +89,20 @@ export interface AdminAuthAdapter {
     admin?: boolean;
     [key: string]: any;
   }>;
-  getUserByEmail(
-    email: string
-  ): Promise<{ uid: string; email?: string; displayName?: string; customClaims?: Record<string, any> }>;
-  createUser(properties: {
-    email: string;
-    displayName?: string;
+  getUserByEmail(email: string): Promise<{
+    uid: string;
+    email?: string;
     emailVerified?: boolean;
-  }): Promise<{ uid: string; email?: string; displayName?: string; customClaims?: Record<string, any> }>;
+    displayName?: string;
+    customClaims?: Record<string, any>;
+  }>;
+  createUser(properties: { email: string; displayName?: string; emailVerified?: boolean }): Promise<{
+    uid: string;
+    email?: string;
+    emailVerified?: boolean;
+    displayName?: string;
+    customClaims?: Record<string, any>;
+  }>;
   setCustomUserClaims(uid: string, customUserClaims: Record<string, any> | null): Promise<void>;
   updateUser?(
     uid: string,
@@ -691,6 +697,14 @@ export function createLanyardServer<
 
   // --- User & Role Provisioning Helpers ---
 
+  function assertExistingAccountVerified(account: { uid: string; emailVerified?: boolean }, email: string): void {
+    if (account.emailVerified !== true) {
+      throw new EmailNotVerifiedError(
+        `Cannot provision or grant access for '${email}': existing account has not verified its email address`
+      );
+    }
+  }
+
   async function getOrProvisionUidByEmail(params: {
     email: string;
     displayName?: string;
@@ -702,6 +716,7 @@ export function createLanyardServer<
 
     try {
       const existing = await adminAuth.getUserByEmail(cleanEmail);
+      assertExistingAccountVerified(existing, cleanEmail);
       return { uid: existing.uid, email: cleanEmail, created: false };
     } catch (err: any) {
       if (err?.code === "auth/user-not-found") {
@@ -715,6 +730,7 @@ export function createLanyardServer<
         } catch (createErr: any) {
           if (createErr?.code === "auth/email-already-exists") {
             const raceExisting = await adminAuth.getUserByEmail(cleanEmail);
+            assertExistingAccountVerified(raceExisting, cleanEmail);
             return { uid: raceExisting.uid, email: cleanEmail, created: false };
           }
           throw createErr;

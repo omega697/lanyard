@@ -8,8 +8,8 @@ import { EMAIL_NOT_VERIFIED_ERROR_CODE, SESSION_REVOKED_ERROR_CODE, TOKEN_STALE_
 export class EmailNotVerifiedError extends Error {
   readonly code = EMAIL_NOT_VERIFIED_ERROR_CODE;
 
-  constructor() {
-    super("Token email must be verified");
+  constructor(message = "Token email must be verified") {
+    super(message);
     this.name = "EmailNotVerifiedError";
   }
 }

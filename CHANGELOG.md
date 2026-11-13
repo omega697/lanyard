@@ -29,6 +29,8 @@
 
 ### Breaking changes
 
+- **`getOrProvisionUidByEmail` refuses existing accounts whose email isn't verified.** If an account for the address already exists in Firebase Auth (`getUserByEmail`), `getOrProvisionUidByEmail` (and therefore `upsertUserByEmail`, `grantRolesByEmail`, and `setSystemAdminStatus` when promoting) now requires `emailVerified === true` on that record and throws `EmailNotVerifiedError` otherwise. Without this, an attacker who registered someone else's email address with an unverified sign-in method before they were invited would receive the roles or admin claim meant for them. `AdminAuthAdapter.getUserByEmail` test doubles that return existing accounts must include `emailVerified: true`.
+
 - **Generated Firestore rules enforce revocations on `isAdmin()` and require a verified email by default.**
   - `isAdmin()` now checks that the token was issued after the revocation epoch (`request.auth.token.iat * 1000 > revocationEpochMs() + 2000`) and that its session hasn't been revoked (`request.auth.token.auth_time * 1000 > sessionRevokedAtMs() + 2000`), so a demoted or signed-out admin loses Firestore admin access at once instead of when their token expires.
   - `isSignedIn()` now requires `request.auth.token.get('email_verified', false) == true` by default, matching `checkAuth`. Pass `requireVerifiedEmail: false` to `generateFirestoreRules` (or `--require-verified-email false` to `lanyard-rules`) only if your app deliberately serves unverified users.
