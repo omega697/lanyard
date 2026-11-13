@@ -3,6 +3,11 @@ import type { EncryptedSecretData, SecretCipher } from "../core/index.js";
 
 const ALGORITHM = "aes-256-gcm";
 const IV_LENGTH = 12;
+// Pinned so GCM never accepts a shortened tag (which would make forging a secret far easier)
+const AUTH_TAG_LENGTH = 16;
+const IV_HEX = new RegExp(`^[0-9a-f]{${IV_LENGTH * 2}}$`, "i");
+const TAG_HEX = new RegExp(`^[0-9a-f]{${AUTH_TAG_LENGTH * 2}}$`, "i");
+const CIPHERTEXT_HEX = /^(?:[0-9a-f]{2})*$/i;
 
 export function isEncryptedSecretData(value: unknown): value is EncryptedSecretData {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
@@ -29,7 +34,7 @@ export function createSecretCipher(masterKey: string): SecretCipher {
   return {
     encrypt(plaintext: string): EncryptedSecretData {
       const iv = crypto.randomBytes(IV_LENGTH);
-      const cipher = crypto.createCipheriv(ALGORITHM, keyBuffer, iv);
+      const cipher = crypto.createCipheriv(ALGORITHM, keyBuffer, iv, { authTagLength: AUTH_TAG_LENGTH });
       let ciphertext = cipher.update(plaintext, "utf8", "hex");
       ciphertext += cipher.final("hex");
       const tag = cipher.getAuthTag().toString("hex");
@@ -40,12 +45,18 @@ export function createSecretCipher(masterKey: string): SecretCipher {
       };
     },
     decrypt(encrypted: EncryptedSecretData): string {
-      if (!isEncryptedSecretData(encrypted)) {
+      // Buffer.from(..., "hex") silently drops invalid characters, so check the exact format first
+      if (
+        !isEncryptedSecretData(encrypted) ||
+        !IV_HEX.test(encrypted.iv) ||
+        !TAG_HEX.test(encrypted.tag) ||
+        !CIPHERTEXT_HEX.test(encrypted.ciphertext)
+      ) {
         throw new Error("Invalid encrypted secret payload");
       }
       const ivBuffer = Buffer.from(encrypted.iv, "hex");
       const tagBuffer = Buffer.from(encrypted.tag, "hex");
-      const decipher = crypto.createDecipheriv(ALGORITHM, keyBuffer, ivBuffer);
+      const decipher = crypto.createDecipheriv(ALGORITHM, keyBuffer, ivBuffer, { authTagLength: AUTH_TAG_LENGTH });
       decipher.setAuthTag(tagBuffer);
       let decrypted = decipher.update(encrypted.ciphertext, "hex", "utf8");
       decrypted += decipher.final("utf8");

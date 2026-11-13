@@ -227,3 +227,40 @@ export function withoutUndeclaredSecretKeys<T>(
   }
   return kept;
 }
+
+/**
+ * Decrypts each stored secret separately, so one unreadable value (corrupted, or tampered with) is skipped with a
+ * warning instead of hiding the user's other secrets. If none of the encrypted values can be decrypted, it throws,
+ * because that usually means the master key is wrong rather than that every value is damaged.
+ */
+export function decryptSecretEntries(
+  entries: readonly (readonly [string, unknown])[],
+  decryptOne: (value: unknown) => string,
+  where: string
+): Record<string, string> {
+  const out: Record<string, string> = {};
+  let attempted = 0;
+  let failed = 0;
+  for (const [key, value] of entries) {
+    if (typeof value === "string") {
+      if (value.length > 0) out[key] = value;
+      continue;
+    }
+    attempted += 1;
+    try {
+      out[key] = decryptOne(value);
+    } catch (error) {
+      failed += 1;
+      console.warn(
+        `[lanyard] Couldn't decrypt secret '${key}' stored at ${where}; skipping it: ` +
+          (error instanceof Error ? error.message : String(error))
+      );
+    }
+  }
+  if (attempted > 0 && failed === attempted) {
+    throw new Error(
+      `Couldn't decrypt any secret stored at ${where}; check that the master encryption key matches the one they were written with`
+    );
+  }
+  return out;
+}

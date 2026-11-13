@@ -30,6 +30,7 @@ import {
   assertDeclaredSecretKeys,
   assertNoReservedAttributeKeys,
   assertNoReservedTierKeys,
+  decryptSecretEntries,
   readTierDocValues,
   resolveAttributeQueryLocation,
   resolveCardFields,
@@ -413,18 +414,17 @@ export class FirestoreServerStore<
     data: Record<string, any>,
     where: string
   ): Partial<Record<keyof TSecrets & string, string>> {
-    const out: Record<string, string> = {};
     const entries = this.declaredSecretEntries(data, where);
-    if (entries.length === 0) return out as Partial<Record<keyof TSecrets & string, string>>;
+    if (entries.length === 0) return {};
     const cipher = this.requireCipher();
-    for (const [k, v] of entries) {
-      if (isEncryptedSecretData(v)) {
-        out[k] = cipher.decrypt(v);
-      } else if (typeof v === "string" && v.length > 0) {
-        out[k] = v;
-      }
-    }
-    return out as Partial<Record<keyof TSecrets & string, string>>;
+    return decryptSecretEntries(
+      entries,
+      (value) => {
+        if (!isEncryptedSecretData(value)) throw new Error("Invalid encrypted secret payload");
+        return cipher.decrypt(value);
+      },
+      where
+    ) as Partial<Record<keyof TSecrets & string, string>>;
   }
 
   private async writeEncryptedSecretsToRef(

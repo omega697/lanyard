@@ -29,6 +29,13 @@
 
 ### Breaking changes
 
+- **Stricter secret decryption.** The built-in AES-256-GCM cipher now pins the auth tag to 16 bytes (GCM otherwise
+  accepts a shortened tag, as short as 4 bytes, which makes forging a secret far easier) and refuses envelopes whose IV
+  isn't 24 hex characters, whose tag isn't 32, or whose ciphertext isn't even-length hex (`Buffer.from(…, "hex")`
+  silently dropped invalid characters). Secrets Lanyard wrote already match. Stores also decrypt each secret
+  separately: one that can't be decrypted is skipped with a `console.warn` instead of making the user's other secrets
+  unreadable, and reads still throw if none can be decrypted, which usually means the wrong master key.
+
 - **The client's preferences cache is per user and cleared when their session ends.** It used to keep every user's
   global preferences under one shared `localStorage` key that outlived sign-out, so on a shared browser the next
   visitor saw the previous user's preferences before signing in, and the next user's preferences were merged on top of

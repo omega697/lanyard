@@ -28,6 +28,7 @@ import {
   assertDeclaredSecretKeys,
   assertNoReservedAttributeKeys,
   assertNoReservedTierKeys,
+  decryptSecretEntries,
   resolveAttributeQueryLocation,
   resolveCardFields,
   resolveSecretKeys,
@@ -141,17 +142,22 @@ export class InMemoryLanyardStore<
     stored: Record<string, string | EncryptedSecretData> | undefined,
     where: string
   ): Partial<Record<keyof TSecrets & string, string>> {
-    const out: Record<string, string> = {};
-    if (!stored) return out as Partial<Record<keyof TSecrets & string, string>>;
-    for (const [k, v] of Object.entries(withoutUndeclaredSecretKeys(this.secretKeys, stored, where))) {
-      if (FORBIDDEN_KEYS.has(k)) continue;
-      if (typeof v === "string") {
-        out[k] = v;
-      } else if (v && typeof v === "object" && typeof v.ciphertext === "string" && this.cipher) {
-        out[k] = this.cipher.decrypt(v);
-      }
-    }
-    return out as Partial<Record<keyof TSecrets & string, string>>;
+    if (!stored) return {};
+    const entries = Object.entries(withoutUndeclaredSecretKeys(this.secretKeys, stored, where)).filter(
+      ([k]) => !FORBIDDEN_KEYS.has(k)
+    );
+    const cipher = this.cipher;
+    return decryptSecretEntries(
+      entries,
+      (value) => {
+        if (!cipher) throw new Error("No cipher configured to decrypt an encrypted secret");
+        if (!value || typeof value !== "object" || typeof (value as EncryptedSecretData).ciphertext !== "string") {
+          throw new Error("Invalid encrypted secret payload");
+        }
+        return cipher.decrypt(value as EncryptedSecretData);
+      },
+      where
+    ) as Partial<Record<keyof TSecrets & string, string>>;
   }
 
   private toSecretStatusMap(
