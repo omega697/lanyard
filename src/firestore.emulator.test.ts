@@ -15,6 +15,7 @@ import { getAuth as getAdminAuth, type Auth as AdminAuth } from "firebase-admin/
 import { getFirestore as getAdminFirestore, type Firestore as AdminFirestore } from "firebase-admin/firestore";
 import { deleteApp as deleteClientApp, initializeApp as initializeClientApp, type FirebaseApp } from "firebase/app";
 import {
+  applyActionCode,
   connectAuthEmulator,
   getAuth as getClientAuth,
   GoogleAuthProvider,
@@ -56,7 +57,8 @@ import {
   SESSION_REVOKED_ERROR_CODE,
   SessionRevokedError,
   TOKEN_STALE_ERROR_CODE,
-  type LanyardReadable
+  type LanyardReadable,
+  type VerifiedEmailChangeEvent
 } from "./core/index.js";
 import { FirestoreServerStore } from "./server/firestore.js";
 import { createLanyardServer, isEncryptedSecretData } from "./server/index.js";
@@ -1203,7 +1205,6 @@ ${block}
         await memberStore.syncAvatar({
           uid: "u-member",
           photoUrl: "https://example.com/avatar.png",
-          email: "member@example.com",
           displayName: "Memby McMember"
         });
         await memberStore.updateUserProfile("u-member", {
@@ -1521,8 +1522,8 @@ ${block}
           clientGetDoc(clientDoc(mgrClient.db, "workspaces", "org-B", "members", "u-other", "private", "attributes"))
         ).rejects.toMatchObject({ code: "permission-denied" });
 
-        // Attack G: Email is private (stored in the attributes tier, never on cards), and owners can only write
-        // their own verified Firebase Auth email there
+        // Attack G: Email is private (stored in the attributes tier, never on cards) and server-owned: clients can't
+        // write it at all, not even their own verified address
         expect((await adminDb.doc("workspaces/org-A/members/u-mgr").get()).data()).not.toHaveProperty("email");
         expect((await adminDb.doc("workspaces/org-A/members/u-mgr/private/attributes").get()).data()).toMatchObject({
           email: "mgr@example.com"
@@ -1534,8 +1535,15 @@ ${block}
         unsubRosterEmails();
         expect(rosterEmails.at(-1)?.map((m: any) => m.email)).toEqual(["", ""]);
 
-        await memberStore.updateUserProfile("u-member", { email: "Member@Example.com" });
-        await memberStore.updateScopeMemberProfile("org-A", "u-member", { email: "member@example.com" });
+        // The client store refuses email in profile patches before writing anything
+        await expect(memberStore.updateUserProfile("u-member", { email: "member@example.com" } as any)).rejects.toThrow(
+          /email/i
+        );
+        await expect(
+          memberStore.updateScopeMemberProfile("org-A", "u-member", { email: "member@example.com" } as any)
+        ).rejects.toThrow(/email/i);
+        // The server writes it (here as provisioning would)
+        await serverStore.upsertUser({ ...(await serverStore.getUser("u-member"))!, email: "member@example.com" });
         expect((await adminDb.doc("users/u-member/private/attributes").get()).data()).toMatchObject({
           email: "member@example.com",
           badge: "global-badge",
@@ -1552,6 +1560,17 @@ ${block}
 
         const ownAttrsRef = clientDoc(memberClient.db, "users", "u-member", "private", "attributes");
         const lanyardMeta = { tier: "attributes", uid: "u-member", scopeId: null };
+        // Not even the owner's own verified address (a client write would race the server's onVerifiedEmailChange)
+        await expect(
+          clientSetDoc(ownAttrsRef, { email: "member@example.com", _lanyard: lanyardMeta }, { merge: true })
+        ).rejects.toMatchObject({ code: "permission-denied" });
+        await expect(
+          clientSetDoc(
+            clientDoc(memberClient.db, "workspaces", "org-A", "members", "u-member", "private", "attributes"),
+            { email: "member@example.com", _lanyard: { ...lanyardMeta, scopeId: "org-A" } },
+            { merge: true }
+          )
+        ).rejects.toMatchObject({ code: "permission-denied" });
         // Claiming someone else's address
         await expect(
           clientSetDoc(ownAttrsRef, { email: "ceo@example.com", _lanyard: lanyardMeta }, { merge: true })
@@ -1564,14 +1583,6 @@ ${block}
             { merge: true }
           )
         ).rejects.toMatchObject({ code: "permission-denied" });
-        // Wrong tier metadata
-        await expect(
-          clientSetDoc(
-            ownAttrsRef,
-            { email: "member@example.com", _lanyard: { ...lanyardMeta, scopeId: "org-A" } },
-            { merge: true }
-          )
-        ).rejects.toMatchObject({ code: "permission-denied" });
         // Writing another user's email, even their real one
         await expect(
           clientSetDoc(
@@ -1580,11 +1591,13 @@ ${block}
             { merge: true }
           )
         ).rejects.toMatchObject({ code: "permission-denied" });
-        // Writing a scoped email in a scope the user isn't a member of (no phantom docs)
-        await expect(
-          memberStore.updateScopeMemberProfile("org-B", "u-member", { email: "member@example.com" })
-        ).rejects.toMatchObject({ code: "permission-denied" });
         expect((await adminDb.doc("workspaces/org-B/members/u-member/private/attributes").get()).exists).toBe(false);
+        // Avatar sync still works, and carries no email
+        await memberStore.syncAvatar({ uid: "u-member", photoUrl: "https://example.com/member-synced.png" });
+        expect((await adminDb.doc("users/u-member").get()).data()).toMatchObject({
+          photoUrl: "https://example.com/member-synced.png"
+        });
+        expect((await adminDb.doc("users/u-member").get()).data()).not.toHaveProperty("email");
 
         // A user whose sign-in email isn't verified can't write it, even to their own attributes tier
         const unverifiedClient = await createAuthedClient("u-unverified", "unverified@example.com", false, false);
@@ -1976,7 +1989,7 @@ service cloud.firestore {
         const value = linkParams.get(key);
         if (value) landing.searchParams.set(key, value);
       }
-      return { link: code.oobLink, continueUrl, landingUrl: landing.toString() };
+      return { link: code.oobLink, oobCode: code.oobCode, continueUrl, landingUrl: landing.toString() };
     }
 
     // Grounds the magic-link design: what Firebase does when a link is completed with the wrong email or reused
@@ -2087,6 +2100,111 @@ service cloud.firestore {
         vi.unstubAllGlobals();
         await deleteClientApp(attacker.app);
         await deleteClientApp(victim.app);
+      }
+    }, 30_000);
+
+    it("a magic-link-only user can change their email, and the server syncs it and calls onVerifiedEmailChange once", async () => {
+      class MemoryLocalStorage {
+        private map = new Map<string, string>();
+        getItem = (k: string) => this.map.get(k) ?? null;
+        setItem = (k: string, v: string) => void this.map.set(k, String(v));
+        removeItem = (k: string) => void this.map.delete(k);
+      }
+      vi.stubGlobal("localStorage", new MemoryLocalStorage());
+      const suffix = Date.now();
+      const oldEmail = `link-user-${suffix}@example.com`;
+      const newEmail = `link-user-new-${suffix}@example.com`;
+      const usersCollection = `users_email_change_${suffix}`;
+      const metaCollection = `meta_email_change_${suffix}`;
+      const rules = `rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+${generateFirestoreRules(createPermissionPolicy({}), { usersCollection, metaCollection })}
+  }
+}
+`;
+      const rulesRes = await fetch(`http://127.0.0.1:${emulatorPort}/emulator/v1/projects/${projectId}:securityRules`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ rules: { files: [{ name: "firestore.rules", content: rules }] } })
+      });
+      expect(rulesRes.status).toBe(200);
+      const store = new FirestoreServerStore({ db: adminDb, usersCollection, metaCollection });
+      const events: VerifiedEmailChangeEvent[] = [];
+      const server = createLanyardServer({
+        adminAuth: adminAuth as any,
+        store,
+        onVerifiedEmailChange: (event) => void events.push(event)
+      });
+      const { app, auth } = emulatorClientAuth("client-email-change");
+      const db = getClientFirestore(app);
+      connectFirestoreEmulator(db, "127.0.0.1", emulatorPort);
+      // The browser's Lanyard client reads (and, before email became server-owned, wrote) the same documents
+      const lanyard = createLanyardClient({
+        auth,
+        store: new FirestoreClientStore({ db, usersCollection, metaCollection }),
+        defaultPreferences: {}
+      });
+      try {
+        // 1. Sign in with a magic link only (no other provider), as a first-time user
+        await lanyard.sendPasswordlessEmailLink(oldEmail);
+        const signIn = await lanyard.completePasswordlessSignIn({ href: (await latestEmailLink(oldEmail)).landingUrl });
+        expect(signIn.status).toBe("signed-in");
+        const uid = auth.currentUser!.uid;
+        expect(auth.currentUser!.providerData.map((p) => p.providerId)).toEqual(["password"]);
+        await store.upsertUser({ uid, email: oldEmail, roles: [] });
+        expect((await runMiddleware(server.checkAuth, await auth.currentUser!.getIdToken())).nextCalled).toBe(true);
+        expect(events).toEqual([]);
+
+        // 2. Request the change; Firebase emails a confirmation link to the NEW address (filed under the current one)
+        await lanyard.sendEmailUpdateVerification(newEmail);
+        const { oobCode } = await latestEmailLink(oldEmail, "VERIFY_AND_CHANGE_EMAIL");
+        // Until it's confirmed, nothing changes
+        expect((await adminAuth.getUser(uid)).email).toBe(oldEmail);
+
+        // 3. Confirming it changes the Firebase account's email, verified
+        await applyActionCode(auth, oobCode);
+        const changed = await adminAuth.getUser(uid);
+        expect(changed.email).toBe(newEmail);
+        expect(changed.emailVerified).toBe(true);
+
+        // 4. The app picks up the change in the browser first (refreshEmailVerification reloads the user), and only
+        //    then makes a request. The client must not write the email itself: if it did, checkAuth would see no
+        //    difference and the hook would never fire. (The Auth emulator keeps the session across the change;
+        //    production Firebase may instead end it, and then the user signs in again, which step 5 covers.)
+        expect(await lanyard.refreshEmailVerification()).toBe(true);
+        expect(lanyard.authStore.get().user?.email).toBe(newEmail);
+        await new Promise((resolve) => setTimeout(resolve, 500));
+        expect((await store.getUser(uid))?.email).toBe(oldEmail);
+        const refreshedToken = await auth.currentUser!.getIdToken(true);
+        expect((await runMiddleware(server.checkAuth, refreshedToken)).nextCalled).toBe(true);
+        expect(events).toEqual([{ uid, email: newEmail, previousEmail: oldEmail }]);
+        expect((await store.getUser(uid))?.email).toBe(newEmail);
+        expect((await runMiddleware(server.checkAuth, refreshedToken)).nextCalled).toBe(true);
+        expect(events).toHaveLength(1);
+
+        // 5. Signing in again with a magic link goes to the new address and reaches the same account; nothing re-fires
+        await lanyard.signOut();
+        await lanyard.sendPasswordlessEmailLink(newEmail);
+        const again = await lanyard.completePasswordlessSignIn({ href: (await latestEmailLink(newEmail)).landingUrl });
+        expect(again).toMatchObject({ status: "signed-in", user: { uid, email: newEmail } });
+        expect((await runMiddleware(server.checkAuth, await auth.currentUser!.getIdToken())).nextCalled).toBe(true);
+        expect(events).toHaveLength(1);
+
+        // 6. The old address no longer leads into this account: a link sent to it signs in a different (new) user
+        await lanyard.signOut();
+        await lanyard.sendPasswordlessEmailLink(oldEmail);
+        const oldAddress = await lanyard.completePasswordlessSignIn({
+          href: (await latestEmailLink(oldEmail)).landingUrl
+        });
+        expect(oldAddress.status).toBe("signed-in");
+        expect(auth.currentUser!.uid).not.toBe(uid);
+      } finally {
+        lanyard.destroy();
+        server.close();
+        vi.unstubAllGlobals();
+        await terminate(db);
+        await deleteClientApp(app);
       }
     }, 30_000);
 
@@ -2542,6 +2660,43 @@ ${generateFirestoreRules(createPermissionPolicy({}), { usersCollection, metaColl
         await deleteClientApp(unverifiedApp);
         await revokedAdmin.close();
         await demoted.close();
+      }
+    }, 30_000);
+
+    it("FIXED: with cardFields.email, an owner can't put a different address on their card", async () => {
+      const usersCollection = `users_card_email_${Date.now()}`;
+      const policy = createPermissionPolicy({ cardFields: { email: true } });
+      const rules = `rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+${generateFirestoreRules(policy, { usersCollection })}
+  }
+}
+`;
+      const rulesRes = await fetch(`http://127.0.0.1:${emulatorPort}/emulator/v1/projects/${projectId}:securityRules`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ rules: { files: [{ name: "firestore.rules", content: rules }] } })
+      });
+      expect(rulesRes.status).toBe(200);
+      await adminDb.doc(`${usersCollection}/u-card-owner`).set({ uid: "u-card-owner", email: "owner@example.com" });
+      const owner = await signInEmulatorUser("u-card-owner", "owner@example.com");
+      try {
+        const card = clientDoc(owner.db, `${usersCollection}/u-card-owner`);
+        await expect(clientUpdateDoc(card, { email: "ceo@example.com" })).rejects.toMatchObject({
+          code: "permission-denied"
+        });
+        await expect(clientUpdateDoc(card, { email: "ceo@example.com", firstName: "O" })).rejects.toMatchObject({
+          code: "permission-denied"
+        });
+        // Ordinary profile fields are still self-editable
+        await clientUpdateDoc(card, { firstName: "Owner" });
+        expect((await adminDb.doc(`${usersCollection}/u-card-owner`).get()).data()).toMatchObject({
+          email: "owner@example.com",
+          firstName: "Owner"
+        });
+      } finally {
+        await owner.close();
       }
     }, 30_000);
   }

@@ -610,11 +610,10 @@ describe("lanyard/client unit tests", () => {
 
     await store.syncAvatar({
       uid: "u-admin",
-      email: "admin@example.com",
       displayName: "Admin",
       photoUrl: "https://example.com/admin.png"
     });
-    // The card never gets the (private) email; it goes to the user's own attributes tier document
+    // Avatar sync writes the card only, never an email (email is server-owned)
     expect(firebaseFirestore.setDoc).toHaveBeenCalledWith(
       expect.objectContaining({ path: "users/u-admin" }),
       {
@@ -624,13 +623,10 @@ describe("lanyard/client unit tests", () => {
       },
       { merge: true }
     );
-    expect(firebaseFirestore.setDoc).toHaveBeenCalledWith(
+    expect(firebaseFirestore.setDoc).not.toHaveBeenCalledWith(
       expect.objectContaining({ path: "users/u-admin/private/attributes" }),
-      {
-        email: "admin@example.com",
-        _lanyard: { tier: "attributes", uid: "u-admin", scopeId: null, updatedAt: expect.any(String) }
-      },
-      { merge: true }
+      expect.anything(),
+      expect.anything()
     );
 
     // 5. recordPresenceHeartbeat
@@ -1511,16 +1507,16 @@ describe("lanyard/client unit tests", () => {
     client.destroy();
   });
 
-  it("merges a private email into userRecordStore and memberships, and syncs a verified email change to the attributes tier", async () => {
+  it("merges a private email into userRecordStore and memberships, never writes it, and shows the server's sync", async () => {
     const store = new InMemoryLanyardStore<TestRole, TestCap, TestPrefs>();
     await store.upsertUser({ uid: "u-1", email: "old@example.com", firstName: "Uno" });
     await store.upsertScopeMember("ws-a", { uid: "u-1", email: "old@example.com", roles: ["member"] });
-    const onVerifiedEmailChange = vi.fn().mockResolvedValue(undefined);
+    const upsertUser = vi.spyOn(store, "upsertUser");
+    const updateUserProfile = vi.spyOn(store, "updateUserProfile");
     const client = createLanyardClient<TestRole, TestCap, TestPrefs>({
       store,
       defaultPreferences: DEFAULT_PREFS,
-      storageKeyPrefix: "privateemail",
-      onVerifiedEmailChange
+      storageKeyPrefix: "privateemail"
     });
 
     client.setActiveUser({
@@ -1533,17 +1529,17 @@ describe("lanyard/client unit tests", () => {
       providerIds: []
     });
 
-    // The card holds no email, but userRecordStore merges the user's own tier email in
-    await vi.waitFor(() => expect(onVerifiedEmailChange).toHaveBeenCalledTimes(1));
-    expect(onVerifiedEmailChange).toHaveBeenCalledWith({
-      uid: "u-1",
-      email: "new@example.com",
-      previousEmail: "old@example.com"
-    });
-    await vi.waitFor(() => expect(client.userRecordStore.get()?.email).toBe("new@example.com"));
-    expect((await store.getUser("u-1"))?.email).toBe("new@example.com");
+    // The card holds no email, but userRecordStore merges the user's own tier email in; the client never writes it
+    await new Promise((r) => setTimeout(r, 0));
+    expect(client.userRecordStore.get()?.email).toBe("old@example.com");
+    expect(upsertUser).not.toHaveBeenCalled();
+    expect(updateUserProfile).not.toHaveBeenCalled();
     expect(client.userRecordStore.get()?.firstName).toBe("Uno");
     expect(client.membershipsStore.get().memberships[0].email).toBe("old@example.com");
+
+    // When the server syncs the verified email, the client shows it
+    await store.upsertUser({ ...(await store.getUser("u-1"))!, email: "new@example.com" });
+    await vi.waitFor(() => expect(client.userRecordStore.get()?.email).toBe("new@example.com"));
 
     client.setActiveUser(null);
     expect(client.userRecordStore.get()).toBeNull();
@@ -1717,18 +1713,12 @@ describe("lanyard/client unit tests", () => {
     };
     vi.mocked(firebaseAuth.onAuthStateChanged).mockImplementation(() => () => {});
 
-    const onVerifiedEmailChange = vi
-      .fn()
-      .mockRejectedValueOnce(new Error("Transient webhook failure"))
-      .mockResolvedValue(undefined);
-
     const client = createLanyardClient<TestRole, TestCap, TestPrefs, CheckinAttrs>({
       auth: fakeAuth,
       store,
       policy: TEST_POLICY,
       defaultPreferences: DEFAULT_PREFS,
-      storageKeyPrefix: "singleapp",
-      onVerifiedEmailChange
+      storageKeyPrefix: "singleapp"
     });
 
     // Calling updateProfile before sign-in throws
@@ -1749,7 +1739,6 @@ describe("lanyard/client unit tests", () => {
     expect(client.preferencesStore.get()).toEqual({ theme: "dark", use12h: false });
     expect(client.attributesStore.get()).toEqual({ pointsAllTime: 120, awardedBadges: ["first-checkin"] });
     expect(client.userRecordStore.get()?.photoUrl).toBe("https://example.com/oauth-single.png");
-    expect(onVerifiedEmailChange).not.toHaveBeenCalled();
 
     // 2. Self-service updateProfile updates firstName/lastName on users/{uid}, auto-computes displayName, and syncs to authStore & Firebase Auth
     await client.updateProfile(GLOBAL_SCOPE, { firstName: "Formy", lastName: "McFormerson" });
@@ -1761,8 +1750,7 @@ describe("lanyard/client unit tests", () => {
       displayName: "Formy McFormerson"
     });
 
-    // Verified email change invokes onVerifiedEmailChange({ uid, email, previousEmail }) before updating users/{uid}.email.
-    // First attempt rejects -> users/{uid}.email remains 'single@example.com' so the next emission/session retries!
+    // A verified email change in Firebase Auth leaves the stored email for the server's checkAuth sync
     client.setActiveUser({
       uid: "u-single",
       email: "updated-single@example.com",
@@ -1773,27 +1761,7 @@ describe("lanyard/client unit tests", () => {
       providerIds: ["google.com"]
     });
     await new Promise((r) => setTimeout(r, 0));
-    expect(onVerifiedEmailChange).toHaveBeenCalledTimes(1);
-    expect(onVerifiedEmailChange).toHaveBeenCalledWith({
-      uid: "u-single",
-      email: "updated-single@example.com",
-      previousEmail: "single@example.com"
-    });
     expect((await store.getUser("u-single"))?.email).toBe("single@example.com");
-
-    // Second trigger retries onVerifiedEmailChange and persists updated-single@example.com to users/{uid}
-    client.setActiveUser({
-      uid: "u-single",
-      email: "updated-single@example.com",
-      emailVerified: true,
-      displayName: "Formy McFormerson",
-      photoUrl: "https://example.com/oauth-single.png",
-      isAdmin: false,
-      providerIds: ["google.com"]
-    });
-    await new Promise((r) => setTimeout(r, 0));
-    expect(onVerifiedEmailChange).toHaveBeenCalledTimes(2);
-    expect((await store.getUser("u-single"))?.email).toBe("updated-single@example.com");
     expect(formatExistingAccountError("test@example.com", ["google.com"])).toContain("Google");
 
     // 3. Server updates attributes -> client attributesStore updates reactively

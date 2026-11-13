@@ -138,12 +138,14 @@ describe("generateFirestoreRules", () => {
     );
   });
 
-  it("lets owners self-write card email only when cardFields.email places it on the card", () => {
-    const privateEmail = generateFirestoreRules(makePolicy());
-    expect(matchBlock(privateEmail, "/users/{uid}")).not.toContain("'email'");
-    const cardEmail = generateFirestoreRules(makePolicy({ cardFields: { email: true } }));
-    expect(matchBlock(cardEmail, "/users/{uid}")).toContain("'uid', 'email', 'firstName'");
-    expect(matchBlock(cardEmail, "/workspaces/{scopeId}/members/{memberUid}")).toContain("['email', 'firstName'");
+  it("never lets clients write email, even when cardFields.email places it on the card", () => {
+    for (const policy of [makePolicy(), makePolicy({ cardFields: { email: true } })]) {
+      const rules = generateFirestoreRules(policy);
+      expect(matchBlock(rules, "/users/{uid}")).not.toContain("'email'");
+      expect(matchBlock(rules, "/workspaces/{scopeId}/members/{memberUid}")).not.toContain("'email'");
+      expect(rules).not.toContain("isOwnVerifiedEmailWrite");
+      expect(matchBlock(rules, "/private/attributes")).toContain("allow write: if false;");
+    }
   });
 
   it("never lets non-admin clients create, delete, or change roles on member cards", () => {

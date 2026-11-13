@@ -59,8 +59,8 @@ function rulesMapLiteral(entries: readonly [string, readonly string[]][], indent
  *
  * The result is a block of functions and `match` statements to place inside
  * `match /databases/{database}/documents { … }`. Cards and the built-in tiers are written by trusted server code
- * (Admin SDK); clients may only update their own profile fields, their own preferences, their own verified email,
- * and custom documents whose `write` audience includes them.
+ * (Admin SDK); clients may only update their own profile fields (never email), their own preferences, and custom
+ * documents whose `write` audience includes them.
  */
 export function generateFirestoreRules<TRole extends string, TCapability extends string>(
   policy: PermissionPolicy<TRole, TCapability>,
@@ -113,10 +113,10 @@ export function generateFirestoreRules<TRole extends string, TCapability extends
         ? scopedStaffExpr()
         : capabilityCheck(policy.cardVisibility.capability, true);
 
-  const emailOnCard = policy.cardFields.email;
+  // Email is server-owned (provisioning and the verified-email sync in checkAuth), so clients never write it, even when
+  // cardFields.email places it on the card
   const userCreateKeys = [
     "uid",
-    ...(emailOnCard ? ["email"] : []),
     "firstName",
     "lastName",
     "displayName",
@@ -126,15 +126,7 @@ export function generateFirestoreRules<TRole extends string, TCapability extends
     "updatedAt"
   ];
   const userUpdateKeys = userCreateKeys.filter((key) => key !== "createdAt");
-  const memberUpdateKeys = [
-    ...(emailOnCard ? ["email"] : []),
-    "firstName",
-    "lastName",
-    "displayName",
-    "lastSeen",
-    "photoUrl",
-    "updatedAt"
-  ];
+  const memberUpdateKeys = ["firstName", "lastName", "displayName", "lastSeen", "photoUrl", "updatedAt"];
 
   /** Rule expression for a custom doc audience; `scoped` selects member vs global capability checks. */
   const customAudience = (rule: Readonly<CustomDocAccessRule<TCapability>>, scoped: boolean, write: boolean) => {
@@ -249,16 +241,6 @@ export function generateFirestoreRules<TRole extends string, TCapability extends
         request.resource.data._lanyard.scopeId == scopeId;
     }
 
-    // Owners may write only their own verified Firebase Auth email (plus Lanyard metadata) to their attributes tier
-    function isOwnVerifiedEmailWrite(uid, scopeId) {
-      return request.auth.token.email_verified == true &&
-        request.resource.data.email == request.auth.token.email.lower() &&
-        isTierDoc('attributes', uid, scopeId) &&
-        (resource == null
-          ? request.resource.data.keys().hasOnly(['email', '_lanyard'])
-          : request.resource.data.diff(resource.data).affectedKeys().hasOnly(['email', '_lanyard']));
-    }
-
     match /${usersCollection}/{uid} {
       allow read: if isOwner(uid) || ${userReadExpr};
       allow create: if isAdmin() || (
@@ -279,10 +261,10 @@ export function generateFirestoreRules<TRole extends string, TCapability extends
         allow write: if (isOwner(uid) || isAdmin()) && isTierDoc('preferences', uid, null);
       }
 
-      // Self + staff attributes tier (server-written, except owners syncing their verified email)
+      // Self + staff attributes tier (server-written, including the user's email)
       match /private/attributes {
         allow read: if isOwner(uid) || ${globalStaffExpr};
-        allow write: if isOwner(uid) && isOwnVerifiedEmailWrite(uid, null);
+        allow write: if false;
       }
 
       // Staff-only hidden attributes tier (server-written)
@@ -313,10 +295,10 @@ ${customDocBlocks(false).join("\n")}
           isTierDoc('preferences', memberUid, scopeId);
       }
 
-      // Self + staff attributes tier (server-written, except members syncing their verified email)
+      // Self + staff attributes tier (server-written, including the member's email)
       match /private/attributes {
         allow read: if isOwner(memberUid) || ${scopedStaffExpr()};
-        allow write: if isOwner(memberUid) && isScopeMember(scopeId) && isOwnVerifiedEmailWrite(memberUid, scopeId);
+        allow write: if false;
       }
 
       // Staff-only hidden attributes tier (server-written)

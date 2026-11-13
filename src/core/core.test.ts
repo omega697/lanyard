@@ -427,7 +427,6 @@ describe("lanyard/core unit tests", () => {
       // System Admin CRUD + avatar & heartbeat sync
       await store.syncAvatar({
         uid: "admin-1",
-        email: "admin@example.com",
         displayName: "Admin One",
         photoUrl: "https://example.com/admin1.png"
       });
@@ -660,8 +659,8 @@ describe("lanyard/core unit tests", () => {
       expect((await store.getSystemAdmin("admin-1"))?.email).toBe("admin@example.com");
       expect((await store.listSystemAdmins()).map((a) => a.email)).toEqual(["admin@example.com"]);
 
-      // Self-service email updates route to the tier; card-only read-modify-write paths can't erase it
-      await store.updateUserProfile("u-1", { email: "New@Example.com" });
+      // Server email updates route to the tier; card-only read-modify-write paths can't erase it
+      await store.upsertUser({ ...(await store.getUser("u-1"))!, email: "new@example.com" });
       expect(attrs.at(-1)?.email).toBe("new@example.com");
       await store.recordPresenceHeartbeat({ uid: "u-1", lastSeenIso: "2026-01-01T00:00:00.000Z" });
       await store.upsertUser({ uid: "u-1", email: "" });
@@ -679,7 +678,7 @@ describe("lanyard/core unit tests", () => {
       const cardPolicy = createPermissionPolicy<TestRole, TestCapability>({ cardFields: { email: true } });
       const cardStore = new InMemoryLanyardStore<TestRole, TestCapability>({ policy: cardPolicy });
       await cardStore.upsertUser({ uid: "u-2", email: "u2@example.com", attributes: { points: 2 } });
-      await cardStore.updateUserProfile("u-2", { email: "u2-new@example.com" });
+      await cardStore.upsertUser({ ...(await cardStore.getUser("u-2"))!, email: "u2-new@example.com" });
       const cardEvents: any[] = [];
       const cardAttrEvents: Array<{ attrs: any; email?: string }> = [];
       cardStore.subscribeToUser("u-2", (u) => cardEvents.push(u))();

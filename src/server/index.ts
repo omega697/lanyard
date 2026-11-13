@@ -6,6 +6,7 @@ import {
   REVOCATION_CLOCK_SKEW_MS,
   SESSION_REVOKED_ERROR_CODE,
   TOKEN_STALE_ERROR_CODE,
+  assertNoEmailInProfilePatch,
   assertValidResourceId,
   createPermissionPolicy,
   isValidEmail,
@@ -262,9 +263,11 @@ export interface LanyardServerConfig<
   /** Default Express route parameter name for the tenant/scope ID (defaults to `"scopeId"`). */
   defaultScopeParam?: string;
   /**
-   * Optional callback invoked in `checkAuth` when an authenticated user's verified token email
-   * differs from `userRecord.email` on `users/{uid}`. Once `onVerifiedEmailChange` resolves,
-   * Lanyard updates `userRecord.email` via `store.upsertUser` so the callback fires only once per email change.
+   * Optional callback invoked in `checkAuth` when an authenticated user's verified token email differs from the email
+   * Lanyard last stored for them (a record with no email yet is filled in without calling it). Once it resolves,
+   * Lanyard stores the new email so the callback normally fires once per change. It's at-least-once: it can fire again
+   * if two server instances see the change at the same moment, and it's retried on the next request if it (or saving
+   * the email) fails. Only this server-side sync writes the stored email; clients never do.
    */
   onVerifiedEmailChange?: (event: VerifiedEmailChangeEvent) => void | Promise<void>;
   /**
@@ -436,19 +439,20 @@ export function createLanyardServer<
         const userRecord = typeof store.getUser === "function" ? await store.getUser(user.uid) : null;
         req.userRecord = userRecord;
         if (
+          userRecord &&
           user.email &&
           user.emailVerified === true &&
-          userRecord?.email &&
-          userRecord.email.toLowerCase() !== user.email.toLowerCase() &&
+          (userRecord.email || "").toLowerCase() !== user.email.toLowerCase() &&
           (typeof onVerifiedEmailChange === "function" || typeof store.upsertUser === "function")
         ) {
           const syncKey = `${user.uid}:${user.email.toLowerCase()}`;
           let syncPromise = inFlightEmailSyncs.get(syncKey);
           if (!syncPromise) {
-            const previousEmail = userRecord.email;
+            const previousEmail = userRecord.email || "";
             const nextEmail = user.email.toLowerCase().trim();
             syncPromise = (async () => {
-              if (typeof onVerifiedEmailChange === "function") {
+              // A record with no email yet is simply filled in: that's not a change of address
+              if (previousEmail && typeof onVerifiedEmailChange === "function") {
                 await onVerifiedEmailChange({
                   uid: user.uid,
                   email: nextEmail,
@@ -469,7 +473,10 @@ export function createLanyardServer<
             });
             inFlightEmailSyncs.set(syncKey, syncPromise);
           }
-          await syncPromise;
+          await syncPromise.catch((error: unknown) => {
+            // The stored email is left as it was, so the next request retries (and calls the hook again)
+            console.warn(`[lanyard] Syncing the verified email for user '${user.uid}' failed; will retry`, error);
+          });
         }
       } catch {
         // If the backing store is unreachable, the caller is still authenticated, and admin status doesn't depend on it
@@ -1246,6 +1253,7 @@ export function createLanyardServer<
   > {
     assertValidScopeId(params.scopeId);
     assertValidResourceId(params.targetUid, "targetUid");
+    assertNoEmailInProfilePatch(params.patch);
 
     const { isAdmin, userRecord: actorGlobalRecord } = await resolveEffectiveAdminStatus(params.actor);
     const actorUid = params.actor.uid;
@@ -1276,14 +1284,11 @@ export function createLanyardServer<
           : typeof patch.firstName === "string" || typeof patch.lastName === "string"
             ? computedDisplayName || existing.displayName
             : existing.displayName;
-      const email =
-        typeof patch.email === "string" && patch.email.trim() ? patch.email.toLowerCase().trim() : existing.email;
       const photoUrl = patch.photoUrl !== undefined ? sanitizeAvatarUrl(patch.photoUrl) : existing.photoUrl;
 
       const updated: UserRecord<TRole, TCapability, TPreferences, TAttributes> = {
         ...existing,
         uid: params.targetUid,
-        email,
         ...(firstName !== undefined ? { firstName } : {}),
         ...(lastName !== undefined ? { lastName } : {}),
         ...(displayName !== undefined ? { displayName } : {}),
@@ -1321,14 +1326,11 @@ export function createLanyardServer<
         : typeof patch.firstName === "string" || typeof patch.lastName === "string"
           ? computedDisplayName || existing.displayName
           : existing.displayName;
-    const email =
-      typeof patch.email === "string" && patch.email.trim() ? patch.email.toLowerCase().trim() : existing.email;
     const photoUrl = patch.photoUrl !== undefined ? sanitizeAvatarUrl(patch.photoUrl) : existing.photoUrl;
 
     const updated: ScopedMember<TRole, TCapability, TPreferences, TAttributes> = {
       ...existing,
       uid: params.targetUid,
-      email,
       ...(firstName !== undefined ? { firstName } : {}),
       ...(lastName !== undefined ? { lastName } : {}),
       ...(displayName !== undefined ? { displayName } : {}),

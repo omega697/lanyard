@@ -29,6 +29,30 @@
 
 ### Breaking changes
 
+- **Email is server-owned: clients never write it.** Only provisioning (`upsertUserByEmail`) and the server's
+  verified-email sync in `checkAuth` write a user's stored email. Before, the client wrote it too, which caused two
+  problems:
+  - **A race that skipped the server hook.** When a user's verified email changed, their browser wrote the new address
+    first. The server's `checkAuth` then saw no difference, so its `onVerifiedEmailChange` never fired, and anything
+    the app did there (newsletter or CRM sync, migrating data keyed by email) was silently skipped.
+  - **A spoofed `previousEmail`.** Profile updates accepted `email`, so a user could store someone else's address and
+    have it passed to the hook as their `previousEmail`, and staff with `userCapabilities.write` could change other
+    users' stored email. With `cardFields.email`, the rules let owners put any address on their card.
+
+  Now:
+  - the client's `onVerifiedEmailChange` option and its email write are removed, and `syncAvatar` no longer takes
+    `email`;
+  - `UserProfilePatch` has no `email`, and `updateUserProfile` (server, client store, in-memory store) throws if a
+    patch includes one;
+  - generated rules deny every client write of email: the owner write path to the `attributes` tier is gone, and
+    `email` is never a client-writable card key, even with `cardFields.email`;
+  - `checkAuth` fills in a missing stored email from the verified token without calling the hook;
+  - `onVerifiedEmailChange` is documented as at-least-once, and `previousEmail` as the last stored value rather than
+    proof of ownership;
+  - a failing sync is logged with `console.warn` and retried on the next request, instead of being swallowed.
+
+  Regenerate your rules.
+
 - **Magic sign-in links never trust an email taken from the link, and are never completed automatically.** The
   client used to complete a sign-in link as soon as it was created, preferring an `email` query parameter (which
   `sendPasswordlessEmailLink` itself added to every link) over this device's stored email. So anyone could sign a

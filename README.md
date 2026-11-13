@@ -43,7 +43,7 @@ Like a conference or workplace lanyard, `lanyard` answers two questions everywhe
     - **`secrets`** (`TSecrets`): **Write-only AES-256-GCM encrypted user secrets** (e.g., BYOK AI API keys or personal OAuth tokens). Stored encrypted at rest (`{ ciphertext, iv, tag }`) in `private/secrets`, never readable back out to any client, with boolean status checks (`getUserSecretsStatus`) for the UI and server-only decryption (`getDecryptedUserSecrets(scopeId, uid)`) for backend API calls.
     - **Custom private documents** (`customDocs`): app-defined documents with their own read/write audiences (`self`, `staff`, or a `capability`) for cases the built-in tiers don't cover. Each lives at `…/{uid}/private/{name}` (stamped with `_lanyard: { tier: name, … }`), is read and written through `readCustomDoc` / `subscribeToCustomDoc` / `updateCustomDoc` (client) and `getCustomDoc` / `updateCustomDoc` (server), and is deleted with its user/member.
     - > [!WARNING]
-    - **`email`** is private by default: it's stored in the `attributes` tier document (so `email` is a reserved attribute key) and merged back into `UserRecord.email` / `ScopedMember.email` for readers of that tier (the user, staff, admins, and the server). Other readers see `email: ""`. Set `cardFields.email: true` to store it on the card instead. Users change their email through Firebase Auth (`sendEmailUpdateVerification`); once verified, Lanyard syncs the stored copy from the client and the server, and the generated security rules accept a client write only for the owner's own verified email.
+    - **`email`** is private by default: it's stored in the `attributes` tier document (so `email` is a reserved attribute key) and merged back into `UserRecord.email` / `ScopedMember.email` for readers of that tier (the user, staff, admins, and the server). Other readers see `email: ""`. Set `cardFields.email: true` to store it on the card instead. Users change their email through Firebase Auth (`sendEmailUpdateVerification`); once verified, the server's `checkAuth` syncs the stored copy (calling `onVerifiedEmailChange`). Email is server-owned: clients never write it, and the generated security rules deny every client write of it.
   - **Single-Listener Multiplexing**: `FirestoreClientStore` multiplexes `onSnapshot` listeners on `users/{uid}` so repeated subscriptions to the user profile, `attributes`, and admin status only ever open **1 Firestore document listener**. Preferences and private attributes use one more listener each on the user's own `private/preferences` and `private/attributes` documents, plus one of each per scope membership.
 - **Smart Avatar Tracking & Fallback Resolution**:
   - **Provider Fallback**: When a user signs up via Magic Email Link (`user.photoURL === null`) and later links Google or GitHub, `normalizeFirebaseUser` automatically extracts their avatar from `user.providerData[].photoURL` and sanitizes the URL.
@@ -226,10 +226,6 @@ export const lanyard = createLanyardClient<WorkspaceRole, WorkspaceCapability, U
   defaultPreferences: {
     themePreference: "system",
     use12h: true
-  },
-  // Optional: notified once per verified email change ({ uid, email, previousEmail }) before users/{uid}.email is updated
-  onVerifiedEmailChange: async ({ uid, email, previousEmail }) => {
-    console.log(`User ${uid} changed verified email from ${previousEmail} to ${email}`);
   }
 });
 
@@ -408,7 +404,8 @@ export const lanyardServer = createLanyardServer<WorkspaceRole, WorkspaceCapabil
   store,
   policy: workspacePolicy,
   defaultScopeParam: "workspaceId",
-  // Optional: notified in checkAuth when an authenticated user's verified token email differs from users/{uid}.email
+  // Optional: called in checkAuth when a user's verified token email differs from the email Lanyard last stored for them
+  // (at-least-once; previousEmail is just the last stored value, not proof of ownership)
   onVerifiedEmailChange: async ({ uid, email, previousEmail }) => {
     console.log(`Server synced verified email change for ${uid}: ${previousEmail} -> ${email}`);
   }

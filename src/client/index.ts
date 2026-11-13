@@ -182,13 +182,6 @@ export interface LanyardClientConfig<
   /** Prefix used for `localStorage` cache keys (preferences, emailForSignIn, and presence timestamps). */
   storageKeyPrefix?: string;
   /**
-   * Optional callback invoked once per email change when the signed-in user's verified email address
-   * in Firebase Auth differs from `record.email` on `users/{uid}` and is synced to the backing store.
-   * If the callback returns a rejected Promise, Lanyard leaves `record.email` unchanged and clears its
-   * deduplication key so the callback will be retried on the next snapshot/session.
-   */
-  onVerifiedEmailChange?: (event: VerifiedEmailChangeEvent) => void | Promise<void>;
-  /**
    * How long `authorizedFetch` waits before refreshing a second time when a freshly refreshed token is still reported
    * stale (it can share a second with the revocation), in milliseconds. Defaults to `REVOCATION_CLOCK_SKEW_MS + 1000`.
    */
@@ -213,7 +206,6 @@ export function createLanyardClient<
     defaultPreferences,
     policy,
     storageKeyPrefix = "lanyard",
-    onVerifiedEmailChange,
     staleTokenRetryDelayMs = REVOCATION_CLOCK_SKEW_MS + 1000
   } = config;
   assertStoreMatchesPolicyPlacement(store, resolveCardFields(policy));
@@ -466,7 +458,6 @@ export function createLanyardClient<
           .syncAvatar({
             uid: user.uid,
             photoUrl: user.photoUrl,
-            email: user.email,
             displayName: user.displayName
           })
           .catch(() => {
@@ -504,7 +495,6 @@ export function createLanyardClient<
               .syncAvatar({
                 uid: user.uid,
                 photoUrl: user.photoUrl,
-                email: user.email,
                 displayName: user.displayName
               })
               .catch(() => {
@@ -513,37 +503,8 @@ export function createLanyardClient<
           }
         }
 
-        // If a verified email change occurred on Firebase Auth, invoke onVerifiedEmailChange and sync the new email to users/{uid}
-        const emailSyncKey = `email:${user.uid}`;
-        if (
-          user.email &&
-          user.emailVerified &&
-          record.email &&
-          record.email.toLowerCase() !== user.email.toLowerCase() &&
-          (typeof store.updateUserProfile === "function" || typeof onVerifiedEmailChange === "function")
-        ) {
-          if (syncedAvatars.get(emailSyncKey) !== user.email) {
-            const previousEmail = record.email;
-            const nextEmail = user.email;
-            syncedAvatars.set(emailSyncKey, nextEmail);
-            Promise.resolve()
-              .then(async () => {
-                if (typeof onVerifiedEmailChange === "function") {
-                  await onVerifiedEmailChange({
-                    uid: user.uid,
-                    email: nextEmail,
-                    previousEmail
-                  });
-                }
-                if (typeof store.updateUserProfile === "function") {
-                  await store.updateUserProfile(user.uid, { email: nextEmail });
-                }
-              })
-              .catch(() => {
-                syncedAvatars.delete(emailSyncKey);
-              });
-          }
-        }
+        // Email is never written from here: the server's checkAuth syncs it from the verified token, and fires its
+        // onVerifiedEmailChange hook (a client write would race it and suppress the hook)
 
         // Real-time system admin promotion/demotion sync from users/{uid}
         if (typeof record.isSystemAdmin === "boolean") {

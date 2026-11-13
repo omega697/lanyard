@@ -4,7 +4,7 @@ import {
   nextSessionRevocations,
   sanitizeAvatarUrl
 } from "./formatters.js";
-import { SESSION_REVOCATION_RETENTION_MS } from "./models.js";
+import { assertNoEmailInProfilePatch, SESSION_REVOCATION_RETENTION_MS } from "./models.js";
 import type {
   CardFieldsPlacement,
   EncryptedSecretData,
@@ -317,14 +317,12 @@ export class InMemoryLanyardStore<
   async updateUserProfile(uid: string, patch: UserProfilePatch): Promise<void> {
     assertValidResourceId(uid, "uid");
     if (!patch || typeof patch !== "object" || Array.isArray(patch)) return;
+    assertNoEmailInProfilePatch(patch);
     const existing = this.users.get(uid) || { uid, email: "" };
     const next: UserRecord<TRole, TCapability, TPreferences, TAttributes> = {
       ...existing,
       uid
     };
-    const email = typeof patch.email === "string" && patch.email.trim() ? patch.email.toLowerCase().trim() : "";
-    if (email && this.cardFields.email) next.email = email;
-    if (email && !this.cardFields.email) this.writeAttributesTier(null, uid, {}, email);
     if (typeof patch.firstName === "string") next.firstName = patch.firstName.trim();
     if (typeof patch.lastName === "string") next.lastName = patch.lastName.trim();
     if (typeof patch.displayName === "string") next.displayName = patch.displayName.trim();
@@ -338,6 +336,7 @@ export class InMemoryLanyardStore<
     assertValidResourceId(scopeId, "scopeId");
     assertValidResourceId(uid, "uid");
     if (!patch || typeof patch !== "object" || Array.isArray(patch)) return;
+    assertNoEmailInProfilePatch(patch);
     const existing = this.getMemberCard(scopeId, uid);
     if (!existing) {
       throw new Error(`Member '${uid}' does not exist in scope '${scopeId}'.`);
@@ -347,7 +346,6 @@ export class InMemoryLanyardStore<
       uid,
       scopeId
     };
-    if (typeof patch.email === "string" && patch.email.trim()) next.email = patch.email.toLowerCase().trim();
     if (typeof patch.firstName === "string") next.firstName = patch.firstName.trim();
     if (typeof patch.lastName === "string") next.lastName = patch.lastName.trim();
     if (typeof patch.displayName === "string") next.displayName = patch.displayName.trim();
@@ -402,10 +400,9 @@ export class InMemoryLanyardStore<
     uid: string;
     photoUrl: string;
     scopeId?: string;
-    email?: string | null;
     displayName?: string | null;
   }): Promise<void> {
-    const { uid, photoUrl, scopeId, email, displayName } = params;
+    const { uid, photoUrl, scopeId, displayName } = params;
     assertValidResourceId(uid, "uid");
     const cleanPhotoUrl = sanitizeAvatarUrl(photoUrl);
     if (!cleanPhotoUrl) return;
@@ -421,11 +418,11 @@ export class InMemoryLanyardStore<
         if (existingUser.photoUrl !== cleanPhotoUrl) {
           await this.upsertUser({ ...existingUser, photoUrl: cleanPhotoUrl });
         }
-      } else if (email) {
+      } else {
         await this.upsertUser({
           uid,
-          email,
-          displayName: displayName || email,
+          email: "",
+          ...(displayName ? { displayName } : {}),
           photoUrl: cleanPhotoUrl,
           isSystemAdmin: true
         });

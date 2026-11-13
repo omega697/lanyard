@@ -13,6 +13,7 @@ import {
   type Firestore
 } from "firebase/firestore";
 import {
+  assertNoEmailInProfilePatch,
   assertValidResourceId,
   DEFAULT_LANYARD_META_COLLECTION,
   readStoredRevocationEpoch,
@@ -472,18 +473,6 @@ export class FirestoreClientStore<
     });
   }
 
-  /**
-   * Writes the user's own `email` to their `attributes` tier document (when `cardFields.email` doesn't place it
-   * on the card). Security rules accept this only for the owner's verified Firebase Auth email.
-   */
-  private async writeOwnEmailToTier(uid: string, scopeId: string | null, email: string): Promise<void> {
-    await setDoc(
-      this.tierDocRef("attributes", uid, scopeId),
-      { email, ...tierDocMetadata("attributes", uid, scopeId) },
-      { merge: true }
-    );
-  }
-
   async savePreferences(uid: string, patch: Partial<TPreferences>): Promise<void> {
     const cleanUid = assertValidFirestoreDocId(uid, "uid");
     await this.writePreferencesDoc(this.tierDocRef("preferences", cleanUid, null), cleanUid, null, patch);
@@ -504,19 +493,18 @@ export class FirestoreClientStore<
   async updateUserProfile(uid: string, patch: UserProfilePatch): Promise<void> {
     const cleanUid = assertValidFirestoreDocId(uid, "uid");
     if (!patch || typeof patch !== "object" || Array.isArray(patch)) return;
-    // Strictly allow ONLY Tier-1 self-editable profile fields (never isSystemAdmin, role, capabilities, attributes, or secrets)
+    assertNoEmailInProfilePatch(patch);
+    // Strictly allow ONLY Tier-1 self-editable profile fields (never email, isSystemAdmin, role, capabilities,
+    // attributes, or secrets)
     const safePayload: Record<string, any> = {
       uid: cleanUid,
       updatedAt: new Date().toISOString()
     };
-    const email = typeof patch.email === "string" && patch.email.trim() ? patch.email.toLowerCase().trim() : "";
-    if (email && this.cardFields.email) safePayload.email = email;
     if (typeof patch.firstName === "string") safePayload.firstName = patch.firstName.trim();
     if (typeof patch.lastName === "string") safePayload.lastName = patch.lastName.trim();
     if (typeof patch.displayName === "string") safePayload.displayName = patch.displayName.trim();
     if (patch.photoUrl !== undefined) safePayload.photoUrl = sanitizeAvatarUrl(patch.photoUrl);
 
-    if (email && !this.cardFields.email) await this.writeOwnEmailToTier(cleanUid, null, email);
     const userRef = doc(this.db, this.usersCollection, cleanUid);
     await setDoc(userRef, safePayload, { merge: true });
   }
@@ -525,15 +513,13 @@ export class FirestoreClientStore<
     const cleanScopeId = assertValidFirestoreDocId(scopeId, "scopeId");
     const cleanUid = assertValidFirestoreDocId(uid, "uid");
     if (!patch || typeof patch !== "object" || Array.isArray(patch)) return;
+    assertNoEmailInProfilePatch(patch);
     // Strictly allow ONLY Tier-1 self-editable profile fields on the existing scoped member doc
     const safePayload: Record<string, any> = {};
-    const email = typeof patch.email === "string" && patch.email.trim() ? patch.email.toLowerCase().trim() : "";
-    if (email && this.cardFields.email) safePayload.email = email;
     if (typeof patch.firstName === "string") safePayload.firstName = patch.firstName.trim();
     if (typeof patch.lastName === "string") safePayload.lastName = patch.lastName.trim();
     if (typeof patch.displayName === "string") safePayload.displayName = patch.displayName.trim();
     if (patch.photoUrl !== undefined) safePayload.photoUrl = sanitizeAvatarUrl(patch.photoUrl);
-    if (email && !this.cardFields.email) await this.writeOwnEmailToTier(cleanUid, cleanScopeId, email);
     if (Object.keys(safePayload).length === 0) return;
 
     const memberRef = doc(this.db, this.scopeCollection, cleanScopeId, this.membersSubcollection, cleanUid);
@@ -647,10 +633,9 @@ export class FirestoreClientStore<
     uid: string;
     photoUrl: string;
     scopeId?: string;
-    email?: string | null;
     displayName?: string | null;
   }): Promise<void> {
-    const { uid, photoUrl, scopeId, email, displayName } = params;
+    const { uid, photoUrl, scopeId, displayName } = params;
     const cleanUid = assertValidFirestoreDocId(uid, "uid");
     const cleanPhotoUrl = sanitizeAvatarUrl(photoUrl);
     if (!cleanPhotoUrl) return;
@@ -662,13 +647,8 @@ export class FirestoreClientStore<
     } else {
       const userRef = doc(this.db, this.usersCollection, cleanUid);
       const payload: Record<string, any> = { uid: cleanUid, photoUrl: cleanPhotoUrl };
-      if (email && this.cardFields.email) payload.email = email;
       if (displayName) payload.displayName = displayName;
       await setDoc(userRef, payload, { merge: true });
-      // A private email goes to the attributes tier after the avatar. It's best-effort, like the rest of this sync:
-      // rules accept it only for the owner's verified email (or an admin), and the verified-email flow and the
-      // server keep it current otherwise.
-      if (email && !this.cardFields.email) await this.writeOwnEmailToTier(cleanUid, null, email).catch(() => {});
     }
   }
 

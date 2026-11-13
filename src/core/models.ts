@@ -606,19 +606,31 @@ export interface LanyardActor {
 }
 
 /**
- * Self-editable profile fields on a `UserRecord` (`users/{uid}`).
+ * Self-editable profile fields on a `UserRecord` (`users/{uid}`). Email isn't one of them: it's written only when a
+ * user is provisioned (`upsertUserByEmail`) and by the server's verified-email sync in `checkAuth`.
  */
 export interface UserProfilePatch {
-  email?: string;
   firstName?: string;
   lastName?: string;
   displayName?: string;
   photoUrl?: string | null;
 }
 
+/** Message of the error thrown when a profile patch tries to set `email`. */
+export const PROFILE_EMAIL_NOT_WRITABLE_MESSAGE =
+  "email can't be changed through a profile update: it's synced from the user's verified Firebase Auth email";
+
+/** Throws if a profile patch (typed or not) carries an `email` key. */
+export function assertNoEmailInProfilePatch(patch: unknown): void {
+  if (patch && typeof patch === "object" && Object.hasOwn(patch, "email")) {
+    throw new Error(PROFILE_EMAIL_NOT_WRITABLE_MESSAGE);
+  }
+}
+
 /**
- * Event payload emitted to `onVerifiedEmailChange` when a user's verified email address
- * in Firebase Auth differs from the email stored on their `UserRecord` (`users/{uid}`).
+ * Event payload emitted to the server's `onVerifiedEmailChange` when a user's verified email address in Firebase Auth
+ * differs from the email Lanyard last stored for them. `email` is verified; `previousEmail` is only the last stored
+ * value, so don't treat it as proof the user ever owned that address.
  */
 export interface VerifiedEmailChangeEvent {
   uid: string;
@@ -892,16 +904,10 @@ export interface LanyardClientStore<
   ): () => void;
 
   /**
-   * Optional: Syncs the signed-in user's OAuth `photoUrl` (and optional `displayName`/`email`)
+   * Optional: Syncs the signed-in user's OAuth `photoUrl` (and optional `displayName`)
    * to an existing scoped member document (`scopeId` provided) or global `users/{uid}` document (`scopeId` omitted).
    */
-  syncAvatar?(params: {
-    uid: string;
-    photoUrl: string;
-    scopeId?: string;
-    email?: string | null;
-    displayName?: string | null;
-  }): Promise<void>;
+  syncAvatar?(params: { uid: string; photoUrl: string; scopeId?: string; displayName?: string | null }): Promise<void>;
 
   /** Record a presence heartbeat (`lastSeen` ISO timestamp, plus optional `photoUrl` sync) for a user. */
   recordPresenceHeartbeat(params: {
