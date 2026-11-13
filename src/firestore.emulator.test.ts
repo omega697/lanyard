@@ -2028,6 +2028,10 @@ service cloud.firestore {
         getItem = (k: string) => this.map.get(k) ?? null;
         setItem = (k: string, v: string) => void this.map.set(k, String(v));
         removeItem = (k: string) => void this.map.delete(k);
+        key = (i: number) => [...this.map.keys()][i] ?? null;
+        get length() {
+          return this.map.size;
+        }
       }
       vi.stubGlobal("localStorage", new MemoryLocalStorage());
       const attacker = emulatorClientAuth("client-csrf-attacker");
@@ -2109,6 +2113,10 @@ service cloud.firestore {
         getItem = (k: string) => this.map.get(k) ?? null;
         setItem = (k: string, v: string) => void this.map.set(k, String(v));
         removeItem = (k: string) => void this.map.delete(k);
+        key = (i: number) => [...this.map.keys()][i] ?? null;
+        get length() {
+          return this.map.size;
+        }
       }
       vi.stubGlobal("localStorage", new MemoryLocalStorage());
       const suffix = Date.now();

@@ -29,6 +29,23 @@
 
 ### Breaking changes
 
+- **The client's preferences cache is per user and cleared when their session ends.** It used to keep every user's
+  global preferences under one shared `localStorage` key that outlived sign-out, so on a shared browser the next
+  visitor saw the previous user's preferences before signing in, and the next user's preferences were merged on top of
+  them (keeping any the new user hadn't set). Now:
+  - each signed-in user's cache lives at `{prefix}_user_preferences_{uid}` and is used only once auth says they're
+    signed in;
+  - when their session ends (sign-out, revocation, another tab, or switching accounts), their cache and any pending
+    magic-link email (`{prefix}_emailForSignIn`) are removed, and whenever auth reports who is signed in (or that
+    nobody is), any other user's cache under the prefix is removed too, including ones left by sessions that ended
+    while no page was open (so with session or in-memory Auth persistence, where tabs can hold different users, each
+    tab's sign-in removes the other user's cache);
+  - signed-out visitors have their own `{prefix}_guest_preferences`, which doesn't carry into an account;
+  - the old shared `{prefix}_user_preferences` key is deleted on startup.
+
+  **Migrating:** nothing to change unless your app reads those keys directly. Preferences saved with
+  `syncToStore: false` are now device-local per user and don't survive sign-out.
+
 - **Role assignment has a ceiling.** Before, anyone holding `userCapabilities.assignRoles` could give any role to
   anyone who wasn't a system admin, including roles above their own and their own roles, so the capability was
   effectively the top role in its scope. `updateUserRoles` also wrote back the whole record it had read, so a

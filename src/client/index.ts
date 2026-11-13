@@ -179,7 +179,14 @@ export interface LanyardClientConfig<
   defaultPreferences: TPreferences;
   /** Optional permission policy defining role hierarchy, capabilities, and per-role `trackPresence`. */
   policy?: PermissionPolicy<TRole, TCapability>;
-  /** Prefix used for `localStorage` cache keys (preferences, emailForSignIn, and presence timestamps). */
+  /**
+   * Prefix used for `localStorage` cache keys: each signed-in user's preferences (`{prefix}_user_preferences_{uid}`,
+   * removed when their session ends), signed-out visitors' preferences (`{prefix}_guest_preferences`), the pending
+   * magic-link email (`{prefix}_emailForSignIn`), and presence timestamps. Whenever auth reports who is signed in, every
+   * other user's preferences cache under this prefix is removed. With Firebase's default (local) persistence every tab
+   * shares one user, but with session or in-memory persistence two tabs can be signed in as different users; then each
+   * tab's sign-in removes the other user's cache, including preferences saved with `syncToStore: false`.
+   */
   storageKeyPrefix?: string;
   /**
    * How long `authorizedFetch` waits before refreshing a second time when a freshly refreshed token is still reported
@@ -215,18 +222,35 @@ export function createLanyardClient<
     );
   }
 
-  const prefStorageKey = `${storageKeyPrefix}_user_preferences`;
+  // Each signed-in user's preferences are cached under their own key and removed when their session ends, so a shared
+  // browser never shows one person's preferences to the next; signed-out visitors get a separate guest cache.
+  const guestPrefStorageKey = `${storageKeyPrefix}_guest_preferences`;
+  const userPrefStorageKey = (uid: string): string => `${storageKeyPrefix}_user_preferences_${uid}`;
   const emailForSignInKey = `${storageKeyPrefix}_emailForSignIn`;
 
   // Tracks (targetKey -> syncedPhotoUrl) to prevent redundant avatar writes within a session
   const syncedAvatars = new Map<string, string>();
 
-  function loadCachedPreferences(): TPreferences {
+  function removeCached(key: string): void {
+    if (typeof localStorage === "undefined") return;
+    try {
+      localStorage.removeItem(key);
+    } catch {}
+  }
+
+  function writeCachedPreferences(key: string, prefs: TPreferences): void {
+    if (typeof localStorage === "undefined") return;
+    try {
+      localStorage.setItem(key, JSON.stringify(prefs));
+    } catch {}
+  }
+
+  function loadCachedPreferences(key: string): TPreferences {
     if (typeof localStorage === "undefined") {
       return { ...defaultPreferences };
     }
     try {
-      const raw = localStorage.getItem(prefStorageKey);
+      const raw = localStorage.getItem(key);
       if (raw) {
         const parsed = JSON.parse(raw);
         return { ...defaultPreferences, ...sanitizePreferencesObject<TPreferences>(parsed) };
@@ -236,6 +260,33 @@ export function createLanyardClient<
     }
     return { ...defaultPreferences };
   }
+
+  /**
+   * Removes every user's cached preferences except `keepUid`'s, including caches left by sessions that ended while no
+   * page was open, so only the person auth says is here has anything cached.
+   */
+  function removeOtherUsersCachedPreferences(keepUid: string | null): void {
+    if (typeof localStorage === "undefined") return;
+    const prefix = `${storageKeyPrefix}_user_preferences_`;
+    const keep = keepUid ? userPrefStorageKey(keepUid) : null;
+    try {
+      const stale: string[] = [];
+      for (let i = 0; i < localStorage.length; i++) {
+        const key = localStorage.key(i);
+        if (key && key.startsWith(prefix) && key !== keep) stale.push(key);
+      }
+      stale.forEach((key) => localStorage.removeItem(key));
+    } catch {}
+  }
+
+  /** Where the active user's (or a signed-out visitor's) global preferences are cached. */
+  function activePrefStorageKey(): string {
+    const uid = authStoreInternal.get().user?.uid;
+    return uid ? userPrefStorageKey(uid) : guestPrefStorageKey;
+  }
+
+  // Older versions cached every user's preferences under one shared key, which may still hold a previous user's
+  removeCached(`${storageKeyPrefix}_user_preferences`);
 
   const authStoreInternal = createWritableStore<AuthState>({
     user: null,
@@ -255,7 +306,8 @@ export function createLanyardClient<
     }
   );
 
-  const preferencesStoreInternal = createWritableStore<TPreferences>(loadCachedPreferences());
+  // Until auth says who is signed in, show only the guest cache
+  const preferencesStoreInternal = createWritableStore<TPreferences>(loadCachedPreferences(guestPrefStorageKey));
 
   let unsubUser: (() => void) | null = null;
   let unsubPrefs: (() => void) | null = null;
@@ -371,15 +423,11 @@ export function createLanyardClient<
     tierAttributes = {};
   }
 
-  function applyRemotePreferences(remotePrefs: Partial<TPreferences> | undefined): void {
+  function applyRemotePreferences(uid: string, remotePrefs: Partial<TPreferences> | undefined): void {
     if (!remotePrefs) return;
     preferencesStoreInternal.update((current) => {
       const merged = { ...current, ...sanitizePreferencesObject<TPreferences>(remotePrefs) };
-      if (typeof localStorage !== "undefined") {
-        try {
-          localStorage.setItem(prefStorageKey, JSON.stringify(merged));
-        } catch {}
-      }
+      writeCachedPreferences(userPrefStorageKey(uid), merged);
       return merged;
     });
   }
@@ -434,18 +482,26 @@ export function createLanyardClient<
     authGeneration += 1;
     cleanupUserSubscriptions();
 
+    // When a user's session ends (sign-out, revocation, another tab, or switching accounts), remove what this browser
+    // cached for them: their preferences and any pending magic-link email
+    const previousUid = authStoreInternal.get().user?.uid;
+    if (previousUid && previousUid !== user?.uid) removeCached(emailForSignInKey);
+    removeOtherUsersCachedPreferences(user?.uid ?? null);
+
     if (!user) {
       syncedAvatars.clear();
       authStoreInternal.set({ user: null, isReady: true });
       userRecordStoreInternal.set(null);
       attributesStoreInternal.set({});
       membershipsStoreInternal.set({ memberships: [], isLoading: false });
-      preferencesStoreInternal.set({ ...defaultPreferences });
+      preferencesStoreInternal.set(loadCachedPreferences(guestPrefStorageKey));
       return;
     }
 
     authStoreInternal.set({ user, isReady: true });
     membershipsStoreInternal.set({ memberships: [], isLoading: true });
+    // Paint from this user's own cache until the store delivers their preferences
+    preferencesStoreInternal.set(loadCachedPreferences(userPrefStorageKey(user.uid)));
     watchRevocationEpoch(user.uid);
 
     const globalUserSyncKey = `user:${user.uid}`;
@@ -538,7 +594,7 @@ export function createLanyardClient<
     }
 
     unsubPrefs = store.subscribeToPreferences(user.uid, (remotePrefs) => {
-      applyRemotePreferences(remotePrefs);
+      applyRemotePreferences(user.uid, remotePrefs);
     });
 
     if (typeof store.subscribeToAttributes === "function") {
@@ -699,7 +755,8 @@ export function createLanyardClient<
    * of their links. When neither is available, or the stored email belongs to a different link, it resolves
    * `{ status: "needs-email" }` and the app should ask the user for the address the link was sent to (never prefilled)
    * and call this again with `{ email }`. If someone is already signed in, it doesn't replace their session; it resolves
-   * `{ status: "signed-in-as-other" }` so the app can ask before switching accounts (sign out, then call this again).
+   * `{ status: "signed-in-as-other" }` so the app can ask before switching accounts (sign out, then call this again;
+   * signing out forgets any email this device saved, so expect `needs-email` and ask the user for it).
    *
    * Throws `EmailLinkMismatchError` when a typed email doesn't match the link (the link stays usable) and
    * `EmailLinkInvalidError` when the link has expired or was already used.
@@ -939,11 +996,7 @@ export function createLanyardClient<
     if (scopeId === GLOBAL_SCOPE) {
       preferencesStoreInternal.update((current) => {
         const updated = { ...current, ...cleanPatch };
-        if (typeof localStorage !== "undefined") {
-          try {
-            localStorage.setItem(prefStorageKey, JSON.stringify(updated));
-          } catch {}
-        }
+        writeCachedPreferences(activePrefStorageKey(), updated);
         return updated;
       });
 

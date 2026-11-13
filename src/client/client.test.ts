@@ -118,6 +118,12 @@ class MemoryLocalStorage {
   clear(): void {
     this.map.clear();
   }
+  get length(): number {
+    return this.map.size;
+  }
+  key(i: number): string | null {
+    return [...this.map.keys()][i] ?? null;
+  }
 }
 
 describe("lanyard/client unit tests", () => {
@@ -215,8 +221,9 @@ describe("lanyard/client unit tests", () => {
     expect(await store.getScopeMember("ws-1", "u-admin")).toBeNull();
 
     // Update preferences with syncToStore = false and syncToStore = true
+    // (u-1's dark theme doesn't carry over to u-admin, who has no saved preferences)
     await client.updatePreferences(GLOBAL_SCOPE, { use12h: false }, false);
-    expect(client.preferencesStore.get()).toEqual({ theme: "dark", use12h: false });
+    expect(client.preferencesStore.get()).toEqual({ theme: "system", use12h: false });
     await client.updatePreferences(GLOBAL_SCOPE, { theme: "light" }, true);
 
     await client.signOut();
@@ -1005,9 +1012,9 @@ describe("lanyard/client unit tests", () => {
     const fakeAuth: any = { currentUser: { uid: "u-sec", email: "sec@example.com" } };
     vi.mocked(firebaseAuth.onAuthStateChanged).mockImplementation(() => () => {});
 
-    // 1. Poison localStorage with __proto__ and non-object JSON before client boot
+    // 1. Poison the guest preferences cache with __proto__ and non-object JSON before client boot
     localStorage.setItem(
-      "secapp_user_preferences",
+      "secapp_guest_preferences",
       '{"__proto__":{"pollutedProp":"yes"},"constructor":{"bad":1},"theme":"dark"}'
     );
     const client = createLanyardClient<TestRole, TestCap, TestPrefs>({
@@ -1021,7 +1028,7 @@ describe("lanyard/client unit tests", () => {
     expect(({} as any).pollutedProp).toBeUndefined();
 
     // Array or primitive in localStorage falls back cleanly to defaultPreferences
-    localStorage.setItem("secapp_user_preferences", "[1, 2, 3]");
+    localStorage.setItem("secapp_guest_preferences", "[1, 2, 3]");
     const clientArrayCache = createLanyardClient<TestRole, TestCap, TestPrefs>({
       store,
       defaultPreferences: DEFAULT_PREFS,

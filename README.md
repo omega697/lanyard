@@ -343,7 +343,7 @@ switch (result.status) {
     // await lanyard.completePasswordlessSignIn({ email: typedEmail });
     // which throws EmailLinkMismatchError (ask again) or EmailLinkInvalidError (expired or used: request a new link)
     break;
-  case "signed-in-as-other": // someone else (result.currentEmail) is signed in: ask before signing them out
+  case "signed-in-as-other": // someone else (result.currentEmail) is signed in: ask before signing them out (the retry will need the email typed)
     break;
   case "not-a-link": // an ordinary page load
     break;
