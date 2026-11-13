@@ -40,18 +40,20 @@ const TEST_POLICY = createPermissionPolicy<TestRole, TestCap>({
   }
 });
 
-function createFakeAdminAuth(): AdminAuthAdapter & {
+type FakeAdminAuth = AdminAuthAdapter & {
   claimsByUid: Map<string, Record<string, any> | null>;
   deletedUids: Set<string>;
   updatedUsersByUid: Map<string, { displayName?: string | null; photoURL?: string | null }>;
-} {
+};
+
+function createFakeAdminAuth(): FakeAdminAuth {
   const usersByEmail = new Map<string, { uid: string; email: string; displayName?: string }>();
   const claimsByUid = new Map<string, Record<string, any> | null>();
   const deletedUids = new Set<string>();
   const updatedUsersByUid = new Map<string, { displayName?: string | null; photoURL?: string | null }>();
   let counter = 1;
 
-  return {
+  const fake: FakeAdminAuth = {
     claimsByUid,
     deletedUids,
     updatedUsersByUid,
@@ -151,6 +153,13 @@ function createFakeAdminAuth(): AdminAuthAdapter & {
       }
     }
   };
+  // Real ID tokens carry iat and auth_time, which checkAuth requires to check them against revocations
+  const verifyClaims = fake.verifyIdToken.bind(fake);
+  fake.verifyIdToken = async (idToken: string) => {
+    const now = Math.floor(Date.now() / 1000);
+    return { iat: now, auth_time: now - 60, ...(await verifyClaims(idToken)) };
+  };
+  return fake;
 }
 
 function createMockRes() {
@@ -191,7 +200,9 @@ describe("lanyard/server unit tests", () => {
       emailVerified: true,
       name: "Verified User",
       photoUrl: "https://example.com/p.png",
-      isAdmin: false
+      isAdmin: false,
+      tokenIssuedAtSeconds: expect.any(Number),
+      authTimeSeconds: expect.any(Number)
     });
 
     await expect(authService.verifyToken("Bearer unverified-token")).rejects.toThrow("Token email must be verified");
@@ -3227,7 +3238,13 @@ describe("lanyard/server unit tests", () => {
         store,
         policy: TEST_POLICY,
         authService: {
-          verifyToken: async () => ({ uid: "u-custom", email: "new@example.com", ...verification })
+          verifyToken: async () => ({
+            uid: "u-custom",
+            email: "new@example.com",
+            tokenIssuedAtSeconds: Math.floor(Date.now() / 1000),
+            authTimeSeconds: Math.floor(Date.now() / 1000) - 60,
+            ...verification
+          })
         },
         onVerifiedEmailChange
       });

@@ -39,7 +39,12 @@ import {
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { FirestoreClientStore } from "./client/firestore.js";
 import { createLanyardClient } from "./client/index.js";
-import { createPermissionPolicy, GLOBAL_SCOPE, type LanyardReadable } from "./core/index.js";
+import {
+  createPermissionPolicy,
+  GLOBAL_SCOPE,
+  SESSION_REVOKED_ERROR_CODE,
+  type LanyardReadable
+} from "./core/index.js";
 import { FirestoreServerStore } from "./server/firestore.js";
 import { createLanyardServer, isEncryptedSecretData } from "./server/index.js";
 import { generateFirestoreRules } from "./rules/index.js";
@@ -1899,6 +1904,11 @@ service cloud.firestore {
         await expect(adminAuth.verifyIdToken(demotedToken.token, true)).rejects.toMatchObject({
           code: "auth/id-token-revoked"
         });
+        // Emulator-only: firebase-admin checks revocation even without checkRevoked when talking to the Auth emulator
+        // (production skips it unless asked). Tests of Lanyard's own revocation handling must not rely on this.
+        await expect(adminAuth.verifyIdToken(demotedToken.token)).rejects.toMatchObject({
+          code: "auth/id-token-revoked"
+        });
         // Cross a second boundary first: iat has one-second granularity
         await new Promise((resolve) => setTimeout(resolve, 1100));
         const afterRevoke = await user.getIdTokenResult(true).catch(() => null);
@@ -1970,6 +1980,26 @@ service cloud.firestore {
 
     const crossSecondBoundary = () => new Promise((resolve) => setTimeout(resolve, 1100));
 
+    /**
+     * An AdminAuthAdapter that verifies tokens like production's default `verifyIdToken`: no revocation check. In
+     * emulator mode firebase-admin always checks revocation (production only does when asked, at the cost of a network
+     * call), which would mask Lanyard's own revocation handling. Emulator tokens are unsigned, so this decodes the
+     * payload directly; everything else delegates to the real emulator-backed Admin SDK.
+     */
+    function productionLikeAdminAuth() {
+      return {
+        verifyIdToken: async (idToken: string) => {
+          const payload = JSON.parse(Buffer.from(idToken.split(".")[1], "base64url").toString("utf8"));
+          return { ...payload, uid: payload.user_id ?? payload.sub };
+        },
+        getUserByEmail: (email: string) => adminAuth.getUserByEmail(email),
+        createUser: (properties: any) => adminAuth.createUser(properties),
+        setCustomUserClaims: (uid: string, claims: Record<string, any> | null) =>
+          adminAuth.setCustomUserClaims(uid, claims),
+        revokeRefreshTokens: (uid: string) => adminAuth.revokeRefreshTokens(uid)
+      };
+    }
+
     knownVulnerability(
       "KNOWN VULNERABILITY (H1): a demoted claim-only admin's still-valid token re-promotes them permanently",
       async () => {
@@ -2035,31 +2065,59 @@ service cloud.firestore {
       30_000
     );
 
-    knownVulnerability(
-      "KNOWN VULNERABILITY: a session revoked with revokeRefreshTokens is still accepted by checkAuth",
-      async () => {
-        const suffix = Date.now();
-        const store = new FirestoreServerStore({
-          db: adminDb,
-          usersCollection: `users_sr_${suffix}`,
-          metaCollection: `meta_sr_${suffix}`
-        });
-        const server = createLanyardServer({ adminAuth: adminAuth as any, store });
-        const signedOut = await signInEmulatorUser("u-signed-out", "signed-out@example.com");
-        try {
-          const tokenBeforeRevocation = await signedOut.user.getIdToken();
-          await adminAuth.revokeRefreshTokens("u-signed-out");
+    it("FIXED: a session revoked through revokeUserSessions is refused at once, on every server instance, even after a refresh", async () => {
+      const suffix = Date.now();
+      const storeConfig = {
+        db: adminDb,
+        usersCollection: `users_sr_${suffix}`,
+        metaCollection: `meta_sr_${suffix}`
+      };
+      const server = createLanyardServer({
+        adminAuth: productionLikeAdminAuth(),
+        store: new FirestoreServerStore(storeConfig)
+      });
+      // A second instance (e.g. another Cloud Run container) that only learns of the revocation through Firestore
+      const otherInstance = createLanyardServer({
+        adminAuth: productionLikeAdminAuth(),
+        store: new FirestoreServerStore(storeConfig)
+      });
+      const signedOut = await signInEmulatorUser("u-signed-out", "signed-out@example.com");
+      try {
+        const tokenBeforeRevocation = await signedOut.user.getIdToken();
+        expect((await runMiddleware(server.checkAuth, tokenBeforeRevocation)).nextCalled).toBe(true);
+        expect((await runMiddleware(otherInstance.checkAuth, tokenBeforeRevocation)).nextCalled).toBe(true);
+        // Cross a second boundary so the revocation is unambiguously after sign-in (auth_time has one-second granularity)
+        await crossSecondBoundary();
 
-          // Secure outcome: the token issued before the revocation is refused. Today it's accepted for up to an hour.
-          const outcome = await runMiddleware(server.checkAuth, tokenBeforeRevocation);
-          expect(outcome.nextCalled).toBe(false);
-          expect(outcome.status).toBe(401);
-        } finally {
-          await signedOut.close();
+        await server.revokeUserSessions({ uid: "u-signed-out", actor: { uid: "u-signed-out" } });
+
+        const outcome = await runMiddleware(server.checkAuth, tokenBeforeRevocation);
+        expect(outcome.nextCalled).toBe(false);
+        expect(outcome.status).toBe(401);
+        expect(outcome.body).toMatchObject({ code: SESSION_REVOKED_ERROR_CODE });
+
+        let otherOutcome = await runMiddleware(otherInstance.checkAuth, tokenBeforeRevocation);
+        for (let i = 0; i < 50 && otherOutcome.nextCalled; i++) {
+          await new Promise((resolve) => setTimeout(resolve, 100));
+          otherOutcome = await runMiddleware(otherInstance.checkAuth, tokenBeforeRevocation);
         }
-      },
-      30_000
-    );
+        expect(otherOutcome.nextCalled).toBe(false);
+        expect(otherOutcome.body).toMatchObject({ code: SESSION_REVOKED_ERROR_CODE });
+
+        // The Auth emulator still lets the revoked session refresh; the refreshed token keeps the old auth_time
+        await crossSecondBoundary();
+        const refreshed = await signedOut.user.getIdToken(true).catch(() => null);
+        if (refreshed) {
+          const refreshedOutcome = await runMiddleware(server.checkAuth, refreshed);
+          expect(refreshedOutcome.nextCalled).toBe(false);
+          expect(refreshedOutcome.body).toMatchObject({ code: SESSION_REVOKED_ERROR_CODE });
+        }
+      } finally {
+        server.close();
+        otherInstance.close();
+        await signedOut.close();
+      }
+    }, 30_000);
 
     knownVulnerability(
       "KNOWN VULNERABILITY: generated rules keep honoring a demoted admin's stale claim",

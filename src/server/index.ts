@@ -2,6 +2,9 @@ import type { NextFunction, Request, Response } from "express";
 import {
   EMAIL_NOT_VERIFIED_ERROR_CODE,
   GLOBAL_SCOPE,
+  REVOCATION_CLOCK_SKEW_MS,
+  SESSION_REVOKED_ERROR_CODE,
+  TOKEN_STALE_ERROR_CODE,
   assertValidResourceId,
   createPermissionPolicy,
   isValidEmail,
@@ -23,6 +26,9 @@ import { assertStoreMatchesPolicyPlacement, resolveAttributeQueryLocation } from
 export {
   EMAIL_NOT_VERIFIED_ERROR_CODE,
   GLOBAL_SCOPE,
+  REVOCATION_CLOCK_SKEW_MS,
+  SESSION_REVOKED_ERROR_CODE,
+  TOKEN_STALE_ERROR_CODE,
   type GlobalScope,
   type LanyardActor,
   type ScopeId,
@@ -38,6 +44,16 @@ export interface AuthenticatedUser {
   name?: string;
   photoUrl?: string | null;
   isAdmin?: boolean;
+  /**
+   * When the ID token was issued (`iat`, seconds). Required by `checkAuth`, which treats tokens issued before the
+   * revocation epoch as stale; a token without it is rejected.
+   */
+  tokenIssuedAtSeconds?: number;
+  /**
+   * When the user signed in (`auth_time`, seconds), which a refreshed token keeps. Required by `checkAuth`, which
+   * rejects tokens from sessions revoked after this time; a token without it is rejected.
+   */
+  authTimeSeconds?: number;
 }
 
 export interface AuthenticatedRequest<
@@ -86,6 +102,8 @@ export interface AdminAuthAdapter {
     properties: { displayName?: string | null; email?: string; photoURL?: string | null }
   ): Promise<any>;
   deleteUser?(uid: string): Promise<void>;
+  /** Revokes the user's refresh tokens (required by `revokeUserSessions`). */
+  revokeRefreshTokens?(uid: string): Promise<void>;
 }
 
 /**
@@ -102,6 +120,77 @@ export class EmailNotVerifiedError extends Error {
 }
 
 const SAFE_AUTH_ERROR_PREFIXES = ["Token must contain an email claim", "Token email must be verified"];
+
+type LiveValueState<T> = { status: "loading" } | { status: "ready"; value: T } | { status: "error"; error: unknown };
+
+/**
+ * Keeps the latest value from a store subscription in memory. After a listener error (which ends a Firestore
+ * listener) it reports the error state and resubscribes with exponential backoff, so callers fail closed until the
+ * data is current again. `current(timeoutMs)` waits for the first value instead of failing during startup.
+ */
+function trackLiveValue<T>(
+  subscribe: (onChange: (value: T) => void, onError: (error: unknown) => void) => () => void,
+  initialRetryDelayMs: number
+) {
+  let state: LiveValueState<T> = { status: "loading" };
+  let waiters: Array<() => void> = [];
+  let unsubscribe: (() => void) | undefined;
+  let retryTimer: ReturnType<typeof setTimeout> | undefined;
+  let retryDelayMs = initialRetryDelayMs;
+  let closed = false;
+
+  const settle = (next: LiveValueState<T>) => {
+    state = next;
+    const pending = waiters;
+    waiters = [];
+    pending.forEach((resolve) => resolve());
+  };
+  const start = () => {
+    if (closed) return;
+    let failed = false;
+    unsubscribe = subscribe(
+      (value) => {
+        if (failed || closed) return;
+        retryDelayMs = initialRetryDelayMs;
+        settle({ status: "ready", value });
+      },
+      (error) => {
+        if (failed || closed) return;
+        failed = true;
+        settle({ status: "error", error });
+        unsubscribe?.();
+        retryTimer = setTimeout(start, retryDelayMs);
+        (retryTimer as any)?.unref?.();
+        retryDelayMs = Math.min(retryDelayMs * 2, 30_000);
+      }
+    );
+    // A synchronous error inside subscribe() ran before unsubscribe was assigned
+    if (failed) unsubscribe?.();
+  };
+  start();
+
+  return {
+    async current(timeoutMs: number): Promise<LiveValueState<T>> {
+      if (state.status !== "loading") return state;
+      await new Promise<void>((resolve) => {
+        const timer = setTimeout(resolve, timeoutMs);
+        waiters.push(() => {
+          clearTimeout(timer);
+          resolve();
+        });
+      });
+      return state;
+    },
+    set(value: T) {
+      settle({ status: "ready", value });
+    },
+    close() {
+      closed = true;
+      if (retryTimer) clearTimeout(retryTimer);
+      unsubscribe?.();
+    }
+  };
+}
 
 function formatClientAuthError(error: unknown): { error: string; code?: typeof EMAIL_NOT_VERIFIED_ERROR_CODE } {
   if (error instanceof EmailNotVerifiedError) {
@@ -144,7 +233,9 @@ export class GoogleAuthService implements AuthService {
       emailVerified: decodedToken.email_verified === true,
       name: decodedToken.name,
       photoUrl: sanitizeAvatarUrl(decodedToken.picture),
-      isAdmin: Boolean(decodedToken.admin)
+      isAdmin: Boolean(decodedToken.admin),
+      tokenIssuedAtSeconds: typeof decodedToken.iat === "number" ? decodedToken.iat : undefined,
+      authTimeSeconds: typeof decodedToken.auth_time === "number" ? decodedToken.auth_time : undefined
     };
   }
 }
@@ -173,6 +264,13 @@ export interface LanyardServerConfig<
    * Lanyard updates `userRecord.email` via `store.upsertUser` so the callback fires only once per email change.
    */
   onVerifiedEmailChange?: (event: VerifiedEmailChangeEvent) => void | Promise<void>;
+  /**
+   * How long `checkAuth` waits for the store's first revocation data before failing closed with 503, in milliseconds
+   * (default 5000). Only matters right after startup.
+   */
+  revocationLoadTimeoutMs?: number;
+  /** Delay before resubscribing after a revocation listener error, in milliseconds (default 1000, doubling to 30s). */
+  revocationResubscribeDelayMs?: number;
 }
 
 /**
@@ -195,9 +293,77 @@ export function createLanyardServer<
     policy = createPermissionPolicy<TRole, TCapability>({}),
     authService = new GoogleAuthService(adminAuth),
     defaultScopeParam = "scopeId",
-    onVerifiedEmailChange
+    onVerifiedEmailChange,
+    revocationLoadTimeoutMs = 5000,
+    revocationResubscribeDelayMs = 1000
   } = config;
   assertStoreMatchesPolicyPlacement(store, policy.cardFields);
+  for (const method of [
+    "getRevocationEpoch",
+    "bumpRevocationEpoch",
+    "subscribeToRevocationEpoch",
+    "getSessionRevocations",
+    "recordSessionRevocation",
+    "subscribeToSessionRevocations"
+  ] as const) {
+    if (typeof (store as any)[method] !== "function") {
+      throw new Error(
+        `Lanyard server store must implement ${method}() (required for immediate revocation); verify custom stores with lanyard/testing`
+      );
+    }
+  }
+
+  const revocationEpoch = trackLiveValue<number | null>(
+    (onChange, onError) => store.subscribeToRevocationEpoch(onChange, onError),
+    revocationResubscribeDelayMs
+  );
+  const sessionRevocations = trackLiveValue<Readonly<Record<string, number>>>(
+    (onChange, onError) => store.subscribeToSessionRevocations(onChange, onError),
+    revocationResubscribeDelayMs
+  );
+
+  /** Stops the revocation subscriptions (for tests and graceful shutdown). */
+  function close(): void {
+    revocationEpoch.close();
+    sessionRevocations.close();
+  }
+
+  /**
+   * Rejects tokens that a revocation has superseded: sessions revoked after the user signed in (`auth_time`), and
+   * tokens issued (`iat`) before the revocation epoch. Fails closed when token times or revocation data are missing.
+   */
+  async function checkTokenFreshness(
+    user: AuthenticatedUser
+  ): Promise<{ status: number; body: { error: string; code?: string } } | null> {
+    const { tokenIssuedAtSeconds: iat, authTimeSeconds: authTime } = user;
+    if (!Number.isInteger(iat) || !Number.isInteger(authTime)) {
+      return { status: 401, body: { error: "Unauthorized: Invalid or expired authentication token" } };
+    }
+    const [epoch, sessions] = await Promise.all([
+      revocationEpoch.current(revocationLoadTimeoutMs),
+      sessionRevocations.current(revocationLoadTimeoutMs)
+    ]);
+    if (epoch.status !== "ready" || sessions.status !== "ready") {
+      return { status: 503, body: { error: "Service unavailable: unable to verify token freshness" } };
+    }
+    const revokedAt = sessions.value[user.uid];
+    if (revokedAt !== undefined && authTime! * 1000 <= revokedAt + REVOCATION_CLOCK_SKEW_MS) {
+      return {
+        status: 401,
+        body: { error: "Unauthorized: Session has been revoked; sign in again", code: SESSION_REVOKED_ERROR_CODE }
+      };
+    }
+    if (epoch.value !== null && iat! * 1000 <= epoch.value + REVOCATION_CLOCK_SKEW_MS) {
+      return {
+        status: 401,
+        body: {
+          error: "Unauthorized: Token was issued before a recent revocation; refresh it and retry",
+          code: TOKEN_STALE_ERROR_CODE
+        }
+      };
+    }
+    return null;
+  }
 
   // Tracks in-flight verified email change syncs per (uid -> targetEmail) so concurrent requests don't double-fire
   const inFlightEmailSyncs = new Map<string, Promise<void>>();
@@ -268,6 +434,10 @@ export function createLanyardServer<
       const user = await authService.verifyToken(req.headers.authorization, req.headers);
       if (!user) {
         return res.status(401).json({ error: "Unauthorized: Missing or invalid authentication credentials" });
+      }
+      const rejection = await checkTokenFreshness(user);
+      if (rejection) {
+        return res.status(rejection.status).json(rejection.body);
       }
       try {
         const { isAdmin, userRecord } = await resolveEffectiveAdminStatus(user);
@@ -584,6 +754,33 @@ export function createLanyardServer<
       }
       throw err;
     }
+  }
+
+  /**
+   * Signs a user out everywhere: revokes their Firebase refresh tokens, then records the revocation so `checkAuth`
+   * immediately rejects every token from a session that started before it (even refreshed ones). Users may revoke their
+   * own sessions; revoking anyone else's requires an admin actor. If Firebase revocation fails, nothing is recorded.
+   */
+  async function revokeUserSessions(params: { uid: string; actor: LanyardActor }): Promise<void> {
+    const { uid, actor } = params;
+    assertValidResourceId(uid, "uid");
+    if (!actor || typeof actor !== "object") {
+      throw new Error("Invalid actor: actor object with uid is required");
+    }
+    assertValidResourceId(actor.uid, "actor.uid");
+    if (actor.uid !== uid) {
+      const { isAdmin } = await resolveEffectiveAdminStatus(actor);
+      if (!isAdmin) {
+        throw new Error("Forbidden: only administrators can revoke other users' sessions");
+      }
+    }
+    if (typeof adminAuth.revokeRefreshTokens !== "function") {
+      throw new Error("adminAuth must implement revokeRefreshTokens to revoke sessions");
+    }
+    await adminAuth.revokeRefreshTokens(uid);
+    const revocations = await store.recordSessionRevocation(uid, Date.now());
+    // Apply on this instance right away instead of waiting for the store subscription to deliver it
+    sessionRevocations.set(revocations);
   }
 
   async function setSystemAdminStatus(params: {
@@ -1770,6 +1967,8 @@ export function createLanyardServer<
     requireAdmin,
     requireRole,
     requireCapability,
+    revokeUserSessions,
+    close,
     getOrProvisionUidByEmail,
     setSystemAdminStatus,
     upsertUserByEmail,

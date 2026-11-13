@@ -4,6 +4,27 @@
 
 ### Breaking changes
 
+- **`checkAuth` enforces revocations, and requires token times.** It now rejects, before any store lookup:
+  - tokens from a session revoked after the user signed in (`auth_time` at or before the user's session revocation):
+    `401 { error, code: "auth/session-revoked" }` (`SESSION_REVOKED_ERROR_CODE`); the user must sign in again;
+  - tokens issued (`iat`) at or before the revocation epoch: `401 { error, code: "auth/token-stale" }`
+    (`TOKEN_STALE_ERROR_CODE`); refreshing the token and retrying is enough.
+
+  Both comparisons allow `REVOCATION_CLOCK_SKEW_MS` (2s) for clock differences and one-second token granularity.
+  `AuthenticatedUser` gains `tokenIssuedAtSeconds` and `authTimeSeconds`, which `GoogleAuthService` fills from the
+  token; **a custom `AuthService` must provide both**, or `checkAuth` fails closed with 401. Revocation data comes from
+  the store's live subscriptions, held in memory, so the check adds no per-request lookup; until it first loads
+  (`revocationLoadTimeoutMs`, default 5s) requests wait, and if it can't be loaded or a listener errors, `checkAuth`
+  responds `503` and resubscribes with backoff (`revocationResubscribeDelayMs`). `createLanyardServer` throws if the
+  store lacks the revocation methods, subscribes at construction, and returns a new `close()` to stop the
+  subscriptions.
+
+- **New `revokeUserSessions({ uid, actor })`** signs a user out everywhere: it revokes their Firebase refresh tokens,
+  then records a session revocation that every server instance enforces at once. Users may revoke their own sessions;
+  revoking someone else's requires an admin actor. Nothing is recorded if Firebase revocation fails.
+  `AdminAuthAdapter` gains an optional `revokeRefreshTokens`, required by this method. Revocations made directly in
+  Firebase (the console, or calling `revokeRefreshTokens` yourself) aren't seen by Lanyard; use this method.
+
 - **Stores must implement the revocation epoch.** `LanyardServerStore` now requires `getRevocationEpoch()`,
   `bumpRevocationEpoch(atMs)` and `subscribeToRevocationEpoch(onChange, onError)`, and `LanyardClientStore` requires
   `subscribeToRevocationEpoch(onChange, onError)`. The epoch is the time (epoch milliseconds) of the most recent

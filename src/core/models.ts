@@ -10,6 +10,24 @@ export type SocialProviderType = "google" | "microsoft" | "github";
 export const EMAIL_NOT_VERIFIED_ERROR_CODE = "auth/email-not-verified";
 
 /**
+ * Error `code` in the 401 body when a token was issued before a recent revocation (for example an admin demotion).
+ * Refreshing the token (`getIdToken(true)`) and retrying is enough; Lanyard's client does this automatically.
+ */
+export const TOKEN_STALE_ERROR_CODE = "auth/token-stale";
+
+/**
+ * Error `code` in the 401 body when the user's sessions were revoked (signed out everywhere or disabled) after they
+ * signed in. Refreshing won't help: the user must sign in again.
+ */
+export const SESSION_REVOKED_ERROR_CODE = "auth/session-revoked";
+
+/**
+ * Margin applied when comparing token times (one-second granularity, issued by Google's clock) with revocation times
+ * (recorded by the server's clock): tokens issued within this margin after a revocation are still treated as revoked.
+ */
+export const REVOCATION_CLOCK_SKEW_MS = 2000;
+
+/**
  * Unique symbol identifying the explicit global (unscoped / single-tenant) scope.
  *
  * Because `GLOBAL_SCOPE` is a `symbol`, an untrusted string from an HTTP route parameter
