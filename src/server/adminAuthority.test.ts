@@ -174,3 +174,87 @@ describe("the Firebase admin claim is the only admin authority", () => {
     server.close();
   });
 });
+
+describe("setSystemAdminStatus authorizes its actor (H2)", () => {
+  function fakeAuthWithAccounts(accounts: Record<string, { uid: string; claims?: Record<string, any> }>) {
+    const claims = new Map(Object.values(accounts).map((a) => [a.uid, { ...(a.claims || {}) }]));
+    const created: string[] = [];
+    const adminAuth = {
+      verifyIdToken: async () => {
+        throw new Error("not used");
+      },
+      getUserByEmail: async (email: string) => {
+        const account = accounts[email.toLowerCase()];
+        if (!account) throw Object.assign(new Error("User not found"), { code: "auth/user-not-found" });
+        return { uid: account.uid, email, customClaims: claims.get(account.uid) };
+      },
+      createUser: vi.fn(async (props: { email: string }) => {
+        created.push(props.email);
+        const uid = `created-${created.length}`;
+        accounts[props.email.toLowerCase()] = { uid };
+        return { uid, email: props.email };
+      }),
+      setCustomUserClaims: vi.fn(async (uid: string, c: Record<string, any> | null) => {
+        claims.set(uid, { ...(c || {}) });
+      }),
+      revokeRefreshTokens: async () => {},
+      getUser: async (uid: string) => ({ uid, customClaims: claims.get(uid) ?? null })
+    } satisfies AdminAuthAdapter;
+    return { adminAuth, claims, created };
+  }
+
+  it("refuses a non-admin actor before provisioning anyone or changing any claim", async () => {
+    const { adminAuth, claims, created } = fakeAuthWithAccounts({
+      "attacker@example.com": { uid: "u-attacker" }
+    });
+    const store = new InMemoryLanyardStore();
+    const server = createLanyardServer({ adminAuth, store });
+
+    for (const email of ["attacker@example.com", "brand-new@example.com"]) {
+      await expect(
+        server.setSystemAdminStatus({ email, isAdmin: true, actor: { uid: "u-attacker", isAdmin: true } })
+      ).rejects.toThrow(/Forbidden/);
+    }
+    expect(adminAuth.setCustomUserClaims).not.toHaveBeenCalled();
+    expect(created).toEqual([]);
+    expect(claims.get("u-attacker")?.admin).toBeUndefined();
+    expect(await store.getSystemAdmin("u-attacker")).toBeNull();
+    server.close();
+  });
+
+  it("lets a real admin (by Firebase claim, or a verified req.user) grant and revoke admin", async () => {
+    const { adminAuth, claims } = fakeAuthWithAccounts({
+      "admin@example.com": { uid: "u-admin", claims: { admin: true } },
+      "target@example.com": { uid: "u-target" }
+    });
+    const store = new InMemoryLanyardStore();
+    const server = createLanyardServer({
+      adminAuth,
+      store,
+      authService: tokenTable({ adminToken: { uid: "u-admin", admin: true } })
+    });
+
+    await server.setSystemAdminStatus({ email: "target@example.com", isAdmin: true, actor: { uid: "u-admin" } });
+    expect(claims.get("u-target")?.admin).toBe(true);
+
+    const { req } = await run(server.checkAuth, authed("adminToken"));
+    await server.setSystemAdminStatus({ email: "target@example.com", isAdmin: false, actor: req.user });
+    expect(claims.get("u-target")?.admin).toBe(false);
+    server.close();
+  });
+
+  it("doesn't create an account when demoting an email that has none", async () => {
+    const { adminAuth, created } = fakeAuthWithAccounts({
+      "admin@example.com": { uid: "u-admin", claims: { admin: true } }
+    });
+    const store = new InMemoryLanyardStore();
+    const server = createLanyardServer({ adminAuth, store });
+
+    expect(
+      await server.setSystemAdminStatus({ email: "nobody@example.com", isAdmin: false, actor: { uid: "u-admin" } })
+    ).toBeNull();
+    expect(created).toEqual([]);
+    expect(adminAuth.setCustomUserClaims).not.toHaveBeenCalled();
+    server.close();
+  });
+});

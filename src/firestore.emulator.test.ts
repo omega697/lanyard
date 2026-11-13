@@ -2052,31 +2052,44 @@ service cloud.firestore {
       }
     }, 30_000);
 
-    knownVulnerability(
-      "KNOWN VULNERABILITY (H2): setSystemAdminStatus lets a non-admin actor make themselves an admin",
-      async () => {
-        const suffix = Date.now();
-        const store = new FirestoreServerStore({
-          db: adminDb,
-          usersCollection: `users_h2_${suffix}`,
-          metaCollection: `meta_h2_${suffix}`
-        });
-        const server = createLanyardServer({ adminAuth: adminAuth as any, store });
-        await adminAuth.createUser({ uid: "u-h2-attacker", email: "h2-attacker@example.com", emailVerified: true });
+    it("FIXED (H2): setSystemAdminStatus refuses a non-admin actor, even one claiming isAdmin, before changing anything", async () => {
+      const suffix = Date.now();
+      const store = new FirestoreServerStore({
+        db: adminDb,
+        usersCollection: `users_h2_${suffix}`,
+        metaCollection: `meta_h2_${suffix}`
+      });
+      const server = createLanyardServer({ adminAuth: adminAuth as any, store });
+      await adminAuth.createUser({ uid: "u-h2-attacker", email: "h2-attacker@example.com", emailVerified: true });
 
-        // An app route that forwards the caller as the actor, without its own admin check
-        const attempt = server.setSystemAdminStatus({
-          email: "h2-attacker@example.com",
-          isAdmin: true,
-          actor: { uid: "u-h2-attacker", isAdmin: false }
-        });
+      try {
+        // An app route that forwards the caller (or a body-supplied actor) without its own admin check
+        for (const actor of [
+          { uid: "u-h2-attacker", isAdmin: false },
+          { uid: "u-h2-attacker", isAdmin: true }
+        ]) {
+          await expect(
+            server.setSystemAdminStatus({ email: "h2-attacker@example.com", isAdmin: true, actor })
+          ).rejects.toThrow(/Forbidden/);
+        }
+        await expect(
+          server.setSystemAdminStatus({
+            email: "h2-new-account@example.com",
+            isAdmin: true,
+            actor: { uid: "u-h2-attacker", isAdmin: true }
+          })
+        ).rejects.toThrow(/Forbidden/);
 
-        // Secure outcome: rejected, and no admin claim granted. Today it succeeds.
-        await expect(attempt).rejects.toThrow();
+        // Nothing changed: no admin claim, no admin record, no account provisioned
         expect((await adminAuth.getUser("u-h2-attacker")).customClaims?.admin).not.toBe(true);
-      },
-      30_000
-    );
+        expect(await store.getSystemAdmin("u-h2-attacker")).toBeNull();
+        await expect(adminAuth.getUserByEmail("h2-new-account@example.com")).rejects.toMatchObject({
+          code: "auth/user-not-found"
+        });
+      } finally {
+        server.close();
+      }
+    }, 30_000);
 
     it("FIXED: a session revoked through revokeUserSessions is refused at once, on every server instance, even after a refresh", async () => {
       const suffix = Date.now();
@@ -2287,6 +2300,12 @@ ${generateFirestoreRules(createPermissionPolicy({}), { usersCollection })}
           metaCollection: `meta_rules_${Date.now()}`
         });
         const server = createLanyardServer({ adminAuth: adminAuth as any, store });
+        await adminAuth.createUser({
+          uid: "u-rules-other-admin",
+          email: "rules-other-admin@example.com",
+          emailVerified: true
+        });
+        await adminAuth.setCustomUserClaims("u-rules-other-admin", { admin: true });
         const demoted = await signInEmulatorUser("u-rules-admin", "rules-admin@example.com", { admin: true });
         try {
           // As an admin they can read another user's private preferences

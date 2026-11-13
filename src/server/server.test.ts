@@ -323,6 +323,8 @@ describe("lanyard/server unit tests", () => {
 
   it("provisions UIDs by email, manages system admins, and grants/revokes multi-capabilities", async () => {
     const adminAuth = createFakeAdminAuth();
+    // The admin actor below is hand-built, so its admin status comes from its Firebase claim
+    adminAuth.claimsByUid.set("root-admin", { admin: true });
     const store = new InMemoryLanyardStore<TestRole, TestCap>();
     const server = createLanyardServer<TestRole, TestCap>({
       adminAuth,
@@ -899,6 +901,8 @@ describe("lanyard/server unit tests", () => {
 
   it("enforces server security guards: default GoogleAuthService, runtime assertNotProduction, checkRevoked, path traversal rejection, and sanitized 500 errors", async () => {
     const adminAuth = createFakeAdminAuth();
+    // The admin actor below is hand-built, so its admin status comes from its Firebase claim
+    adminAuth.claimsByUid.set("root-admin", { admin: true });
     const store = new InMemoryLanyardStore<TestRole, TestCap>();
 
     // 1. createLanyardServer defaults to GoogleAuthService even if FIRESTORE_EMULATOR_HOST is set
@@ -1139,6 +1143,8 @@ describe("lanyard/server unit tests", () => {
       pointsAllTime: number;
     }
     const adminAuth = createFakeAdminAuth();
+    // The admin actor below is hand-built, so its admin status comes from its Firebase claim
+    adminAuth.claimsByUid.set("root-admin", { admin: true });
     const store = new InMemoryLanyardStore<TestRole, TestCap, Prefs, Attrs>();
     const server = createLanyardServer<TestRole, TestCap, Prefs, Attrs>({
       adminAuth,
@@ -2573,6 +2579,8 @@ describe("lanyard/server unit tests", () => {
     });
 
     const adminAuth = createFakeAdminAuth();
+    // The admin actor below is hand-built, so its admin status comes from its Firebase claim
+    adminAuth.claimsByUid.set("bootstrap", { admin: true });
     const store = new InMemoryLanyardStore<
       UserRole,
       UserCap,

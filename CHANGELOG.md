@@ -46,6 +46,12 @@
   `setSystemAdminStatus`; they grant nothing. This supersedes the store-based fail-closed admin check from earlier in
   this release: admin checks no longer touch the store at all.
 
+- **`setSystemAdminStatus` requires an admin actor.** It used to validate only `actor.uid` (and block self-demotion), so
+  an app route that forwarded the caller as the actor let any user grant themselves admin. It now checks, before
+  provisioning an account or changing any claim, that the actor is an admin by the rules above (a verified `req.user`,
+  or the user's current Firebase claim), and throws `Forbidden` otherwise. Demoting an email with no account is now a
+  no-op that returns `null` instead of provisioning an account first.
+
 - **`checkAuth` enforces revocations, and requires token times.** It now rejects, before any store lookup:
   - tokens from a session revoked after the user signed in (`auth_time` at or before the user's session revocation):
     `401 { error, code: "auth/session-revoked" }` (`SESSION_REVOKED_ERROR_CODE`); the user must sign in again;

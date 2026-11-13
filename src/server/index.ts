@@ -759,12 +759,26 @@ export function createLanyardServer<
     actor: LanyardActor;
   }): Promise<SystemAdminProfile | null> {
     const { email, isAdmin, firstName = "", lastName = "", actor } = params;
-    if (!actor || typeof actor !== "object") {
-      throw new Error("Invalid actor: actor object with uid is required");
+    // Authorize before touching anything: no account is provisioned and no claim changes for a non-admin actor
+    if (!(await isActorAdmin(actor))) {
+      throw new Error("Forbidden: only administrators can change system admin status");
     }
-    assertValidResourceId(actor.uid, "actor.uid");
     const displayName = [firstName.trim(), lastName.trim()].filter(Boolean).join(" ") || email.trim();
-    const { uid, email: cleanEmail } = await getOrProvisionUidByEmail({ email, displayName });
+    let uid: string;
+    let cleanEmail: string;
+    if (isAdmin) {
+      ({ uid, email: cleanEmail } = await getOrProvisionUidByEmail({ email, displayName }));
+    } else {
+      // Demoting someone without an account is a no-op: never provision an account just to demote it
+      cleanEmail = (email || "").toLowerCase().trim();
+      if (!isValidEmail(cleanEmail)) throw new Error("Invalid email address");
+      try {
+        uid = (await adminAuth.getUserByEmail(cleanEmail)).uid;
+      } catch (error: any) {
+        if (error?.code === "auth/user-not-found") return null;
+        throw error;
+      }
+    }
 
     if (!isAdmin && uid === actor.uid) {
       throw new Error("Cannot remove yourself from system administrators");
