@@ -29,6 +29,12 @@
 
 ### Breaking changes
 
+- **The client's `authStore.user.isAdmin` is always the Firebase claim.** The client used to overwrite it with the
+  user's stored `isSystemAdmin` whenever the record changed, so a stale directory entry made a non-admin (or a demoted
+  admin) look like an admin in the UI until something refreshed it. The server and generated rules never trusted the
+  record, so this affected only what the UI showed. Now a change to the record only prompts a token refresh, and
+  `isAdmin` is whatever the refreshed claim says.
+
 - **Non-admins can't manage system admins, judged by the Firebase claim.** The guards that stop a non-admin with
   `userCapabilities.write` / `assignRoles` from editing, re-roling or deleting a system admin used to check the
   store's `isSystemAdmin` flag, and only in `GLOBAL_SCOPE`. So an admin whose record lacked the flag (for example one

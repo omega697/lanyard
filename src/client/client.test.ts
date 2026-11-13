@@ -1770,17 +1770,19 @@ describe("lanyard/client unit tests", () => {
     await store.updateUserAttributes("u-single", { pointsAllTime: 170 });
     expect(client.attributesStore.get().pointsAllTime).toBe(170);
 
-    // 4. Real-time system admin promotion & demotion in users/{uid} updates authStore.user.isAdmin and refreshes ID token
+    // 4. A change to the admin directory entry refreshes the ID token, and authStore.user.isAdmin follows the claim
     await store.upsertSystemAdmin({
       uid: "u-single",
       email: "single@example.com",
       isSystemAdmin: true
     });
-    expect(client.authStore.get().user?.isAdmin).toBe(true);
     expect(getIdTokenResultSpy).toHaveBeenCalledWith(true);
+    await vi.waitFor(() => expect(client.authStore.get().user?.isAdmin).toBe(true));
 
+    // Demotion: the claim is revoked first, and the directory change prompts the refresh that picks it up
+    getIdTokenResultSpy.mockResolvedValue({ claims: { admin: false } });
     await store.deleteSystemAdmin("u-single");
-    expect(client.authStore.get().user?.isAdmin).toBe(false);
+    await vi.waitFor(() => expect(client.authStore.get().user?.isAdmin).toBe(false));
     // Attributes and preferences remain intact after admin demotion!
     expect(client.attributesStore.get().pointsAllTime).toBe(170);
 

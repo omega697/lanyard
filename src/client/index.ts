@@ -470,6 +470,8 @@ export function createLanyardClient<
     type OwnRecord = UserRecord<TRole, TCapability, TPreferences, TAttributes>;
     let latestCard: OwnRecord | null = null;
     let tierEmail: string | undefined;
+    // The record's admin flag as last seen, so only a change to it (not every record update) prompts a token refresh
+    let lastRecordAdminFlag: boolean | undefined;
     const withTierEmail = (record: OwnRecord | null): OwnRecord | null =>
       record && tierEmail ? { ...record, email: tierEmail } : record;
 
@@ -506,26 +508,20 @@ export function createLanyardClient<
         // Email is never written from here: the server's checkAuth syncs it from the verified token, and fires its
         // onVerifiedEmailChange hook (a client write would race it and suppress the hook)
 
-        // Real-time system admin promotion/demotion sync from users/{uid}
-        if (typeof record.isSystemAdmin === "boolean") {
+        // A change to the admin directory entry is only a hint that the user's claim may have changed: refresh the
+        // token and publish what the claim says. The record itself never decides isAdmin (it can be stale).
+        if (typeof record.isSystemAdmin === "boolean" && record.isSystemAdmin !== lastRecordAdminFlag) {
+          lastRecordAdminFlag = record.isSystemAdmin;
           const currentAuth = authStoreInternal.get();
           if (
             currentAuth.user &&
             currentAuth.user.uid === user.uid &&
-            currentAuth.user.isAdmin !== record.isSystemAdmin
+            currentAuth.user.isAdmin !== record.isSystemAdmin &&
+            auth?.currentUser &&
+            auth.currentUser.uid === user.uid &&
+            typeof auth.currentUser.getIdTokenResult === "function"
           ) {
-            authStoreInternal.set({
-              ...currentAuth,
-              user: { ...currentAuth.user, isAdmin: record.isSystemAdmin }
-            });
-            // Force-refresh the Firebase Auth ID token in the background so custom claims update immediately
-            if (
-              auth?.currentUser &&
-              auth.currentUser.uid === user.uid &&
-              typeof auth.currentUser.getIdTokenResult === "function"
-            ) {
-              auth.currentUser.getIdTokenResult(true).catch(() => {});
-            }
+            refreshTokenAndClaims(auth.currentUser).catch(() => {});
           }
         }
       } else {
