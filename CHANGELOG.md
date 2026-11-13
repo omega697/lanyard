@@ -4,6 +4,14 @@
 
 ### Breaking changes
 
+- **Admin checks fail closed when the backing store is unreachable.** `checkAuth` used to keep the token's `admin`
+  claim as `req.user.isAdmin` if `store.getUser`/`store.getSystemAdmin` threw, and `requireAdmin` let the request
+  through on the same claim. Because a demotion only lands in the token when it's refreshed (up to an hour later), a
+  just-demoted admin was treated as an admin again during a store outage. Now `checkAuth` still authenticates the
+  caller but sets `isAdmin: false`, and `requireAdmin` responds `503` with
+  `{ error: "Service unavailable: unable to verify administrative access" }` without calling `next()`. Admin routes are
+  unavailable during a store outage rather than trusting a possibly stale claim.
+
 - **Missing `email_verified` now fails closed on the server.** `GoogleAuthService.verifyToken` used to reject a token
   only when its `email_verified` claim was exactly `false`, and reported `emailVerified: true` when the claim was
   absent. It now requires `email_verified === true` (when `requireVerifiedEmail` is on) and reports `emailVerified`

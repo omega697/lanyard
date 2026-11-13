@@ -100,6 +100,14 @@ function createFakeAdminAuth(): AdminAuthAdapter & {
           picture: "https://example.com/mgr-oauth.png"
         };
       }
+      if (idToken === "admin-claim-token") {
+        return {
+          uid: "u-admin-claim",
+          email: "admin-claim@example.com",
+          email_verified: true,
+          admin: true
+        };
+      }
       throw new Error("Invalid token");
     },
     async getUserByEmail(email: string) {
@@ -208,6 +216,25 @@ describe("lanyard/server unit tests", () => {
 
     const lenientUser = await new GoogleAuthService(adminAuth, false).verifyToken(`Bearer ${token}`);
     expect(lenientUser?.emailVerified).toBe(false);
+  });
+
+  it("authenticates but does not grant admin from the token claim in checkAuth when the backing store throws", async () => {
+    const store = new InMemoryLanyardStore<TestRole, TestCap>();
+    const server = createLanyardServer<TestRole, TestCap>({
+      adminAuth: createFakeAdminAuth(),
+      store,
+      policy: TEST_POLICY
+    });
+    vi.spyOn(store, "getUser").mockRejectedValueOnce(new Error("Transient directory outage"));
+    const req: any = { headers: { authorization: "Bearer admin-claim-token" } };
+    let nextCalled = false;
+
+    await server.checkAuth(req, createMockRes(), () => {
+      nextCalled = true;
+    });
+
+    expect(nextCalled).toBe(true);
+    expect(req.user).toMatchObject({ uid: "u-admin-claim", isAdmin: false });
   });
 
   it("omits the email-not-verified code from other checkAuth rejections", async () => {
@@ -1004,8 +1031,9 @@ describe("lanyard/server unit tests", () => {
     ).rejects.toThrow(/role is not defined in policy\.roles/);
   });
 
-  it("covers non-fatal requireAdmin store errors, requireCapability 500 sanitization, and FirestoreServerStore photoUrl sanitization", async () => {
-    // 1. requireAdmin continues (calls next()) even if the backing directory store throws a transient error
+  it("covers fail-closed requireAdmin store errors, requireCapability 500 sanitization, and FirestoreServerStore photoUrl sanitization", async () => {
+    // 1. requireAdmin denies (503, never calls next()) when the backing directory store throws, even if the token
+    //    carries an admin claim: a stale claim must not grant admin while demotion can't be checked
     const adminAuth = createFakeAdminAuth();
     const store = new InMemoryLanyardStore<TestRole, TestCap>();
     const server = createLanyardServer<TestRole, TestCap>({
@@ -1016,14 +1044,30 @@ describe("lanyard/server unit tests", () => {
 
     vi.spyOn(store, "getSystemAdmin").mockRejectedValueOnce(new Error("Transient directory outage"));
     let adminProceeded = false;
+    const adminRes = createMockRes();
     await server.requireAdmin(
       { user: { uid: "u-admin", email: "admin@example.com", isAdmin: true } } as any,
-      createMockRes(),
+      adminRes,
       () => {
         adminProceeded = true;
       }
     );
-    expect(adminProceeded).toBe(true);
+    expect(adminProceeded).toBe(false);
+    expect(adminRes.statusCode).toBe(503);
+    expect(adminRes.body).toEqual({ error: "Service unavailable: unable to verify administrative access" });
+
+    // 1b. ...but once admin is confirmed against the store, a failing best-effort admin profile mirror doesn't block it
+    await store.upsertUser({ uid: "u-store-admin", email: "store-admin@example.com", roles: [], isSystemAdmin: true });
+    vi.spyOn(store, "upsertSystemAdmin").mockRejectedValueOnce(new Error("Transient write outage"));
+    let storeAdminProceeded = false;
+    await server.requireAdmin(
+      { user: { uid: "u-store-admin", email: "store-admin@example.com", isAdmin: false } } as any,
+      createMockRes(),
+      () => {
+        storeAdminProceeded = true;
+      }
+    );
+    expect(storeAdminProceeded).toBe(true);
 
     // 4. requireCapability returns 500 with sanitized error when store.getScopeMember rejects
     const requireEdit = server.requireCapability("edit_content");

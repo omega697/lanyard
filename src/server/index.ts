@@ -313,7 +313,9 @@ export function createLanyardServer<
           await syncPromise;
         }
       } catch {
-        // If backing store is unreachable during checkAuth, preserve verified token claim
+        // If the backing store is unreachable, the caller is still authenticated by their verified token, but admin
+        // can't be confirmed (a demotion may not be reflected in a still-valid token claim), so fail closed on admin
+        user.isAdmin = false;
       }
       req.user = user;
       next();
@@ -331,20 +333,24 @@ export function createLanyardServer<
       return res.status(403).json({ error: "Forbidden: Administrative access required" });
     }
 
+    let resolved: Awaited<ReturnType<typeof resolveEffectiveAdminStatus>>;
     try {
-      const { isAdmin, userRecord } = await resolveEffectiveAdminStatus(req.user);
-      if (!isAdmin) {
-        req.user.isAdmin = false;
-        return res.status(403).json({ error: "Forbidden: Administrative access required" });
-      }
-      req.user.isAdmin = true;
-      req.userRecord = userRecord;
+      resolved = await resolveEffectiveAdminStatus(req.user);
+    } catch {
+      // If the store can't be read, demotion can't be ruled out, so never fall back to the token's admin claim
+      req.user.isAdmin = false;
+      return res.status(503).json({ error: "Service unavailable: unable to verify administrative access" });
+    }
+    if (!resolved.isAdmin) {
+      req.user.isAdmin = false;
+      return res.status(403).json({ error: "Forbidden: Administrative access required" });
+    }
+    req.user.isAdmin = true;
+    req.userRecord = resolved.userRecord;
+    try {
       await syncAdminProfileIfNeeded(req.user);
     } catch {
-      // If store check fails when verifying explicit demotion, continue only if token claim was verified
-      if (!req.user.isAdmin) {
-        return res.status(403).json({ error: "Forbidden: Administrative access required" });
-      }
+      // Mirroring the admin profile is best-effort; admin status was already confirmed against the store above
     }
 
     next();
