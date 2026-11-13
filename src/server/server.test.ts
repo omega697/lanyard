@@ -2949,11 +2949,20 @@ describe("lanyard/server unit tests", () => {
       })
     ).rejects.toThrow(/Non-system administrators cannot modify a system administrator/);
 
-    // - Trusted `roleManager` (who holds `assign:roles`) CAN assign multiple concrete roles (e.g. `["scanner", "merch_seller"]`)
-    //   to `attendee`, even though `roleManager` does not personally hold `scanner` or `merch_seller`!
+    // - `roleManager` holds `assign:roles` but not `scanner` or `merch_seller`, so it CANNOT hand them out (role ceiling)
+    await expect(
+      server.updateUserRoles({
+        scopeId: GLOBAL_SCOPE,
+        actor: roleManager,
+        targetUid: attendee.uid,
+        roles: ["scanner", "merch_seller"]
+      })
+    ).rejects.toThrow(/Forbidden: Role 'scanner' is outside your rank/);
+
+    // - `director` (who holds `assign:roles` and inherits both roles) CAN assign multiple concrete roles to `attendee`
     const updatedRoles = await server.updateUserRoles({
       scopeId: GLOBAL_SCOPE,
-      actor: roleManager,
+      actor: director,
       targetUid: attendee.uid,
       roles: ["scanner", "merch_seller"]
     });
@@ -3100,13 +3109,29 @@ describe("lanyard/server unit tests", () => {
     });
     expect(scopedEdited.displayName).toBe("ScopedRenamed Attendee");
 
+    // The role ceiling applies per scope: roleManager can't hand out `scanner` here either, but can share its own role
+    await expect(
+      server.updateUserRoles({
+        scopeId: "ws-scoped",
+        actor: roleManager,
+        targetUid: attendee.uid,
+        roles: ["scanner"]
+      })
+    ).rejects.toThrow(/Forbidden: Role 'scanner' is outside your rank/);
     const scopedRolesUpdated = await server.updateUserRoles({
       scopeId: "ws-scoped",
       actor: roleManager,
       targetUid: attendee.uid,
-      roles: ["scanner"]
+      roles: ["role_manager"]
     });
-    expect(scopedRolesUpdated.roles).toEqual(["scanner"]);
+    expect(scopedRolesUpdated.roles).toEqual(["role_manager"]);
+    // ...and take it back, so the moderator below (who doesn't outrank role_manager) can manage this member
+    await server.updateUserRoles({
+      scopeId: "ws-scoped",
+      actor: roleManager,
+      targetUid: attendee.uid,
+      roles: ["attendee"]
+    });
 
     // Scoped `deleteUser` removes the member from `"ws-scoped"` with `confirmTargetEmail` verification,
     // WITHOUT deleting the global `users/{attendee.uid}` record or Firebase Auth user!
@@ -3129,11 +3154,20 @@ describe("lanyard/server unit tests", () => {
     expect(await store.getUser(attendee.uid)).not.toBeNull();
     expect(adminAuth.deletedUids.has(attendee.uid)).toBe(false);
 
-    // Safeguard F: Authorized Moderator deleting `attendee` in `GLOBAL_SCOPE` with matching `confirmTargetEmail`
-    // succeeds and cleans up store + hiddenAttributes + secrets + Auth
+    // Safeguard F: An authorized deleter who outranks `attendee` (now scanner + merch_seller globally, so `director`,
+    // not `moderator`) deleting them in `GLOBAL_SCOPE` with matching `confirmTargetEmail` succeeds and cleans up store
+    // + hiddenAttributes + secrets + Auth
+    await expect(
+      server.deleteUser({
+        scopeId: GLOBAL_SCOPE,
+        actor: moderator,
+        targetUid: attendee.uid,
+        confirmTargetEmail: "attendee@example.com"
+      })
+    ).rejects.toThrow(/Forbidden: Target holds 'merch_seller'/);
     await server.deleteUser({
       scopeId: GLOBAL_SCOPE,
-      actor: moderator,
+      actor: director,
       targetUid: attendee.uid,
       confirmTargetEmail: "  ATTENDEE@example.com "
     });

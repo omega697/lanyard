@@ -16,6 +16,7 @@ import {
   type LanyardActor,
   type LanyardServerStore,
   type PermissionPolicy,
+  type PolicySubject,
   type ScopeId,
   type ScopedMember,
   type SystemAdminProfile,
@@ -1368,7 +1369,10 @@ export function createLanyardServer<
       if (!existing) {
         throw new Error(`Target user '${params.targetUid}' not found`);
       }
-      if (!isSelf) await assertMayManageTarget(isAdmin, params.targetUid, "modify");
+      if (!isSelf) {
+        await assertMayManageTarget(isAdmin, params.targetUid, "modify");
+        assertTargetWithinRank(isAdmin, actorGlobalRecord, existing.roles);
+      }
 
       const fields = profileFieldsToWrite(params.patch || {}, existing);
       // Only the edited fields are written, so roles or admin status changed since `existing` was read stay changed
@@ -1395,16 +1399,82 @@ export function createLanyardServer<
     if (!existing) {
       throw new Error(`Target member '${params.targetUid}' not found in scope '${params.scopeId}'`);
     }
-    if (!isSelf) await assertMayManageTarget(isAdmin, params.targetUid, "modify");
+    if (!isSelf) {
+      await assertMayManageTarget(isAdmin, params.targetUid, "modify");
+      assertTargetWithinRank(isAdmin, actorMember, existing.roles);
+    }
 
     await store.patchScopeMember(params.scopeId, params.targetUid, profileFieldsToWrite(params.patch || {}, existing));
     return (await store.getScopeMember(params.scopeId, params.targetUid))!;
   }
 
   /**
-   * Replaces a user's `roles` in `GLOBAL_SCOPE` (`users/{targetUid}`) or a specific tenant `scopeId`
-   * after verifying the caller (`actor`) holds the `assignRoles` capability in `userCapabilities`
-   * within that scope (or is an active system admin), and that every role in `roles` is concrete (`!abstract`).
+   * Refuses a non-admin actor acting on a target who holds a role outside the actor's rank (a role they neither hold nor
+   * inherit), so staff can't remove, edit, or re-role someone who outranks them. System-managed roles don't count.
+   */
+  function assertTargetWithinRank(
+    isAdmin: boolean,
+    actorRecord: PolicySubject<TRole, TCapability> | null | undefined,
+    targetRoles: readonly TRole[] | undefined
+  ): void {
+    if (isAdmin) return;
+    for (const role of Array.isArray(targetRoles) ? targetRoles : []) {
+      if (!policy.isSystemManagedRole(role) && !policy.hasRole(actorRecord, role)) {
+        throw new Error(`Forbidden: Target holds '${role}', which is outside your rank`);
+      }
+    }
+  }
+
+  /**
+   * Plans a role change for `updateUserRoles`, returning the roles to grant and revoke. System-managed roles the target
+   * holds are kept and none can be added (by anyone). A non-admin actor can't change their own roles, can't change a
+   * target holding a role outside their rank, and can only add or remove roles within it (see `policy.canAssignRole`).
+   */
+  function planRoleChange(params: {
+    isAdmin: boolean;
+    actorRecord: PolicySubject<TRole, TCapability> | null | undefined;
+    actorUid: string;
+    targetUid: string;
+    currentRoles: readonly TRole[] | undefined;
+    requestedRoles: readonly TRole[];
+  }): { grant: TRole[]; revoke: TRole[] } {
+    const current = Array.isArray(params.currentRoles) ? params.currentRoles : [];
+    const requested = Array.from(new Set(params.requestedRoles));
+    for (const role of requested) {
+      if (policy.isSystemManagedRole(role) && !current.includes(role)) {
+        throw new Error(`Invalid role change: '${role}' is system-managed, so only trusted server code assigns it`);
+      }
+    }
+    const next = Array.from(
+      new Set([
+        ...current.filter((role) => policy.isSystemManagedRole(role)),
+        ...requested.filter((role) => !policy.isSystemManagedRole(role))
+      ])
+    );
+    const grant = next.filter((role) => !current.includes(role));
+    const revoke = current.filter((role) => !next.includes(role));
+
+    if (!params.isAdmin) {
+      if (params.actorUid === params.targetUid) {
+        throw new Error("Forbidden: Users can't change their own roles");
+      }
+      assertTargetWithinRank(false, params.actorRecord, current);
+      for (const role of [...grant, ...revoke]) {
+        if (!policy.canAssignRole(params.actorRecord, role)) {
+          throw new Error(`Forbidden: Role '${role}' is outside your rank`);
+        }
+      }
+    }
+    return { grant, revoke };
+  }
+
+  /**
+   * Sets a user's human-assigned `roles` in `GLOBAL_SCOPE` (`users/{targetUid}`) or a specific tenant `scopeId`.
+   * The caller (`actor`) must hold the `assignRoles` capability in `userCapabilities` within that scope (or be an
+   * active system admin), and every role in `roles` must be concrete (`!abstract`). Non-admins are also held to their
+   * rank: they can't change their own roles, can't change a target holding a role outside their rank, and can only add
+   * or remove roles within it (`policy.canAssignRole`). System-managed roles the target holds are kept, and none can
+   * be added. Only the `roles` field is written.
    */
   async function updateUserRoles(params: {
     scopeId: GlobalScope;
@@ -1444,8 +1514,12 @@ export function createLanyardServer<
     const actorUid = params.actor.uid;
 
     if (params.scopeId === GLOBAL_SCOPE) {
-      if (typeof store.getUser !== "function" || typeof store.upsertUser !== "function") {
-        throw new Error("Backing store does not implement getUser / upsertUser");
+      if (
+        typeof store.getUser !== "function" ||
+        typeof store.grantUserRoles !== "function" ||
+        typeof store.revokeUserRoles !== "function"
+      ) {
+        throw new Error("Backing store does not implement getUser / grantUserRoles / revokeUserRoles");
       }
       if (!policy.canAssignRoles(actorGlobalRecord, isAdmin)) {
         throw new Error("Forbidden: Insufficient permissions to assign user roles");
@@ -1456,13 +1530,17 @@ export function createLanyardServer<
       }
       await assertMayManageTarget(isAdmin, params.targetUid, "modify");
 
-      const updated: UserRecord<TRole, TCapability, TPreferences, TAttributes> = {
-        ...existing,
-        uid: params.targetUid,
-        roles: Array.from(new Set(params.roles)),
-        updatedAt: new Date().toISOString()
-      };
-      await store.upsertUser(updated);
+      const { grant, revoke } = planRoleChange({
+        isAdmin,
+        actorRecord: actorGlobalRecord,
+        actorUid,
+        targetUid: params.targetUid,
+        currentRoles: existing.roles,
+        requestedRoles: params.roles
+      });
+      // Write only the roles that change, so fields the snapshot read (such as isSystemAdmin) are never written back
+      if (grant.length > 0) await store.grantUserRoles(params.targetUid, grant);
+      if (revoke.length > 0) await store.revokeUserRoles(params.targetUid, revoke);
       return (await store.getUser(params.targetUid))!;
     }
 
@@ -1479,12 +1557,16 @@ export function createLanyardServer<
     }
     await assertMayManageTarget(isAdmin, params.targetUid, "modify");
 
-    const updated: ScopedMember<TRole, TCapability, TPreferences, TAttributes> = {
-      ...existing,
-      uid: params.targetUid,
-      roles: Array.from(new Set(params.roles))
-    };
-    await store.upsertScopeMember(params.scopeId, updated);
+    const { grant, revoke } = planRoleChange({
+      isAdmin,
+      actorRecord: actorMember,
+      actorUid,
+      targetUid: params.targetUid,
+      currentRoles: existing.roles,
+      requestedRoles: params.roles
+    });
+    if (grant.length > 0) await store.grantScopeRoles(params.scopeId, params.targetUid, grant);
+    if (revoke.length > 0) await store.revokeScopeRoles(params.scopeId, params.targetUid, revoke);
     return (await store.getScopeMember(params.scopeId, params.targetUid))!;
   }
 
@@ -1523,9 +1605,11 @@ export function createLanyardServer<
 
       const isSelf = actorUid === params.targetUid;
       let isAdmin = false;
+      let actorRecord: PolicySubject<TRole, TCapability> | null | undefined = null;
       if (!isSelf) {
         const resolved = await resolveEffectiveAdminStatus(params.actor);
         isAdmin = resolved.isAdmin;
+        actorRecord = resolved.userRecord;
         if (!policy.canWriteUser(resolved.userRecord, isAdmin)) {
           throw new Error("Forbidden: Insufficient permissions to delete user");
         }
@@ -1537,7 +1621,10 @@ export function createLanyardServer<
           throw new Error(`Target user '${params.targetUid}' not found`);
         }
       } else {
-        if (!isSelf) await assertMayManageTarget(isAdmin, params.targetUid, "delete");
+        if (!isSelf) {
+          await assertMayManageTarget(isAdmin, params.targetUid, "delete");
+          assertTargetWithinRank(isAdmin, actorRecord, targetUser.roles);
+        }
         const targetEmail = (targetUser.email || "").toLowerCase().trim();
         if (!targetEmail || targetEmail !== cleanConfirmEmail) {
           throw new Error(
@@ -1569,7 +1656,10 @@ export function createLanyardServer<
         throw new Error(`Target member '${params.targetUid}' not found in scope '${params.scopeId}'`);
       }
     } else {
-      if (!isSelf) await assertMayManageTarget(isAdmin, params.targetUid, "remove");
+      if (!isSelf) {
+        await assertMayManageTarget(isAdmin, params.targetUid, "remove");
+        assertTargetWithinRank(isAdmin, actorMember, targetMember.roles);
+      }
       const targetEmail = (targetMember.email || "").toLowerCase().trim();
       if (!targetEmail || targetEmail !== cleanConfirmEmail) {
         throw new Error(

@@ -30,9 +30,11 @@ Like a conference or workplace lanyard, `lanyard` answers two questions everywhe
   - **Explicit Role Inheritance (`inherits`) & Abstract Role Groupings (`abstract?: boolean`)**:
     - Each role in `TRole` defines its optional `inherits: readonly TRole[]` (supporting DAGs and sibling roles with cycle detection), implied `capabilities` (`"*"` or `readonly TCapability[]`), and `trackPresence` (`boolean`) in one place.
     - If a user holds role `A` and `A` transitively `inherits` from `B`, then `policy.hasRole(user, "B")` is `true` (`hasAnyRole` and `hasAllRoles` follow the same transitive inheritance).
-    - Mark logical capability-bundle roles with `abstract: true` so they are excluded from `policy.assignableRoles` (and `client.getAssignableRoles()`), cannot be included in `defaultRoles`, and cannot be directly assigned to users—while concrete roles that inherit from them inherit all of their capabilities and satisfy `hasRole(user, abstractRole)`.
+    - Mark logical capability-bundle roles with `abstract: true` so they are excluded from `policy.assignableRoles` (and `client.getAssignableRoles(scopeId)`), cannot be included in `defaultRoles`, and cannot be directly assigned to users—while concrete roles that inherit from them inherit all of their capabilities and satisfy `hasRole(user, abstractRole)`.
   - **Role-Based User Management, Role Assignment & Safe Deletion (`userCapabilities`)**:
     - Configure `userCapabilities: { read?: TCapability; write?: TCapability; assignRoles?: TCapability }` so non-admin roles with the appropriate capability can view other users' profiles (`getUser`, `listUsers`), update/delete non-admin users (`updateUserProfile`, `deleteUser`), or assign concrete roles to non-admin users (`updateUserRoles`).
+    - **Role assignment has a ceiling.** A non-admin with `assignRoles` may add or remove only roles within their rank (the roles they hold plus everything those roles `inherits`), may only change users whose current roles are all within it (the same goes for editing or deleting users with `write`), and never changes their own roles. Peers of equal rank may manage each other. Rank comes from `inherits` alone, not from matching capabilities, so a role that should hand out another must inherit it; when `assignRoles` is configured, `createPermissionPolicy` throws if a `capabilities: "*"` role doesn't reach every other role.
+    - Mark roles that trusted server code owns (e.g. a `volunteer` role synced from a roster) with `systemManaged: true`: `updateUserRoles` never adds them (not even for admins), keeps them when someone's other roles change, and `getAssignableRoles` never lists them, while `grantRolesByEmail` / `revokeRoles` / `upsertUserByEmail` still manage them.
     - Protects `deleteUser({ scopeId, actor, targetUid, confirmTargetEmail })` with case-insensitive `confirmTargetEmail` verification against `targetUid`'s stored email so swapped-UID mistakes are caught before any deletion occurs.
   - **Storage Tiers for Custom User & Member Properties (`preferences`, `attributes`, `hiddenAttributes`, `secrets`)**:
     - Each tier has one **read audience**, because Firestore security rules grant or deny whole documents (they can't hide individual fields). Reads are therefore configured **per tier**, while writes can still be gated **per key**.
@@ -244,7 +246,7 @@ All role, capability, preference, profile, attribute, directory, and field-level
 // Role & capability checks:
 const globalRoles = lanyard.getRoles(GLOBAL_SCOPE);
 const workspaceRoles = lanyard.getRoles(activeWorkspaceId);
-const assignableRoleOptions = lanyard.getAssignableRoles(); // Concrete (!abstract) roles for UI dropdowns
+const assignableRoleOptions = lanyard.getAssignableRoles(activeWorkspaceId); // Roles this user may assign here (matches the server's ceiling)
 
 const isManager = lanyard.hasRole("manager", activeWorkspaceId); // True if user holds 'manager' or 'owner' (which inherits 'manager')
 const isStaff = lanyard.hasRole("base_staff", activeWorkspaceId); // True for any role inheriting from abstract 'base_staff'
@@ -529,7 +531,7 @@ await lanyardServer.updateUserRoles({
   scopeId: GLOBAL_SCOPE,
   actor: req.user!,
   targetUid: attendeeUid,
-  roles: ["manager", "billing_manager"] // Concrete roles only; abstract roles are rejected
+  roles: ["manager", "billing_manager"] // Concrete roles within the actor's rank; system-managed roles they hold are kept
 });
 // Deleting a user (self or another user) verifies confirmTargetEmail matches targetUid's email:
 await lanyardServer.deleteUser({

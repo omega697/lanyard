@@ -29,6 +29,32 @@
 
 ### Breaking changes
 
+- **Role assignment has a ceiling.** Before, anyone holding `userCapabilities.assignRoles` could give any role to
+  anyone who wasn't a system admin, including roles above their own and their own roles, so the capability was
+  effectively the top role in its scope. `updateUserRoles` also wrote back the whole record it had read, so a
+  concurrent change (such as a demotion clearing `isSystemAdmin`) could be undone. Now, for non-admin actors:
+  - every role added or removed must be within the actor's rank: a role they hold, or one those roles inherit;
+  - the target's current roles must all be within it, so nobody changes someone who outranks them; this also applies
+    to `updateUserProfile` and `deleteUser`, since removing someone from a scope revokes every role they hold there;
+  - nobody changes their own roles;
+  - peers of equal rank may grant and remove each other's role.
+
+  Rank comes only from `inherits`, never from matching capabilities, and `capabilities: "*"` doesn't imply it. When
+  `assignRoles` or `write` is configured, `createPermissionPolicy` throws if a `"*"` role can't reach every other
+  concrete role that isn't ranked above it (so two unrelated concrete `"*"` roles must be ordered by having one inherit
+  the other; a role that inherits a `"*"` role, like a superowner above owner, is fine).
+  New role flag `systemManaged: true` marks roles trusted server code owns (such as a roster-synced `volunteer`):
+  `updateUserRoles` never adds them, for anyone, keeps them when other roles change, and ignores them when comparing
+  rank; the trusted helpers still grant and revoke them. `updateUserRoles` now writes only the roles that change. New
+  `policy.canAssignRole`, `policy.getAssignableRoles(actor, isAdmin)` and `policy.isSystemManagedRole`; the client's
+  `getAssignableRoles(scopeId)` now takes a scope and returns only the roles the user may assign there (it used to
+  return every concrete role).
+
+  **Migrating:** make any role that should hand out, edit or delete holders of another role inherit it (directly or
+  through another role); this includes "side" staff roles that hold `userCapabilities.write` but sit outside the
+  hierarchy, which can no longer edit or delete people holding roles they don't. Pass a scope to
+  `client.getAssignableRoles`, and mark roles that only server code assigns as `systemManaged`.
+
 - **Secrets are closed-world: only keys declared in `secretCapabilities` exist.** Before:
   - `canWriteSecret` let a user write their own copy of any secret key the policy didn't mention, so a user could store
     arbitrary encrypted values under names that server code might later decrypt and trust;

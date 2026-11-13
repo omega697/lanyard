@@ -1897,7 +1897,10 @@ describe("lanyard/client unit tests", () => {
     });
 
     // 1. Unscoped (GLOBAL_SCOPE) role, capability, preference, and attribute checks:
-    expect(client.getAssignableRoles()).toEqual(["owner", "manager", "editor", "member"]);
+    // Assignable roles follow the server's ceiling: the assign-roles capability, then the user's rank in that scope
+    expect(client.getAssignableRoles(GLOBAL_SCOPE)).toEqual([]); // editor can't assign roles
+    expect(client.getAssignableRoles("ws-alpha")).toEqual(["manager", "editor", "member"]);
+    expect(client.getAssignableRoles("ws-beta")).toEqual(["owner", "manager", "editor", "member"]);
     expect(client.getRoles(GLOBAL_SCOPE)).toEqual(["editor"]);
     expect(client.hasRole("editor", GLOBAL_SCOPE)).toBe(true);
     expect(client.hasRole("member", GLOBAL_SCOPE)).toBe(true); // inherited via editor -> member!

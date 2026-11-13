@@ -1058,8 +1058,11 @@ export function createLanyardClient<
     return Array.isArray(subject?.roles) ? [...subject.roles] : [];
   }
 
-  function getAssignableRoles(): readonly TRole[] {
-    return policy ? policy.assignableRoles : [];
+  /** The roles the signed-in user may assign in `scopeId` (mirrors the server's ceiling), e.g. for a role picker. */
+  function getAssignableRoles(scopeId: ScopeId): readonly TRole[] {
+    const currentUser = authStoreInternal.get().user;
+    if (!currentUser || !policy) return [];
+    return policy.getAssignableRoles(resolveTargetSubject(scopeId), Boolean(currentUser.isAdmin));
   }
 
   function hasRole(requiredRole: TRole, scopeId: ScopeId): boolean {

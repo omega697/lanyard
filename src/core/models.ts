@@ -87,6 +87,14 @@ export interface RoleDefinition<TRole extends string = string, TCapability exten
    * - Concrete roles that inherit from it still inherit all of its capabilities and satisfy `hasRole(user, abstractRole)`.
    */
   abstract?: boolean;
+  /**
+   * If `true`, trusted server code owns this role (e.g. a `volunteer` role kept in sync with a roster):
+   * - `updateUserRoles` never adds it, for anyone (system admins included), and keeps it on users who hold it;
+   * - it's never listed by `getAssignableRoles` and doesn't count when checking whether an actor outranks a target;
+   * - trusted helpers (`grantRolesByEmail`, `revokeRoles`, `upsertUserByEmail`, store methods) still grant and revoke it.
+   * A role can't be both `abstract` and `systemManaged`.
+   */
+  systemManaged?: boolean;
 }
 
 /**
@@ -349,6 +357,26 @@ export interface PermissionPolicy<TRole extends string = string, TCapability ext
    * Returns `true` if `role` is defined in `policy.roles` and is concrete (`!roleDef.abstract`).
    */
   isAssignableRole(role: TRole): boolean;
+
+  /** Returns `true` if `role` is marked `systemManaged` (owned by trusted server code; see `RoleDefinition`). */
+  isSystemManagedRole(role: TRole): boolean;
+
+  /**
+   * Whether `actor` may add or remove `role` on someone else through `updateUserRoles`: they must hold the
+   * `userCapabilities.assignRoles` capability and `role` must be within their rank (a role they hold, or one those
+   * roles inherit). System admins may assign any role. Abstract and system-managed roles are never assignable.
+   */
+  canAssignRole(
+    actor: PolicySubject<TRole, TCapability> | null | undefined,
+    role: TRole,
+    isSystemAdmin?: boolean
+  ): boolean;
+
+  /** The roles `actor` may assign (see `canAssignRole`), in declaration order, e.g. for a role picker. */
+  getAssignableRoles(
+    actor: PolicySubject<TRole, TCapability> | null | undefined,
+    isSystemAdmin?: boolean
+  ): readonly TRole[];
 
   /**
    * Evaluates whether a member/user (or global system admin) holds `requiredRole`

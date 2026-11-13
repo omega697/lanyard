@@ -100,6 +100,9 @@ export function createPermissionPolicy<TRole extends string = string, TCapabilit
           `so the closed capability set is known at runtime and in generated security rules.`
       );
     }
+    if (def.abstract && def.systemManaged) {
+      throw new Error(`Role '${role}' can't be both abstract and systemManaged: abstract roles are never held.`);
+    }
     rawRoles[role] = def;
   }
 
@@ -224,7 +227,8 @@ export function createPermissionPolicy<TRole extends string = string, TCapabilit
       ...(def.inherits !== undefined ? { inherits: Object.freeze([...def.inherits]) } : {}),
       ...(resolvedCapabilities[role] !== undefined ? { capabilities: resolvedCapabilities[role] } : {}),
       trackPresence: resolvedTrackPresence[role],
-      ...(def.abstract !== undefined ? { abstract: Boolean(def.abstract) } : {})
+      ...(def.abstract !== undefined ? { abstract: Boolean(def.abstract) } : {}),
+      ...(def.systemManaged !== undefined ? { systemManaged: Boolean(def.systemManaged) } : {})
     });
   }
 
@@ -263,6 +267,32 @@ export function createPermissionPolicy<TRole extends string = string, TCapabilit
           ? { assignRoles: config.userCapabilities.assignRoles }
           : {})
       });
+    }
+  }
+
+  // When non-admins can assign roles or manage users, rank (which comes only from `inherits`) limits whom they can act
+  // on. A role with every capability is clearly meant to be top rank, so refuse one that couldn't assign or manage some
+  // role rather than letting those actions fail at runtime.
+  if (userRule.assignRoles || userRule.write) {
+    for (const role of wildcardRoles) {
+      if (rawRoles[role].abstract) continue;
+      for (const [other, def] of entries) {
+        // Roles ranked above this one (they inherit it, like a superowner over owner) are meant to be out of its reach
+        if (
+          other === role ||
+          def.abstract ||
+          def.systemManaged ||
+          roleInherits[role].includes(other) ||
+          roleInherits[other].includes(role)
+        ) {
+          continue;
+        }
+        throw new Error(
+          `Role '${role}' has every capability but can't assign or manage '${other}': rank follows inherits, ` +
+            `so add '${other}' to ${role}'s inherits (directly or through a role it inherits), or rank '${other}' ` +
+            `above it by having '${other}' inherit '${role}'.`
+        );
+      }
     }
   }
 
@@ -496,6 +526,27 @@ export function createPermissionPolicy<TRole extends string = string, TCapabilit
     return hasCapability(actor, userRule.assignRoles, false);
   }
 
+  function isSystemManagedRole(role: TRole): boolean {
+    return typeof role === "string" && Object.hasOwn(roles, role) && Boolean(roles[role].systemManaged);
+  }
+
+  function canAssignRole(
+    actor: PolicySubject<TRole, TCapability> | null | undefined,
+    role: TRole,
+    isSystemAdmin = false
+  ): boolean {
+    if (!isAssignableRole(role) || isSystemManagedRole(role)) return false;
+    if (isSystemAdmin) return true;
+    return canAssignRoles(actor, false) && hasRole(actor, role, false);
+  }
+
+  function getAssignableRoles(
+    actor: PolicySubject<TRole, TCapability> | null | undefined,
+    isSystemAdmin = false
+  ): readonly TRole[] {
+    return assignableRoles.filter((role) => canAssignRole(actor, role, isSystemAdmin));
+  }
+
   function isStaff(actor: PolicySubject<TRole, TCapability> | null | undefined, isSystemAdmin = false): boolean {
     if (isSystemAdmin) return true;
     if (!staffCapability) return false;
@@ -717,6 +768,9 @@ export function createPermissionPolicy<TRole extends string = string, TCapabilit
     cardFields,
     customDocs,
     isAssignableRole,
+    isSystemManagedRole,
+    canAssignRole,
+    getAssignableRoles,
     hasRole,
     hasAnyRole,
     hasAllRoles,

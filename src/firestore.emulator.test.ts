@@ -2967,5 +2967,73 @@ ${generateFirestoreRules(policy, { usersCollection })}
         server.close();
       }
     }, 30_000);
+
+    it("FIXED: on real Firestore, a coordinator who can assign roles can't promote anyone above their rank or touch the volunteer roster", async () => {
+      const suffix = Date.now();
+      const scopeCollection = `campaigns_ceiling_${suffix}`;
+      const usersCollection = `users_ceiling_${suffix}`;
+      type Role = "volunteer" | "scanner" | "coordinator" | "owner";
+      type Cap = "scan" | "assign_roles";
+      // canvus's roles, once it turns on assign-roles
+      const policy = createPermissionPolicy<Role, Cap>({
+        capabilities: ["scan", "assign_roles"],
+        roles: {
+          volunteer: { systemManaged: true },
+          scanner: { capabilities: ["scan"] },
+          coordinator: { inherits: ["scanner"], capabilities: ["assign_roles"] },
+          owner: { inherits: ["coordinator"], capabilities: "*" }
+        },
+        userCapabilities: { assignRoles: "assign_roles" }
+      });
+      const store = new FirestoreServerStore<Role, Cap>({ db: adminDb, policy, usersCollection, scopeCollection });
+      const server = createLanyardServer({ adminAuth, store, policy });
+      const rules = `rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+${generateFirestoreRules(policy, { usersCollection, scopeCollection })}
+  }
+}
+`;
+      const rulesRes = await fetch(`http://127.0.0.1:${emulatorPort}/emulator/v1/projects/${projectId}:securityRules`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ rules: { files: [{ name: "firestore.rules", content: rules }] } })
+      });
+      expect(rulesRes.status).toBe(200);
+      const campaign = "campaign-1";
+      const coordUid = `coord-${suffix}`;
+      const add = (uid: string, roles: Role[]) =>
+        store.upsertScopeMember(campaign, { uid, email: `${uid}@example.com`, roles });
+      await add(coordUid, ["coordinator"]);
+      await add(`boss-${suffix}`, ["owner"]);
+      await add(`vol-${suffix}`, ["volunteer"]);
+      const coordinator = await signInEmulatorUser(coordUid, `${coordUid}@example.com`);
+      const update = (targetUid: string, roles: Role[]) =>
+        server.updateUserRoles({ scopeId: campaign, actor: { uid: coordUid }, targetUid, roles });
+      const rolesOf = async (uid: string) => (await store.getScopeMember(campaign, uid))?.roles;
+      try {
+        // Through the server: no promotion above their rank, no edits to someone who outranks them, no self-promotion
+        await expect(update(`vol-${suffix}`, ["owner"])).rejects.toThrow(/Forbidden: Role 'owner'/);
+        await expect(update(`boss-${suffix}`, ["scanner"])).rejects.toThrow(/Forbidden: Target holds 'owner'/);
+        await expect(update(coordUid, ["owner"])).rejects.toThrow(/Forbidden: Users can't change their own roles/);
+        expect(await rolesOf(`boss-${suffix}`)).toEqual(["owner"]);
+
+        // Promoting a volunteer keeps them on the roster, and the roster role can't be handed out by hand
+        await update(`vol-${suffix}`, ["coordinator"]);
+        expect(await rolesOf(`vol-${suffix}`)).toEqual(["volunteer", "coordinator"]);
+        await expect(update(`boss-${suffix}`, ["owner", "volunteer"])).rejects.toThrow(/system-managed/);
+
+        // Around the server: the generated rules don't let a non-admin client write roles at all
+        await expect(
+          clientUpdateDoc(clientDoc(coordinator.db, `${scopeCollection}/${campaign}/members/${coordUid}`), {
+            roles: ["owner"]
+          })
+        ).rejects.toMatchObject({ code: "permission-denied" });
+        expect(await rolesOf(coordUid)).toEqual(["coordinator"]);
+      } finally {
+        await coordinator.close();
+        server.close();
+      }
+    }, 30_000);
   }
 );
