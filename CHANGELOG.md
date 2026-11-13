@@ -4,6 +4,14 @@
 
 ### New
 
+- **`bootstrapFirstAdmin({ email })` on the server** creates the first system admin from a trusted setup script, since
+  `setSystemAdminStatus` needs an admin actor. It promotes an existing, enabled account whose email is verified (never
+  creating one), keeps its other claims, and adds the directory entry. It refuses once any account has the `admin`
+  claim, which it checks by paging through `adminAuth.listUsers` (a new optional adapter method it requires; Firebase
+  Admin's `Auth` has it); stale directory entries don't count. If the directory write fails after the claim is set, the
+  new admin completes it with `setSystemAdminStatus`. Run it once: two bootstraps started at the same moment aren't
+  guarded against each other.
+
 - **`authorizedFetch(input, init)` on the client** sends a request with the signed-in user's ID token and handles
   Lanyard's auth responses, so apps don't compare strings or retry by hand:
   - `401 auth/token-stale`: forces a token refresh, publishes the refreshed claims (such as `isAdmin` after a demotion)

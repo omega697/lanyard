@@ -446,6 +446,20 @@ router.post(
 );
 ```
 
+#### Creating the First Admin
+
+Admin changes (`setSystemAdminStatus`) require an admin actor, so the very first admin comes from a one-off setup
+script. `bootstrapFirstAdmin` promotes an existing, enabled account whose email is verified (it never creates one), and
+refuses once any account has the `admin` claim (it pages through accounts with `adminAuth.listUsers` to check; stale
+directory entries don't count). If the directory write fails after the claim is set, the new admin finishes it by
+calling `setSystemAdminStatus` on themselves:
+
+```ts
+// scripts/bootstrap-admin.ts: run once, after the person has signed in
+await lanyardServer.bootstrapFirstAdmin({ email: "founder@example.com" });
+lanyardServer.close();
+```
+
 #### Pre-Provisioning Users & Granting Multiple Roles by Email (`GLOBAL_SCOPE | string`)
 
 When adding a user by email (e.g., via CSV import or an invite form) before they have ever signed in:

@@ -112,6 +112,7 @@ export interface AdminAuthAdapter {
     uid: string;
     email?: string;
     emailVerified?: boolean;
+    disabled?: boolean;
     displayName?: string;
     customClaims?: Record<string, any>;
   }>;
@@ -135,6 +136,14 @@ export interface AdminAuthAdapter {
    * management are admins. Firebase Admin's `Auth` provides it.
    */
   getUser(uid: string): Promise<{ uid: string; customClaims?: Record<string, any> | null }>;
+  /**
+   * Lists Firebase accounts a page at a time (required by `bootstrapFirstAdmin`, to rule out admins known only by their
+   * claim). Firebase Admin's `Auth` provides it.
+   */
+  listUsers?(
+    maxResults?: number,
+    pageToken?: string
+  ): Promise<{ users: Array<{ uid: string; customClaims?: Record<string, any> | null }>; pageToken?: string }>;
 }
 
 /**
@@ -897,6 +906,79 @@ export function createLanyardServer<
     const revocations = await store.recordSessionRevocation(uid, Date.now());
     // Apply on this instance right away instead of waiting for the store subscription to deliver it
     sessionRevocations.set(revocations);
+  }
+
+  /**
+   * Trusted, run-once setup: makes `email`'s existing account the first system admin (sets the `admin` claim, keeping its
+   * other claims, and adds the directory entry). Refuses if any account already has the `admin` claim, the admin
+   * authority (it pages through every account with `adminAuth.listUsers`; stale directory entries don't count), and
+   * only promotes an existing, enabled account whose email is verified; it never creates one. The claim is set before
+   * the directory entry: if that write fails, the new admin completes it with `setSystemAdminStatus` on themselves.
+   * Run it from a setup script, not a request handler, and only once: two bootstraps started at the same moment aren't
+   * guarded against each other.
+   */
+  async function bootstrapFirstAdmin(params: { email: string }): Promise<SystemAdminProfile> {
+    const cleanEmail = (params?.email || "").toLowerCase().trim();
+    if (!isValidEmail(cleanEmail)) throw new Error("Valid email address is required");
+    if (typeof adminAuth.listUsers !== "function") {
+      throw new Error("bootstrapFirstAdmin requires adminAuth.listUsers to check that no admin exists yet");
+    }
+    // The Firebase claim is the admin authority (a directory entry can be stale), so check every account's claims
+    let pageToken: string | undefined;
+    const seenPageTokens = new Set<string>();
+    do {
+      const page = await adminAuth.listUsers(1000, pageToken);
+      const admin = page.users.find((u) => u.customClaims?.admin === true);
+      if (admin) {
+        throw new Error(
+          `Refusing to bootstrap: an admin already exists ('${admin.uid}'); use setSystemAdminStatus as an admin instead`
+        );
+      }
+      if (page.pageToken !== undefined) {
+        if (seenPageTokens.has(page.pageToken)) {
+          throw new Error("Refusing to bootstrap: adminAuth.listUsers returned a page token it had already returned");
+        }
+        seenPageTokens.add(page.pageToken);
+      }
+      pageToken = page.pageToken;
+    } while (pageToken);
+
+    let account: Awaited<ReturnType<AdminAuthAdapter["getUserByEmail"]>>;
+    try {
+      account = await adminAuth.getUserByEmail(cleanEmail);
+    } catch (error: any) {
+      if (error?.code === "auth/user-not-found") {
+        throw new Error(`Refusing to bootstrap: no account for '${cleanEmail}'; have them sign in first`);
+      }
+      throw error;
+    }
+    assertExistingAccountVerified(account, cleanEmail);
+    if (account.disabled === true) {
+      throw new Error(`Refusing to bootstrap: the account for '${cleanEmail}' is disabled`);
+    }
+    const existingClaims =
+      account.customClaims && typeof account.customClaims === "object" ? { ...account.customClaims } : {};
+    await adminAuth.setCustomUserClaims(account.uid, { ...existingClaims, admin: true });
+
+    const existing =
+      (typeof store.getUser === "function" ? await store.getUser(account.uid) : null) ||
+      (await store.getSystemAdmin(account.uid));
+    const now = new Date().toISOString();
+    const profile: SystemAdminProfile = {
+      uid: account.uid,
+      email: cleanEmail,
+      firstName: existing?.firstName,
+      lastName: existing?.lastName,
+      displayName: existing?.displayName || account.displayName || cleanEmail,
+      photoUrl: existing?.photoUrl,
+      lastSeen: existing?.lastSeen,
+      isSystemAdmin: true,
+      addedBy: "bootstrap",
+      createdAt: existing?.createdAt || now,
+      updatedAt: now
+    };
+    await store.upsertSystemAdmin(profile);
+    return profile;
   }
 
   async function setSystemAdminStatus(params: {
@@ -2157,6 +2239,7 @@ export function createLanyardServer<
     close,
     getOrProvisionUidByEmail,
     setSystemAdminStatus,
+    bootstrapFirstAdmin,
     upsertUserByEmail,
     grantRolesByEmail,
     revokeRoles,

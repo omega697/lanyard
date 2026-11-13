@@ -3052,5 +3052,39 @@ ${generateFirestoreRules(policy, { usersCollection, scopeCollection })}
         server.close();
       }
     }, 30_000);
+
+    it("bootstrapFirstAdmin promotes the first admin once, then refuses, even when the only admin is a bare claim", async () => {
+      // A fresh project, so earlier tests' admins don't count
+      const bootstrapProject = `lanyard-bootstrap-${Date.now()}`;
+      const app = initializeAdminApp({ projectId: bootstrapProject }, bootstrapProject);
+      const auth = getAdminAuth(app);
+      const store = new FirestoreServerStore({ db: getAdminFirestore(app), usersCollection: "users_bootstrap" });
+      const server = createLanyardServer({ adminAuth: auth, store });
+      try {
+        await auth.createUser({ uid: "founder", email: "founder@example.com", emailVerified: true });
+        await auth.setCustomUserClaims("founder", { plan: "pro" });
+        await auth.createUser({ uid: "unverified", email: "unverified@example.com", emailVerified: false });
+        await auth.createUser({ uid: "second", email: "second@example.com", emailVerified: true });
+
+        await expect(server.bootstrapFirstAdmin({ email: "unverified@example.com" })).rejects.toThrow(/not verified/);
+        const profile = await server.bootstrapFirstAdmin({ email: "founder@example.com" });
+        expect(profile).toMatchObject({ uid: "founder", isSystemAdmin: true, addedBy: "bootstrap" });
+        expect((await auth.getUser("founder")).customClaims).toEqual({ plan: "pro", admin: true });
+
+        await expect(server.bootstrapFirstAdmin({ email: "second@example.com" })).rejects.toThrow(
+          /an admin already exists/
+        );
+        // With no directory entry left, the real listUsers scan still finds the claim
+        await store.deleteSystemAdmin("founder");
+        expect(await store.listSystemAdmins()).toEqual([]);
+        await expect(server.bootstrapFirstAdmin({ email: "second@example.com" })).rejects.toThrow(
+          /an admin already exists/
+        );
+        expect((await auth.getUser("second")).customClaims?.admin).toBeUndefined();
+      } finally {
+        server.close();
+        await deleteAdminApp(app);
+      }
+    }, 30_000);
   }
 );
