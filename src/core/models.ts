@@ -742,6 +742,24 @@ export const REVOCATION_EPOCH_DOC_ID = "revocation";
 export const REVOCATION_EPOCH_FIELD = "lastRevocationAtMs";
 
 /**
+ * Receives a store's session revocations: uid to the time (epoch milliseconds) that user's sessions were revoked
+ * (signed out everywhere or disabled). Tokens whose `auth_time` (sign-in time) is at or before that time are rejected,
+ * even if refreshed afterwards.
+ */
+export type SessionRevocationsListener = (revocations: Readonly<Record<string, number>>) => void;
+
+/** Document id of the session revocations map within the Lanyard metadata collection. */
+export const SESSION_REVOCATIONS_DOC_ID = "session_revocations";
+/** Field of the session revocations document holding the uid-to-epoch-milliseconds map. */
+export const SESSION_REVOCATIONS_FIELD = "revokedAtMs";
+/**
+ * How long a session revocation is kept, relative to newer revocations, before it's pruned. ID tokens live for one
+ * hour and Firebase refuses to refresh a revoked session, so an entry is only needed briefly; 24 hours leaves a wide
+ * margin for clock differences.
+ */
+export const SESSION_REVOCATION_RETENTION_MS = 24 * 60 * 60 * 1000;
+
+/**
  * Storage-agnostic client adapter interface.
  *
  * Consuming applications can pass `FirestoreClientStore` (from `lanyard/client/firestore`),
@@ -907,6 +925,22 @@ export interface LanyardServerStore<
    * change; report failures through `onError`. Returns an unsubscribe function.
    */
   subscribeToRevocationEpoch(onChange: RevocationEpochListener, onError: (error: unknown) => void): () => void;
+
+  // --- Session revocations (required; verify with `assertSessionRevocationConformance` from `lanyard/testing`) ---
+  /** Required: Resolves the session revocations (see {@link SessionRevocationsListener}); `{}` if none are recorded. */
+  getSessionRevocations(): Promise<Readonly<Record<string, number>>>;
+  /**
+   * Required: Records that `uid`'s sessions were revoked at `atMs` (non-negative integer epoch milliseconds), keeping
+   * the later time if the user already has an entry, and pruning entries older than
+   * `atMs - SESSION_REVOCATION_RETENTION_MS` in the same atomic write. Rejects an invalid uid or time. Resolves the
+   * map stored afterwards.
+   */
+  recordSessionRevocation(uid: string, atMs: number): Promise<Readonly<Record<string, number>>>;
+  /**
+   * Required: Subscribe to the session revocations. Must emit the current map promptly after subscribing, then every
+   * change; report failures through `onError`. Returns an unsubscribe function.
+   */
+  subscribeToSessionRevocations(onChange: SessionRevocationsListener, onError: (error: unknown) => void): () => void;
 
   // --- Global User (`users/{uid}`) & System Admin Operations ---
   getUser?(uid: string): Promise<UserRecord<TRole, TCapability, TPreferences, TAttributes> | null>;

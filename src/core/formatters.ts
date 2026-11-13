@@ -175,6 +175,47 @@ export function readStoredRevocationEpoch(data: Record<string, any> | undefined,
 }
 
 /**
+ * Reads a stored session revocations map (uid to epoch milliseconds): `{}` when absent. Throws on a malformed map,
+ * uid, or time rather than dropping entries, so callers fail closed.
+ */
+export function readStoredSessionRevocations(
+  data: Record<string, any> | undefined,
+  field: string
+): Record<string, number> {
+  const value = data?.[field];
+  if (value === undefined || value === null) return {};
+  if (typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("Invalid session revocations: must be a map of uid to epoch milliseconds");
+  }
+  const out: Record<string, number> = {};
+  for (const [uid, atMs] of Object.entries(value)) {
+    out[assertValidResourceId(uid, "session revocation uid")] = assertValidRevocationEpoch(atMs);
+  }
+  return out;
+}
+
+/**
+ * Computes the session revocations map after recording `uid` at `atMs`: keeps the later time for an existing entry and
+ * drops entries older than `atMs - retentionMs`. Validates the input. Shared by store implementations.
+ */
+export function nextSessionRevocations(
+  current: Readonly<Record<string, number>>,
+  uid: string,
+  atMs: number,
+  retentionMs: number
+): Record<string, number> {
+  assertValidResourceId(uid, "uid");
+  assertValidRevocationEpoch(atMs);
+  const cutoff = atMs - retentionMs;
+  const next: Record<string, number> = {};
+  for (const [existingUid, existingAt] of Object.entries(current)) {
+    if (existingAt >= cutoff) next[existingUid] = existingAt;
+  }
+  next[uid] = Math.max(current[uid] ?? 0, atMs);
+  return next;
+}
+
+/**
  * Sanitizes a raw avatar URL string, stripping empty strings, `"null"`/`"undefined"` literals,
  * oversized payloads (`> 2048` chars), protocol-relative URLs (`//evil.com`), SVG data URIs
  * (`data:image/svg+xml`), and unsafe protocols or HTML-injection characters.

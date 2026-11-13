@@ -13,6 +13,14 @@
   `lanyard_meta/revocation`, configurable with the new `metaCollection` option, and a malformed stored value fails
   closed). Custom stores must add these methods; verify them with `assertRevocationEpochConformance` from the new
   `lanyard/testing` entry point.
+- **Server stores must implement session revocations.** `LanyardServerStore` now also requires
+  `getSessionRevocations()`, `recordSessionRevocation(uid, atMs)` and `subscribeToSessionRevocations(onChange, onError)`:
+  a map of uid to the time that user's sessions were revoked (signed out everywhere or disabled). Firebase keys session
+  revocation on a token's `auth_time` (sign-in time), which a refreshed token keeps, so the revocation epoch alone
+  can't cut off a revoked session; this map will. Each user's entry only moves forward, and recording a revocation
+  prunes entries older than 24 hours (`SESSION_REVOCATION_RETENTION_MS`) in the same atomic write, so the map holds
+  only recent revocations. Firestore keeps it server-only in `lanyard_meta/session_revocations`; malformed entries fail
+  closed. Verify custom stores with `assertSessionRevocationConformance` from `lanyard/testing`.
 
 - **Admin checks fail closed when the backing store is unreachable.** `checkAuth` used to keep the token's `admin`
   claim as `req.user.isAdmin` if `store.getUser`/`store.getSystemAdmin` threw, and `requireAdmin` let the request

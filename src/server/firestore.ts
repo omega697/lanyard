@@ -3,14 +3,20 @@ import {
   assertValidResourceId,
   assertValidRevocationEpoch,
   DEFAULT_LANYARD_META_COLLECTION,
+  nextSessionRevocations,
   readStoredRevocationEpoch,
+  readStoredSessionRevocations,
   REVOCATION_EPOCH_DOC_ID,
   REVOCATION_EPOCH_FIELD,
+  SESSION_REVOCATION_RETENTION_MS,
+  SESSION_REVOCATIONS_DOC_ID,
+  SESSION_REVOCATIONS_FIELD,
   sanitizeAvatarUrl,
   type CardFieldsPlacement,
   type LanyardServerStore,
   type LanyardStorePlacementSource,
   type RevocationEpochListener,
+  type SessionRevocationsListener,
   TIER_METADATA_KEY,
   type ScopedMember,
   type SecretCipher,
@@ -178,6 +184,43 @@ export class FirestoreServerStore<
         return;
       }
       onChange(epoch);
+    }, onError);
+  }
+
+  // --- Session Revocations ---
+
+  private sessionRevocationsRef() {
+    return this.db.collection(this.metaCollection).doc(SESSION_REVOCATIONS_DOC_ID);
+  }
+
+  async getSessionRevocations(): Promise<Readonly<Record<string, number>>> {
+    const snap = await this.sessionRevocationsRef().get();
+    return readStoredSessionRevocations(snap.data(), SESSION_REVOCATIONS_FIELD);
+  }
+
+  async recordSessionRevocation(uid: string, atMs: number): Promise<Readonly<Record<string, number>>> {
+    // Validate before opening a transaction so invalid input never touches the stored map
+    nextSessionRevocations({}, uid, atMs, SESSION_REVOCATION_RETENTION_MS);
+    const ref = this.sessionRevocationsRef();
+    return this.db.runTransaction(async (tx) => {
+      const current = readStoredSessionRevocations((await tx.get(ref)).data(), SESSION_REVOCATIONS_FIELD);
+      const next = nextSessionRevocations(current, uid, atMs, SESSION_REVOCATION_RETENTION_MS);
+      // Replace the whole map so pruned entries are actually removed
+      tx.set(ref, { [SESSION_REVOCATIONS_FIELD]: next });
+      return next;
+    });
+  }
+
+  subscribeToSessionRevocations(onChange: SessionRevocationsListener, onError: (error: unknown) => void): () => void {
+    return this.sessionRevocationsRef().onSnapshot((snap) => {
+      let revocations: Record<string, number>;
+      try {
+        revocations = readStoredSessionRevocations(snap.data(), SESSION_REVOCATIONS_FIELD);
+      } catch (error) {
+        onError(error);
+        return;
+      }
+      onChange(revocations);
     }, onError);
   }
 

@@ -1,4 +1,10 @@
-import { assertValidResourceId, assertValidRevocationEpoch, sanitizeAvatarUrl } from "./formatters.js";
+import {
+  assertValidResourceId,
+  assertValidRevocationEpoch,
+  nextSessionRevocations,
+  sanitizeAvatarUrl
+} from "./formatters.js";
+import { SESSION_REVOCATION_RETENTION_MS } from "./models.js";
 import type {
   CardFieldsPlacement,
   EncryptedSecretData,
@@ -6,6 +12,7 @@ import type {
   LanyardServerStore,
   LanyardStorePlacementSource,
   RevocationEpochListener,
+  SessionRevocationsListener,
   ScopedMember,
   SecretCipher,
   SubscribeToMembersOptions,
@@ -203,6 +210,32 @@ export class InMemoryLanyardStore<
     onChange(this.revocationEpoch);
     return () => {
       this.revocationEpochListeners.delete(onChange);
+    };
+  }
+
+  private sessionRevocations: Readonly<Record<string, number>> = {};
+  private sessionRevocationsListeners = new Set<SessionRevocationsListener>();
+
+  async getSessionRevocations(): Promise<Readonly<Record<string, number>>> {
+    return { ...this.sessionRevocations };
+  }
+
+  async recordSessionRevocation(uid: string, atMs: number): Promise<Readonly<Record<string, number>>> {
+    this.sessionRevocations = nextSessionRevocations(
+      this.sessionRevocations,
+      uid,
+      atMs,
+      SESSION_REVOCATION_RETENTION_MS
+    );
+    for (const listener of [...this.sessionRevocationsListeners]) listener({ ...this.sessionRevocations });
+    return { ...this.sessionRevocations };
+  }
+
+  subscribeToSessionRevocations(onChange: SessionRevocationsListener, _onError: (error: unknown) => void): () => void {
+    this.sessionRevocationsListeners.add(onChange);
+    onChange({ ...this.sessionRevocations });
+    return () => {
+      this.sessionRevocationsListeners.delete(onChange);
     };
   }
 

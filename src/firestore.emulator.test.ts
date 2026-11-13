@@ -43,7 +43,7 @@ import { createPermissionPolicy, GLOBAL_SCOPE, type LanyardReadable } from "./co
 import { FirestoreServerStore } from "./server/firestore.js";
 import { createLanyardServer, isEncryptedSecretData } from "./server/index.js";
 import { generateFirestoreRules } from "./rules/index.js";
-import { assertRevocationEpochConformance } from "./testing/index.js";
+import { assertRevocationEpochConformance, assertSessionRevocationConformance } from "./testing/index.js";
 
 /**
  * Resolves the Cloud Firestore Emulator jar: `FIRESTORE_EMULATOR_JAR` if set, otherwise the newest
@@ -310,6 +310,19 @@ describe.skipIf(!emulatorsAvailable)(
         );
       });
       expect(String(subscriptionError)).toMatch(/Invalid revocation epoch/);
+    }, 30_000);
+
+    it("FirestoreServerStore conforms to the session revocation contract on real Firestore", async () => {
+      const metaCollection = `lanyard_meta_sessions_${Date.now()}`;
+      await assertSessionRevocationConformance({
+        serverStore: new FirestoreServerStore({ db: adminDb, metaCollection })
+      });
+
+      // A malformed stored map fails closed
+      const corruptCollection = `${metaCollection}_corrupt`;
+      await adminDb.doc(`${corruptCollection}/session_revocations`).set({ revokedAtMs: { "u-bad": "yesterday" } });
+      const corruptStore = new FirestoreServerStore({ db: adminDb, metaCollection: corruptCollection });
+      await expect(corruptStore.getSessionRevocations()).rejects.toThrow(/Invalid revocation epoch/);
     }, 30_000);
 
     it("enforces single-tenant multi-role hierarchy, sibling role isolation, field-level attributes/hiddenAttributes, AES-256-GCM encrypted secrets, and live client reactivity on real Firestore", async () => {
