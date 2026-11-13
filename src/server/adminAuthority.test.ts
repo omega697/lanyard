@@ -15,8 +15,8 @@ function tokenTable(users: Record<string, { uid: string; admin: boolean }>): Aut
         uid: entry.uid,
         email: `${entry.uid}@example.com`,
         emailVerified: true,
-        isAdmin: entry.admin,
-        tokenIssuedAtSeconds: t,
+        adminClaim: entry.admin,
+        issuedAtSeconds: t,
         authTimeSeconds: t - 60
       };
     }
@@ -153,7 +153,7 @@ describe("the Firebase admin claim is the only admin authority", () => {
     });
 
     await expect(
-      server.revokeUserSessions({ uid: "u-victim", actor: { uid: "u-pretender", isAdmin: true } })
+      server.revokeUserSessions({ uid: "u-victim", actor: { uid: "u-pretender", isAdmin: true } as any })
     ).rejects.toThrow(/Forbidden/);
     await server.revokeUserSessions({ uid: "u-victim", actor: { uid: "u-real-admin" } });
 
@@ -169,7 +169,7 @@ describe("the Firebase admin claim is the only admin authority", () => {
     adminAuth.getUser.mockRejectedValue(new Error("Firebase unavailable"));
     const server = createLanyardServer({ adminAuth, store: new InMemoryLanyardStore() });
     await expect(
-      server.revokeUserSessions({ uid: "u-victim", actor: { uid: "u-admin", isAdmin: true } })
+      server.revokeUserSessions({ uid: "u-victim", actor: { uid: "u-admin", isAdmin: true } as any })
     ).rejects.toThrow(/Forbidden/);
     server.close();
   });
@@ -219,7 +219,7 @@ describe("setSystemAdminStatus authorizes its actor (H2)", () => {
 
     for (const email of ["attacker@example.com", "brand-new@example.com"]) {
       await expect(
-        server.setSystemAdminStatus({ email, isAdmin: true, actor: { uid: "u-attacker", isAdmin: true } })
+        server.setSystemAdminStatus({ email, isAdmin: true, actor: { uid: "u-attacker", isAdmin: true } as any })
       ).rejects.toThrow(/Forbidden/);
     }
     expect(adminAuth.setCustomUserClaims).not.toHaveBeenCalled();

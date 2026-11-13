@@ -198,7 +198,8 @@ describe("lanyard/client unit tests", () => {
     expect(syncSpy).toHaveBeenCalledTimes(2);
     expect((await store.getScopeMember("ws-1", "u-1"))?.photoUrl).toBe("https://example.com/u1-oauth.png");
 
-    // Admin-only user signing in syncs avatar to system_admins (not ws-1)
+    // Admin-only user signing in syncs their avatar to their users/{uid} card (not ws-1), without creating an admin
+    // directory entry: only setSystemAdminStatus writes those
     client.setActiveUser({
       uid: "u-admin",
       email: "admin@example.com",
@@ -209,7 +210,8 @@ describe("lanyard/client unit tests", () => {
       providerIds: ["google.com"]
     });
     await new Promise((r) => setTimeout(r, 0));
-    expect((await store.getSystemAdmin("u-admin"))?.photoUrl).toBe("https://example.com/admin.png");
+    expect((await store.getUser("u-admin"))?.photoUrl).toBe("https://example.com/admin.png");
+    expect(await store.getSystemAdmin("u-admin")).toBeNull();
     expect(await store.getScopeMember("ws-1", "u-admin")).toBeNull();
 
     // Update preferences with syncToStore = false and syncToStore = true
@@ -1136,7 +1138,7 @@ describe("lanyard/client unit tests", () => {
     });
     await new Promise((r) => setTimeout(r, 0));
     expect(syncSpy).toHaveBeenCalledTimes(4);
-    expect((await store.getSystemAdmin("u-retry"))?.photoUrl).toBe("https://example.com/retry.png");
+    expect((await store.getUser("u-retry"))?.photoUrl).toBe("https://example.com/retry.png");
     expect((await store.getScopeMember("ws-1", "u-retry"))?.photoUrl).toBe("https://example.com/retry.png");
 
     // 2. Presence heartbeat failure rolls back lastSynced in localStorage so the next sync retries immediately

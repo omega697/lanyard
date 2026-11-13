@@ -424,12 +424,23 @@ describe("lanyard/core unit tests", () => {
 
       expect(updates).toEqual([{}, { theme: "dark" }]);
 
-      // System Admin CRUD + avatar & heartbeat sync
+      // A client avatar sync for an unknown user creates a plain card, never an admin directory entry (only
+      // setSystemAdminStatus writes those)
       await store.syncAvatar({
         uid: "admin-1",
         displayName: "Admin One",
         photoUrl: "https://example.com/admin1.png"
       });
+      expect(await store.getSystemAdmin("admin-1")).toBeNull();
+      expect(await store.getUser("admin-1")).toMatchObject({
+        displayName: "Admin One",
+        photoUrl: "https://example.com/admin1.png"
+      });
+      expect((await store.getUser("admin-1"))?.isSystemAdmin).not.toBe(true);
+
+      // System Admin CRUD + avatar & heartbeat sync
+      await store.upsertSystemAdmin({ uid: "admin-1", email: "admin@example.com", isSystemAdmin: true });
+      await store.syncAvatar({ uid: "admin-1", photoUrl: "https://example.com/admin1.png" });
       expect((await store.getSystemAdmin("admin-1"))?.photoUrl).toBe("https://example.com/admin1.png");
 
       await store.recordPresenceHeartbeat({

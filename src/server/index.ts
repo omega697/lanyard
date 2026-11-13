@@ -39,24 +39,36 @@ export {
 };
 export * from "./encryption.js";
 
+/**
+ * The request's user, produced only by `checkAuth` after it verified the token and its freshness (revocation checks).
+ * `isAdmin` is the effective admin status: the token's admin claim, kept current by those checks.
+ */
 export interface AuthenticatedUser {
   uid: string;
   email: string;
-  /** Only `true` counts as verified; `false` or omitted is treated as unverified. */
-  emailVerified?: boolean;
+  emailVerified: boolean;
   name?: string;
   photoUrl?: string | null;
-  isAdmin?: boolean;
-  /**
-   * When the ID token was issued (`iat`, seconds). Required by `checkAuth`, which treats tokens issued before the
-   * revocation epoch as stale; a token without it is rejected.
-   */
-  tokenIssuedAtSeconds?: number;
-  /**
-   * When the user signed in (`auth_time`, seconds), which a refreshed token keeps. Required by `checkAuth`, which
-   * rejects tokens from sessions revoked after this time; a token without it is rejected.
-   */
-  authTimeSeconds?: number;
+  isAdmin: boolean;
+}
+
+/**
+ * What an `AuthService` reports about a signature-verified ID token. It is not freshness-checked: `adminClaim` may be
+ * stale (a demoted or signed-out admin's token still says `true` until it expires), so never authorize on it directly;
+ * `checkAuth` turns it into `AuthenticatedUser.isAdmin` after the revocation checks.
+ */
+export interface VerifiedToken {
+  uid: string;
+  email: string;
+  emailVerified: boolean;
+  name?: string;
+  photoUrl?: string | null;
+  /** The token's raw `admin` custom claim (signature-checked, not revocation-checked). */
+  adminClaim: boolean;
+  /** When the token was issued (`iat`, seconds); tokens issued before the revocation epoch are rejected. */
+  issuedAtSeconds: number;
+  /** When the user signed in (`auth_time`, seconds), which refreshed tokens keep; checked against session revocations. */
+  authTimeSeconds: number;
 }
 
 export interface AuthenticatedRequest<
@@ -71,7 +83,7 @@ export interface AuthenticatedRequest<
 }
 
 export interface AuthService {
-  verifyToken(authHeader: string | undefined, headers?: Record<string, any>): Promise<AuthenticatedUser | null>;
+  verifyToken(authHeader: string | undefined, headers?: Record<string, any>): Promise<VerifiedToken | null>;
 }
 
 /**
@@ -231,14 +243,26 @@ function profileFieldsToWrite(
   return fields;
 }
 
+export interface GoogleAuthServiceOptions {
+  /** Reject tokens whose email isn't verified (default `true`). */
+  requireVerifiedEmail?: boolean;
+  /** Also ask Firebase whether the token was revoked, at the cost of a lookup per request (default `false`). */
+  checkRevoked?: boolean;
+}
+
 export class GoogleAuthService implements AuthService {
+  private readonly requireVerifiedEmail: boolean;
+  private readonly checkRevoked: boolean;
+
   constructor(
     private readonly adminAuth: Pick<AdminAuthAdapter, "verifyIdToken">,
-    private readonly requireVerifiedEmail = true,
-    private readonly checkRevoked = false
-  ) {}
+    options: GoogleAuthServiceOptions = {}
+  ) {
+    this.requireVerifiedEmail = options.requireVerifiedEmail ?? true;
+    this.checkRevoked = options.checkRevoked ?? false;
+  }
 
-  async verifyToken(authHeader: string | undefined): Promise<AuthenticatedUser | null> {
+  async verifyToken(authHeader: string | undefined): Promise<VerifiedToken | null> {
     if (!authHeader || !authHeader.startsWith("Bearer ")) {
       return null;
     }
@@ -255,15 +279,18 @@ export class GoogleAuthService implements AuthService {
     if (this.requireVerifiedEmail && decodedToken.email_verified !== true) {
       throw new EmailNotVerifiedError();
     }
+    if (!Number.isInteger(decodedToken.iat) || !Number.isInteger(decodedToken.auth_time)) {
+      throw new Error("Token must contain iat and auth_time claims");
+    }
     return {
       uid: decodedToken.uid,
       email: decodedToken.email.toLowerCase().trim(),
       emailVerified: decodedToken.email_verified === true,
       name: decodedToken.name,
       photoUrl: sanitizeAvatarUrl(decodedToken.picture),
-      isAdmin: Boolean(decodedToken.admin),
-      tokenIssuedAtSeconds: typeof decodedToken.iat === "number" ? decodedToken.iat : undefined,
-      authTimeSeconds: typeof decodedToken.auth_time === "number" ? decodedToken.auth_time : undefined
+      adminClaim: decodedToken.admin === true,
+      issuedAtSeconds: decodedToken.iat,
+      authTimeSeconds: decodedToken.auth_time
     };
   }
 }
@@ -370,9 +397,10 @@ export function createLanyardServer<
    * tokens issued (`iat`) before the revocation epoch. Fails closed when token times or revocation data are missing.
    */
   async function checkTokenFreshness(
-    user: AuthenticatedUser
+    token: VerifiedToken
   ): Promise<{ status: number; body: { error: string; code?: string } } | null> {
-    const { tokenIssuedAtSeconds: iat, authTimeSeconds: authTime } = user;
+    // Checked at runtime too: a custom AuthService can return anything
+    const { issuedAtSeconds: iat, authTimeSeconds: authTime } = token;
     if (!Number.isInteger(iat) || !Number.isInteger(authTime)) {
       return { status: 401, body: { error: "Unauthorized: Invalid or expired authentication token" } };
     }
@@ -383,14 +411,14 @@ export function createLanyardServer<
     if (epoch.status !== "ready" || sessions.status !== "ready") {
       return { status: 503, body: { error: "Service unavailable: unable to verify token freshness" } };
     }
-    const revokedAt = sessions.value[user.uid];
-    if (revokedAt !== undefined && authTime! * 1000 <= revokedAt + REVOCATION_CLOCK_SKEW_MS) {
+    const revokedAt = sessions.value[token.uid];
+    if (revokedAt !== undefined && authTime * 1000 <= revokedAt + REVOCATION_CLOCK_SKEW_MS) {
       return {
         status: 401,
         body: { error: "Unauthorized: Session has been revoked; sign in again", code: SESSION_REVOKED_ERROR_CODE }
       };
     }
-    if (epoch.value !== null && iat! * 1000 <= epoch.value + REVOCATION_CLOCK_SKEW_MS) {
+    if (epoch.value !== null && iat * 1000 <= epoch.value + REVOCATION_CLOCK_SKEW_MS) {
       return {
         status: 401,
         body: {
@@ -405,8 +433,9 @@ export function createLanyardServer<
   // Tracks in-flight verified email change syncs per (uid -> targetEmail) so concurrent requests don't double-fire
   const inFlightEmailSyncs = new Map<string, Promise<void>>();
 
-  // Users whose admin claim checkAuth verified (token signature plus revocation checks); their isAdmin is trustworthy
-  const verifiedUsers = new WeakSet<object>();
+  // The admin status checkAuth decided for each request user it produced (verified claim plus revocation checks), keyed
+  // by object identity. It's never read back from the object, so code that later sets `req.user.isAdmin` gains nothing.
+  const verifiedAdminStatus = new WeakMap<object, boolean>();
 
   /** Whether Firebase currently gives `uid` the admin claim. Fails closed if it can't be confirmed. */
   async function firebaseClaimIsAdmin(uid: string): Promise<boolean> {
@@ -420,16 +449,17 @@ export function createLanyardServer<
   }
 
   /**
-   * Whether an actor is a system admin. The Firebase `admin` claim is the only authority: for a `req.user` verified by
-   * `checkAuth` that's its token claim (kept current by the revocation checks); for any other actor object, whose
-   * `isAdmin` can't be trusted, it's the user's current claim from Firebase.
+   * Whether an actor is a system admin. The Firebase `admin` claim is the only authority: for a `req.user` produced by
+   * `checkAuth` it's the status checkAuth decided (the verified claim, kept current by the revocation checks); for any
+   * other actor object it's the user's current claim from Firebase.
    */
   async function isActorAdmin(actor: LanyardActor): Promise<boolean> {
     if (!actor || typeof actor !== "object") {
       throw new Error("Invalid actor: actor object with uid is required");
     }
     assertValidResourceId(actor.uid, "actor.uid");
-    if (verifiedUsers.has(actor)) return actor.isAdmin === true;
+    const verified = verifiedAdminStatus.get(actor);
+    if (verified !== undefined) return verified;
     return firebaseClaimIsAdmin(actor.uid);
   }
 
@@ -456,17 +486,25 @@ export function createLanyardServer<
     next: NextFunction
   ) {
     try {
-      const user = await authService.verifyToken(req.headers.authorization, req.headers);
-      if (!user) {
+      const token = await authService.verifyToken(req.headers.authorization, req.headers);
+      if (!token) {
         return res.status(401).json({ error: "Unauthorized: Missing or invalid authentication credentials" });
       }
-      const rejection = await checkTokenFreshness(user);
+      const rejection = await checkTokenFreshness(token);
       if (rejection) {
         return res.status(rejection.status).json(rejection.body);
       }
+      // Admin status is the verified token's claim, kept current by the revocation checks above; nothing here consults
+      // or writes admin records, so a stale record or claim can't override a demotion
+      const user: AuthenticatedUser = {
+        uid: token.uid,
+        email: token.email,
+        emailVerified: token.emailVerified === true,
+        ...(token.name !== undefined ? { name: token.name } : {}),
+        ...(token.photoUrl !== undefined ? { photoUrl: token.photoUrl } : {}),
+        isAdmin: token.adminClaim === true
+      };
       try {
-        // Admin status is the verified token's claim, kept current by the revocation checks above; nothing here
-        // consults or writes admin records, so a stale record or claim can't override a demotion
         const userRecord = typeof store.getUser === "function" ? await store.getUser(user.uid) : null;
         req.userRecord = userRecord;
         if (
@@ -505,8 +543,7 @@ export function createLanyardServer<
       } catch {
         // If the backing store is unreachable, the caller is still authenticated, and admin status doesn't depend on it
       }
-      user.isAdmin = Boolean(user.isAdmin);
-      verifiedUsers.add(user);
+      verifiedAdminStatus.set(user, user.isAdmin);
       req.user = user;
       next();
     } catch (error: unknown) {
@@ -1951,7 +1988,6 @@ export function createLanyardServer<
   }
 
   return {
-    authService,
     checkAuth,
     requireAdmin,
     requireRole,

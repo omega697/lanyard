@@ -29,6 +29,29 @@
 
 ### Breaking changes
 
+- **Only `checkAuth` produces `isAdmin`; nothing else can create or alter it.** Before:
+  - `GoogleAuthService.verifyToken` returned `isAdmin` straight from the token claim, which isn't freshness-checked;
+  - `createLanyardServer` returned its `authService`, so it was easy to build middleware that trusted a demoted or
+    signed-out admin's still-valid token;
+  - the server trusted a verified `req.user`'s _mutable_ `isAdmin` property, so app code that later set
+    `req.user.isAdmin = true` (a mock-admin header, or a bug) passed `requireAdmin` and could promote anyone through
+    `setSystemAdminStatus`.
+
+  Now:
+  - `AuthService.verifyToken` returns a `VerifiedToken`: `{ uid, email, emailVerified, name?, photoUrl?, adminClaim,
+issuedAtSeconds, authTimeSeconds }`, all required except `name` and `photoUrl`. It has no `isAdmin`, and
+    `tokenIssuedAtSeconds` is renamed to `issuedAtSeconds`;
+  - `checkAuth` builds a new `AuthenticatedUser` (`{ uid, email, emailVerified, name?, photoUrl?, isAdmin }`, without
+    the token times), and server methods judge it by the status `checkAuth` recorded for that object, never by its
+    `isAdmin` property;
+  - `LanyardActor` is just `{ uid }`: hand-built actors were already judged by their current Firebase claim, and now
+    they can't claim otherwise in the type either;
+  - `createLanyardServer` no longer returns `authService`;
+  - `GoogleAuthService` takes `(adminAuth, { requireVerifiedEmail?, checkRevoked? })` instead of positional booleans,
+    and rejects tokens without `iat`/`auth_time`;
+  - a client `syncAvatar` on `InMemoryLanyardStore` no longer creates an `isSystemAdmin: true` record for an unknown
+    user; like the Firestore client store, it creates a plain card.
+
 - **Syncs and profile edits write only the fields they change, so they can't undo a revocation.** `checkAuth`'s
   verified-email sync, the avatar sync in `requireRole` / `requireCapability`, and `updateUserProfile` used to write
   back the whole record they had read. That record included `roles` and `isSystemAdmin`. If an admin revoked a role
@@ -124,8 +147,8 @@ currentEmail }` (someone is already signed in; their session is left alone) or `
     (`TOKEN_STALE_ERROR_CODE`); refreshing the token and retrying is enough.
 
   Both comparisons allow `REVOCATION_CLOCK_SKEW_MS` (2s) for clock differences and one-second token granularity.
-  `AuthenticatedUser` gains `tokenIssuedAtSeconds` and `authTimeSeconds`, which `GoogleAuthService` fills from the
-  token; **a custom `AuthService` must provide both**, or `checkAuth` fails closed with 401. Revocation data comes from
+  An `AuthService` reports `issuedAtSeconds` and `authTimeSeconds` on its `VerifiedToken` (see "Only `checkAuth`
+  produces `isAdmin`" above); if they're missing, `checkAuth` fails closed with 401. Revocation data comes from
   the store's live subscriptions, held in memory, so the check adds no per-request lookup; until it first loads
   (`revocationLoadTimeoutMs`, default 5s) requests wait, and if it can't be loaded or a listener errors, `checkAuth`
   responds `503` and resubscribes with backoff (`revocationResubscribeDelayMs`). `createLanyardServer` throws if the

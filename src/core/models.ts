@@ -597,12 +597,12 @@ export interface LanyardUser {
 /**
  * Minimal user identity passed into `lanyardServer` operations to authorize the caller.
  *
- * Satisfied directly by `req.user` (`LanyardUser`), `UserRecord`, `ScopedMember`,
- * `SystemAdminProfile`, or `{ uid: string, isAdmin?: boolean }`.
+ * Pass `req.user` from `checkAuth` (its admin status is already verified), or any object with the caller's `uid`
+ * (`UserRecord`, `ScopedMember`, `{ uid }`), whose admin status is then looked up from their current Firebase claim.
+ * An actor can't vouch for its own admin status, so there's deliberately no `isAdmin` here.
  */
 export interface LanyardActor {
   uid: string;
-  isAdmin?: boolean;
 }
 
 /**

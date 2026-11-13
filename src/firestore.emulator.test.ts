@@ -632,7 +632,7 @@ describe.skipIf(!emulatorsAvailable)(
       });
       await server.updateUserHiddenAttributes({
         scopeId: GLOBAL_SCOPE,
-        actor: { uid: "root-admin", isAdmin: true },
+        actor: { uid: "root-admin" },
         targetUid: attendee.uid,
         patch: { superAdminSecret: "root-eyes-only" }
       });
@@ -655,7 +655,7 @@ describe.skipIf(!emulatorsAvailable)(
       expect(
         await server.readUserHiddenAttributes({
           scopeId: GLOBAL_SCOPE,
-          actor: { uid: "root-admin", isAdmin: true },
+          actor: { uid: "root-admin" },
           targetUid: attendee.uid
         })
       ).toEqual({
@@ -2361,7 +2361,7 @@ ${generateFirestoreRules(createPermissionPolicy({}), { usersCollection, metaColl
           server.setSystemAdminStatus({
             email: "h2-new-account@example.com",
             isAdmin: true,
-            actor: { uid: "u-h2-attacker", isAdmin: true }
+            actor: { uid: "u-h2-attacker", isAdmin: true } as any
           })
         ).rejects.toThrow(/Forbidden/);
 
@@ -2441,7 +2441,9 @@ ${generateFirestoreRules(createPermissionPolicy({}), { usersCollection, metaColl
       const app = express();
       // Echoes when the token the server accepted was issued
       app.get("/me", server.checkAuth as any, (req: any, res) => {
-        res.json({ uid: req.user.uid, tokenIssuedAtSeconds: req.user.tokenIssuedAtSeconds });
+        const token = String(req.headers.authorization).replace(/^Bearer /, "");
+        const { iat } = JSON.parse(Buffer.from(token.split(".")[1], "base64url").toString("utf8"));
+        res.json({ uid: req.user.uid, tokenIssuedAtSeconds: iat });
       });
       const httpServer = await new Promise<HttpServer>((resolve) => {
         const s = app.listen(0, "127.0.0.1", () => resolve(s));
@@ -2689,8 +2691,8 @@ ${generateFirestoreRules(createPermissionPolicy({}), { usersCollection, metaColl
               email: "lu-new@example.com",
               emailVerified: true,
               photoUrl: "https://example.com/lu.png",
-              isAdmin: false,
-              tokenIssuedAtSeconds: t,
+              adminClaim: false,
+              issuedAtSeconds: t,
               authTimeSeconds: t - 60
             };
           }

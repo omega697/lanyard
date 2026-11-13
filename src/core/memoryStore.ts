@@ -420,12 +420,12 @@ export class InMemoryLanyardStore<
           await this.upsertUser({ ...existingUser, photoUrl: cleanPhotoUrl });
         }
       } else {
+        // Like the Firestore client store's merge write: a plain card, never an admin directory entry
         await this.upsertUser({
           uid,
           email: "",
           ...(displayName ? { displayName } : {}),
-          photoUrl: cleanPhotoUrl,
-          isSystemAdmin: true
+          photoUrl: cleanPhotoUrl
         });
       }
     }

@@ -203,8 +203,8 @@ describe("lanyard/server unit tests", () => {
       emailVerified: true,
       name: "Verified User",
       photoUrl: "https://example.com/p.png",
-      isAdmin: false,
-      tokenIssuedAtSeconds: expect.any(Number),
+      adminClaim: false,
+      issuedAtSeconds: expect.any(Number),
       authTimeSeconds: expect.any(Number)
     });
 
@@ -212,7 +212,7 @@ describe("lanyard/server unit tests", () => {
     await expect(authService.verifyToken("Bearer no-email-token")).rejects.toThrow("Token must contain an email claim");
 
     // requireVerifiedEmail = false allows unverified email tokens
-    const lenientAuth = new GoogleAuthService(adminAuth, false);
+    const lenientAuth = new GoogleAuthService(adminAuth, { requireVerifiedEmail: false });
     const unverifiedUser = await lenientAuth.verifyToken("Bearer unverified-token");
     expect(unverifiedUser?.emailVerified).toBe(false);
   });
@@ -228,7 +228,9 @@ describe("lanyard/server unit tests", () => {
     await expect(rejection).rejects.toBeInstanceOf(EmailNotVerifiedError);
     await expect(rejection).rejects.toHaveProperty("code", EMAIL_NOT_VERIFIED_ERROR_CODE);
 
-    const lenientUser = await new GoogleAuthService(adminAuth, false).verifyToken(`Bearer ${token}`);
+    const lenientUser = await new GoogleAuthService(adminAuth, { requireVerifiedEmail: false }).verifyToken(
+      `Bearer ${token}`
+    );
     expect(lenientUser?.emailVerified).toBe(false);
   });
 
@@ -305,7 +307,7 @@ describe("lanyard/server unit tests", () => {
         adminAuth,
         store,
         policy: TEST_POLICY,
-        authService: new GoogleAuthService(adminAuth, false),
+        authService: new GoogleAuthService(adminAuth, { requireVerifiedEmail: false }),
         onVerifiedEmailChange
       });
       const req: any = { headers: { authorization: `Bearer ${token}` } };
@@ -389,7 +391,7 @@ describe("lanyard/server unit tests", () => {
       isAdmin: true,
       firstName: "Boss",
       lastName: "Admin",
-      actor: { uid: "root-admin", isAdmin: true }
+      actor: { uid: "root-admin" }
     });
     expect(adminProfile?.uid).toBe("provisioned-uid-3");
     expect(adminAuth.claimsByUid.get("provisioned-uid-3")).toEqual({ admin: true });
@@ -407,7 +409,7 @@ describe("lanyard/server unit tests", () => {
     const demoted = await server.setSystemAdminStatus({
       email: "boss@example.com",
       isAdmin: false,
-      actor: { uid: "root-admin", isAdmin: true }
+      actor: { uid: "root-admin" }
     });
     expect(demoted).toBeNull();
     expect(adminAuth.claimsByUid.get("provisioned-uid-3")).toEqual({ admin: false });
@@ -915,7 +917,7 @@ describe("lanyard/server unit tests", () => {
         store,
         policy: TEST_POLICY
       });
-      expect(defaultServer.authService).toBeInstanceOf(GoogleAuthService);
+      expect(defaultServer).not.toHaveProperty("authService");
     } finally {
       if (origFsEmulator !== undefined) process.env.FIRESTORE_EMULATOR_HOST = origFsEmulator;
       else delete process.env.FIRESTORE_EMULATOR_HOST;
@@ -923,7 +925,7 @@ describe("lanyard/server unit tests", () => {
 
     // 2. GoogleAuthService with checkRevoked = true passes true to adminAuth.verifyIdToken
     const verifySpy = vi.spyOn(adminAuth, "verifyIdToken");
-    const strictAuth = new GoogleAuthService(adminAuth, true, true);
+    const strictAuth = new GoogleAuthService(adminAuth, { checkRevoked: true });
     await strictAuth.verifyToken("Bearer valid-token");
     expect(verifySpy).toHaveBeenCalledWith("valid-token", true);
 
@@ -992,7 +994,7 @@ describe("lanyard/server unit tests", () => {
     await server.setSystemAdminStatus({
       email: "boss@example.com",
       isAdmin: true,
-      actor: { uid: "root-admin", isAdmin: true }
+      actor: { uid: "root-admin" }
     });
     expect(adminAuth.claimsByUid.get(provisionedBoss.uid)).toEqual({
       tenantTier: "enterprise",
@@ -1166,7 +1168,7 @@ describe("lanyard/server unit tests", () => {
     await server.setSystemAdminStatus({
       email: "hybrid.admin@example.com",
       isAdmin: true,
-      actor: { uid: "root-admin", isAdmin: true }
+      actor: { uid: "root-admin" }
     });
     expect((await store.getSystemAdmin(user.uid))?.isSystemAdmin).toBe(true);
 
@@ -1174,7 +1176,7 @@ describe("lanyard/server unit tests", () => {
     await server.setSystemAdminStatus({
       email: "hybrid.admin@example.com",
       isAdmin: false,
-      actor: { uid: "root-admin", isAdmin: true }
+      actor: { uid: "root-admin" }
     });
 
     // User's attendee attributes and preferences on users/{uid} are 100% preserved!
@@ -1426,7 +1428,7 @@ describe("lanyard/server unit tests", () => {
     });
     await server.updateUserHiddenAttributes({
       scopeId: GLOBAL_SCOPE,
-      actor: { uid: "root-admin", isAdmin: true },
+      actor: { uid: "root-admin" },
       targetUid: attendee.uid,
       patch: { superAdminSecret: "classified-flag" }
     });
@@ -1470,7 +1472,7 @@ describe("lanyard/server unit tests", () => {
     expect(
       await server.readUserHiddenAttributes({
         scopeId: GLOBAL_SCOPE,
-        actor: { uid: "root-admin", isAdmin: true },
+        actor: { uid: "root-admin" },
         targetUid: attendee.uid
       })
     ).toEqual({
@@ -2125,7 +2127,7 @@ describe("lanyard/server unit tests", () => {
     expect(
       await server.readUserHiddenAttributes({
         scopeId: GLOBAL_SCOPE,
-        actor: { uid: "sys-admin", isAdmin: true },
+        actor: { uid: "sys-admin" },
         targetUid: attendee.uid
       })
     ).toEqual({
@@ -2698,7 +2700,7 @@ describe("lanyard/server unit tests", () => {
       isAdmin: true,
       firstName: "Root",
       lastName: "Admin",
-      actor: { uid: "bootstrap", isAdmin: true }
+      actor: { uid: "bootstrap" }
     });
 
     // - Middleware `requireRole("user_reader_base", GLOBAL_SCOPE)` passes for `scanner` and `moderator` (who inherit `user_reader_base`),
@@ -3041,7 +3043,7 @@ describe("lanyard/server unit tests", () => {
     await expect(
       server.deleteUser({
         scopeId: GLOBAL_SCOPE,
-        actor: { uid: tempAdmin!.uid, isAdmin: true }, // Stale JWT claim!
+        actor: { uid: tempAdmin!.uid }, // Stale JWT claim!
         targetUid: attendee.uid,
         confirmTargetEmail: "attendee@example.com"
       })
@@ -3239,13 +3241,16 @@ describe("lanyard/server unit tests", () => {
         store,
         policy: TEST_POLICY,
         authService: {
-          verifyToken: async () => ({
-            uid: "u-custom",
-            email: "new@example.com",
-            tokenIssuedAtSeconds: Math.floor(Date.now() / 1000),
-            authTimeSeconds: Math.floor(Date.now() / 1000) - 60,
-            ...verification
-          })
+          // A custom AuthService may omit emailVerified at runtime; only an explicit true counts as verified
+          verifyToken: async () =>
+            ({
+              uid: "u-custom",
+              email: "new@example.com",
+              adminClaim: false,
+              issuedAtSeconds: Math.floor(Date.now() / 1000),
+              authTimeSeconds: Math.floor(Date.now() / 1000) - 60,
+              ...verification
+            }) as any
         },
         onVerifiedEmailChange
       });

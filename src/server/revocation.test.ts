@@ -21,9 +21,10 @@ function tokenTable(
         uid: entry.uid,
         email: `${entry.uid}@example.com`,
         emailVerified: true,
-        isAdmin: entry.admin ?? false,
-        tokenIssuedAtSeconds: entry.iat,
-        authTimeSeconds: entry.authTime
+        adminClaim: entry.admin ?? false,
+        // Missing times are possible from a custom AuthService at runtime; checkAuth must fail closed on them
+        issuedAtSeconds: entry.iat as number,
+        authTimeSeconds: entry.authTime as number
       };
     }
   };
@@ -248,7 +249,7 @@ describe("checkAuth token freshness", () => {
         auth_time: 900
       })
     }).verifyToken("Bearer t");
-    expect(user).toMatchObject({ tokenIssuedAtSeconds: 1000, authTimeSeconds: 900 });
+    expect(user).toMatchObject({ issuedAtSeconds: 1000, authTimeSeconds: 900 });
   });
 });
 

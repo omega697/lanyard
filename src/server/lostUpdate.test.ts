@@ -25,8 +25,8 @@ function tokenFor(uid: string, email: string, photoUrl: string): AuthService {
         email,
         emailVerified: true,
         photoUrl,
-        isAdmin: false,
-        tokenIssuedAtSeconds: t,
+        adminClaim: false,
+        issuedAtSeconds: t,
         authTimeSeconds: t - 60
       };
     }

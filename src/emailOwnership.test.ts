@@ -21,8 +21,8 @@ function tokenTable(users: Record<string, { uid: string; email: string }>): Auth
         uid: entry.uid,
         email: entry.email,
         emailVerified: true,
-        isAdmin: false,
-        tokenIssuedAtSeconds: t,
+        adminClaim: false,
+        issuedAtSeconds: t,
         authTimeSeconds: t - 60
       };
     }
