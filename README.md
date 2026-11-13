@@ -8,6 +8,10 @@ Like a conference or workplace lanyard, `lanyard` answers two questions everywhe
 2. **Access Passes**: _What roles (`TRole[]`) and role-derived capabilities (`TCapability[]`) do they hold in the current scope (`GLOBAL_SCOPE` or tenant `scopeId`)?_
 
 > [!IMPORTANT]
+> **Upgrading from 0.2.x?** 0.3.0 is a security-hardening release with many breaking changes (secrets, roles, deletes,
+> magic links, custom stores and adapters). Follow "Upgrading from 0.2.x" in [CHANGELOG.md](./CHANGELOG.md) and
+> regenerate your Firestore rules.
+>
 > **Upgrading from 0.1.x?** 0.2.0 moves preferences, attributes, and email into per-audience tier documents and
 > generates your security rules. Existing data must be migrated; see [CHANGELOG.md](./CHANGELOG.md).
 

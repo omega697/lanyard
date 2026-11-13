@@ -1,6 +1,11 @@
 # Changelog
 
-## Unreleased
+## 0.3.0
+
+A security-hardening release. It closes ways to gain or keep admin access, escalate roles, sign someone into another
+account, spoof or leave stale emails, plant or forge secrets, leak preferences across users on a shared browser, and
+delete users without explicit permission. Most changes are breaking; see "Upgrading from 0.2.x" at the end of this
+section.
 
 ### New
 
@@ -34,6 +39,16 @@
   (`{metaCollection}/revocation`, needed for proactive refresh); everything else there, including session revocations,
   is server-only. `generateFirestoreRules` takes a `metaCollection` option and `lanyard-rules` a `--meta` flag (default
   `lanyard_meta`). Regenerate your rules.
+
+- **Email verification for providers that don't vouch for the address.** `client.sendEmailVerificationLink(redirectUrl?)`
+  emails a Firebase verification link for the signed-in user's own address (it never takes an address, and resolves
+  `false` without sending when the email is already verified). `client.refreshEmailVerification()` reloads the user and
+  forces a fresh ID token, so a verification completed in another tab or on another device reaches `authStore` and the
+  server's `email_verified` check.
+- **A recognizable "email not verified" rejection.** `GoogleAuthService.verifyToken` now throws
+  `EmailNotVerifiedError` (with `code: EMAIL_NOT_VERIFIED_ERROR_CODE`, `"auth/email-not-verified"`, exported from
+  `lanyard/core` and `lanyard/server`), and `checkAuth` includes that `code` in its 401 JSON body alongside the existing
+  `error` message.
 
 ### Breaking changes
 
@@ -344,17 +359,55 @@ currentEmail }` (someone is already signed in; their session is left alone) or `
   required `email_verified == true`. If you mint custom tokens that carry an `email` claim, also set
   `email_verified: true` on them when the email is genuinely verified.
 
-### New
+### Upgrading from 0.2.x
 
-- **Email verification for providers that don't vouch for the address.** `client.sendEmailVerificationLink(redirectUrl?)`
-  emails a Firebase verification link for the signed-in user's own address (it never takes an address, and resolves
-  `false` without sending when the email is already verified). `client.refreshEmailVerification()` reloads the user and
-  forces a fresh ID token, so a verification completed in another tab or on another device reaches `authStore` and the
-  server's `email_verified` check.
-- **A recognizable "email not verified" rejection.** `GoogleAuthService.verifyToken` now throws
-  `EmailNotVerifiedError` (with `code: EMAIL_NOT_VERIFIED_ERROR_CODE`, `"auth/email-not-verified"`, exported from
-  `lanyard/core` and `lanyard/server`), and `checkAuth` includes that `code` in its 401 JSON body alongside the existing
-  `error` message.
+1. **Update the dependency** to the `v0.3.0` tag.
+2. **Stores.**
+   - Pass the same `policy` to every Lanyard store and to `createLanyardServer` / `createLanyardClient`; stores need it
+     for card field placement and to read or write secrets at all.
+   - Remove `defaultRoles` from store configs (TypeScript flags it); list `policy.defaultRoles` explicitly if you relied
+     on the implicit root-role default.
+   - Custom server stores must implement the revocation epoch, session revocations, `patchUser`, `patchScopeMember` and
+     `listUserMembershipScopeIds`; custom client stores must implement `subscribeToRevocationEpoch`. Check them with
+     `assertRevocationEpochConformance` and `assertSessionRevocationConformance` from `lanyard/testing`.
+3. **Policy.**
+   - Rewrite `secretCapabilities` in the `{ self?, capability? }` shape (the old `write` / `allowSelfWrite` keys throw),
+     and declare every secret key you store, including ones only backend code writes, as `{}`.
+   - Make every role that should assign, edit or delete holders of another role inherit it, including side staff roles
+     with `write` or `delete`; when any of `assignRoles`, `write` or `delete` is configured,
+     `createPermissionPolicy` throws if a `"*"` role can't reach every other concrete role.
+   - Mark roles that only server code assigns (for example a roster-synced volunteer role) `systemManaged: true`.
+   - Set `userCapabilities.delete` if non-admins should delete users or remove members; otherwise only admins can.
+4. **Server.**
+   - `AdminAuthAdapter.getUser` is required, `listUsers` is needed for `bootstrapFirstAdmin`, and `revokeRefreshTokens`
+     for `revokeUserSessions`; Firebase Admin's `Auth` has all three. Test doubles must return `emailVerified: true`
+     for verified accounts, and tokens must carry `iat` and `auth_time`.
+   - A custom `AuthService` returns a `VerifiedToken` (`adminClaim`, `issuedAtSeconds`, `authTimeSeconds`; no
+     `isAdmin`). Pass `req.user` (or `{ uid }`) as the actor; `LanyardActor` is just `{ uid }`, and admin status always
+     comes from the Firebase claim. `createLanyardServer` no longer returns `authService`, and `GoogleAuthService`
+     takes an options object.
+   - Promote admins with `setSystemAdminStatus` and an admin actor, and create the first one with
+     `bootstrapFirstAdmin` from a setup script; remove any "promote this email" endpoints.
+   - Don't pass `email` to `updateUserProfile`; the server keeps every stored email in sync with the verified one.
+   - Call `server.close()` when a script or test is done with the server, or Node won't exit.
+5. **Client.**
+   - Call `completePasswordlessSignIn()` when the app starts and handle its statuses, including asking for the email
+     when it returns `needs-email` (cross-device links now need it).
+   - Make API calls with `authorizedFetch`, which refreshes stale tokens and signs out revoked sessions. After any
+     admin demotion, every user's freshly minted tokens are stale for about two seconds; `authorizedFetch` absorbs
+     this, but raw `fetch` calls and parallel integration tests may see `401 auth/token-stale`.
+   - Pass a scope to `getAssignableRoles(scopeId)`, and remove the client `onVerifiedEmailChange` option (use the
+     server's).
+6. **Regenerate your Firestore rules** (`lanyard-rules`, with `--meta` if you renamed the metadata collection): they
+   now enforce revocations and verified emails and deny client email writes.
+7. **Data.**
+   - If your stores had a non-empty `defaultRoles`, audit records whose roles may have been persisted from substituted
+     defaults.
+   - Member emails that went stale before upgrading are corrected on the user's next email change; rewrite them from
+     the global records with `patchScopeMember` to fix them now.
+   - Stored secrets under keys your policy doesn't declare are ignored (with a warning) and can be deleted.
+8. **Deploy** the regenerated rules and the server before or together with the client, since the new client reads the
+   revocation epoch that the new rules expose.
 
 ## 0.2.1
 
