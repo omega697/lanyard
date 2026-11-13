@@ -156,9 +156,11 @@ export const workspacePolicy = createPermissionPolicy<WorkspaceRole, WorkspaceCa
   hiddenAttributeCapabilities: {
     internalNotes: { write: "edit_content" } // Per-key WRITE rule; reads follow the hiddenAttributes tier (staff + admins)
   },
+  // Secrets are closed-world: only these keys can ever be written or read back, and the store needs this policy too
   secretCapabilities: {
-    geminiKey: { allowSelfWrite: true }, // User-owned write-only encrypted secret
-    workspaceOpenaiKey: { write: "billing", allowSelfWrite: false } // Role-gated write-only encrypted user secret
+    geminiKey: { self: true }, // User-owned write-only encrypted secret
+    workspaceOpenaiKey: { capability: "billing" }, // Role-gated: holders of 'billing' (and admins), not the user
+    gmailRefreshToken: {} // Written only by trusted server code (e.g. an OAuth callback via the store) and admins
   },
   // App-defined private documents with their own audiences (names may not reuse built-in tier names)
   customDocs: {
@@ -391,7 +393,7 @@ import { workspacePolicy, type WorkspaceRole, type WorkspaceCapability } from ".
 
 const store = new FirestoreServerStore<WorkspaceRole, WorkspaceCapability>({
   db,
-  policy: workspacePolicy, // Field placement (cardFields) must match the server's policy
+  policy: workspacePolicy, // Field placement (cardFields) and declared secret keys must match the server's policy
   scopeCollection: "workspaces",
   membersSubcollection: "members",
   encryptionKey: process.env.LANYARD_ENCRYPTION_KEY // Master key for AES-256-GCM encrypted secrets
@@ -663,6 +665,10 @@ class PostgresServerStore<
   }
 }
 ```
+
+A custom store that stores secrets must be closed-world too: refuse writes to keys the policy's `secretCapabilities`
+doesn't declare, and leave undeclared keys out of reads. Expose them as `readonly secretKeys` (from `policy.secretKeys`)
+and `createLanyardServer` will check they match its policy.
 
 For unit tests, use the built-in **`InMemoryLanyardStore<TRole, TCapability, TPreferences>`** from `lanyard/core`, which implements both `LanyardClientStore` and `LanyardServerStore` out of the box with zero mocks required.
 

@@ -180,6 +180,8 @@ export type CardFieldsPlacement = Readonly<{ email: boolean; attributes: readonl
  */
 export interface LanyardStorePlacementSource {
   readonly cardFields: CardFieldsPlacement;
+  /** Declared secret keys (`PermissionPolicy.secretKeys`); server stores write and read only these. */
+  readonly secretKeys?: readonly string[];
 }
 
 /**
@@ -206,15 +208,19 @@ export interface CustomDocDefinition<TCapability extends string = string> {
 }
 
 /**
- * Specifies who is allowed to set or clear a write-only encrypted secret field (e.g., an API key or OAuth token).
+ * Who may set or clear one write-only encrypted secret (e.g. an API key or OAuth token), in the same terms as
+ * `CustomDocAccessRule`: a capability name (shorthand for `{ capability }`), or `{ self?, capability? }`, where an empty
+ * rule (`{}`) means system admins and trusted server code only. Self-writing is opt-in (`self: true`).
  * Encrypted secrets can NEVER be read back out to any client—only boolean configured status is exposed,
  * and only trusted server-side code can decrypt them.
  */
 export type SecretCapabilityRule<TCapability extends string = string> =
   | TCapability
   | {
-      write?: TCapability;
-      allowSelfWrite?: boolean;
+      /** The user/member the secret belongs to may set or clear it. */
+      self?: boolean;
+      /** Holders of this capability (in the scope) may set or clear it. */
+      capability?: TCapability;
     };
 
 /**
@@ -291,9 +297,8 @@ export interface PermissionPolicyConfig<TRole extends string = string, TCapabili
    */
   hiddenAttributeCapabilities?: Record<string, FieldCapabilityRule<TCapability>>;
   /**
-   * Optional capability rules governing who can write/clear specific keys in write-only encrypted `secrets`.
-   * If a key is not listed in `secretCapabilities`, `isSelf = true` (the user themselves) or `isSystemAdmin = true`
-   * is allowed to set/clear their own secret by default.
+   * The secret keys that exist, and who may write each (see `SecretCapabilityRule`). Closed-world: a key not listed
+   * here can't be written by anyone, system admins included, and stores refuse it.
    */
   secretCapabilities?: Record<string, SecretCapabilityRule<TCapability>>;
   /**
@@ -323,6 +328,8 @@ export interface PermissionPolicy<TRole extends string = string, TCapability ext
   readonly roleInherits: Readonly<Record<TRole, readonly TRole[]>>;
   readonly assignableRoles: readonly TRole[];
   readonly defaultRoles: readonly TRole[];
+  /** The declared secret keys (`secretCapabilities`), in declaration order. No other secret key exists. */
+  readonly secretKeys: readonly string[];
   /** Normalized global user record access capabilities. */
   readonly userCapabilities: Readonly<{
     read?: TCapability;
@@ -1060,6 +1067,11 @@ export interface LanyardServerStore<
   ): Promise<void>;
   /** Required: Like `patchUser`, for an existing member of `scopeId`; throws if they aren't a member. */
   patchScopeMember(scopeId: string, uid: string, fields: StoredProfileFieldsPatch): Promise<void>;
+  /**
+   * Optional: the secret keys this store accepts (from the policy it was given). If present, `createLanyardServer`
+   * checks they match `policy.secretKeys`. Stores must refuse writes to any other key.
+   */
+  readonly secretKeys?: readonly string[];
   updateScopeMemberAttributes?(
     scopeId: string,
     uid: string,

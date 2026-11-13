@@ -29,6 +29,29 @@
 
 ### Breaking changes
 
+- **Secrets are closed-world: only keys declared in `secretCapabilities` exist.** Before:
+  - `canWriteSecret` let a user write their own copy of any secret key the policy didn't mention, so a user could store
+    arbitrary encrypted values under names that server code might later decrypt and trust;
+  - self-writing was opt-out (`allowSelfWrite` defaulted to `true`), so `{ write: "cap" }` quietly let every user write
+    their own copy too;
+  - stores accepted and returned any key found in a secrets document.
+
+  Now:
+  - an undeclared key can't be written by anyone, including system admins, and stores refuse it even when called
+    directly;
+  - a rule is either a capability string or `{ self?, capability? }`: `self: true` lets the user (or member) write their
+    own copy, `capability` lets holders write anyone's, `{}` leaves it to admins and trusted server code, and the string
+    shorthand never grants self-writing;
+  - the old `write` / `allowSelfWrite` keys throw when the policy is created, rather than silently changing meaning;
+  - `FirestoreServerStore` and `InMemoryLanyardStore` need the policy (`new FirestoreServerStore({ db, policy })`) to
+    write secrets at all, `createLanyardServer` throws if the store's declared keys differ from its policy's
+    (`policy.secretKeys`), and reads drop undeclared keys already in storage with a `console.warn`.
+
+  **Migrating:** rename `{ allowSelfWrite: true }` to `{ self: true }`, `{ write: X }` to `{ capability: X, self: true }`
+  to keep its old behaviour (or `{ capability: X }` if users shouldn't write their own), and
+  `{ write: X, allowSelfWrite: false }` to `{ capability: X }`. Declare every key your server writes, including ones only
+  backend code writes (e.g. OAuth tokens, as `{}`), and pass the same policy to your store.
+
 - **Default roles only seed a newly provisioned record; revoking every role leaves none.** Before:
   - the Firestore stores substituted their `defaultRoles` option whenever a stored `roles` field was empty or
     missing, so revoking all of a user's roles quietly gave them the defaults back on the server and the client,

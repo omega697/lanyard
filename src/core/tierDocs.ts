@@ -162,3 +162,68 @@ export function assertStoreMatchesPolicyPlacement(
     );
   }
 }
+
+/**
+ * Throws if a server store's declared secret keys differ from the policy's, which would let the store write keys
+ * the policy doesn't govern (or refuse ones it does). Stores that don't declare `secretKeys` (custom implementations)
+ * are trusted to follow the policy.
+ * @internal Used by `createLanyardServer`.
+ */
+export function assertStoreMatchesPolicySecretKeys(
+  store: { readonly secretKeys?: readonly string[] },
+  policySecretKeys: readonly string[]
+): void {
+  if (store.secretKeys === undefined) return;
+  const same =
+    store.secretKeys.length === policySecretKeys.length && store.secretKeys.every((k) => policySecretKeys.includes(k));
+  if (!same) {
+    throw new Error(
+      "Store secret keys do not match the policy's secretCapabilities. Pass the same policy to the store (e.g. " +
+        "new FirestoreServerStore({ db, policy })) and to createLanyardServer."
+    );
+  }
+}
+
+/** Resolves a store's declared secret keys from the policy it was given (none if it wasn't given one). */
+export function resolveSecretKeys(source: { readonly secretKeys?: readonly string[] } | undefined): readonly string[] {
+  return Object.freeze([...(source?.secretKeys ?? [])]);
+}
+
+/** Throws unless every key in a secrets patch is declared (stores are closed-world for secrets). */
+export function assertDeclaredSecretKeys(secretKeys: readonly string[], patch: Record<string, unknown>): void {
+  for (const key of Object.keys(patch || {})) {
+    if (!secretKeys.includes(key)) {
+      throw new Error(
+        secretKeys.length === 0
+          ? `Secret key '${key}' is not declared: pass a policy with secretCapabilities to the store to write secrets`
+          : `Secret key '${key}' is not declared in policy.secretCapabilities`
+      );
+    }
+  }
+}
+
+// Undeclared stored keys already warned about, as "location\0key", so a stray key doesn't log on every read. Bounded:
+// once it holds MAX entries it starts over, so a store with stray keys on many users can't grow it without limit.
+const MAX_WARNED_UNDECLARED_SECRET_KEYS = 1000;
+const warnedUndeclaredSecretKeys = new Set<string>();
+
+/**
+ * Drops stored secret keys the policy doesn't declare, so nothing trusts them, warning once per location and key.
+ */
+export function withoutUndeclaredSecretKeys<T>(
+  secretKeys: readonly string[],
+  values: Record<string, T>,
+  where: string
+): Record<string, T> {
+  const kept: Record<string, T> = {};
+  for (const [key, value] of Object.entries(values)) {
+    if (secretKeys.includes(key)) {
+      kept[key] = value;
+    } else if (!warnedUndeclaredSecretKeys.has(`${where}\0${key}`)) {
+      if (warnedUndeclaredSecretKeys.size >= MAX_WARNED_UNDECLARED_SECRET_KEYS) warnedUndeclaredSecretKeys.clear();
+      warnedUndeclaredSecretKeys.add(`${where}\0${key}`);
+      console.warn(`[lanyard] Ignoring undeclared secret key '${key}' stored at ${where}`);
+    }
+  }
+  return kept;
+}

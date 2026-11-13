@@ -24,7 +24,11 @@ import {
   type UserRecord,
   type VerifiedEmailChangeEvent
 } from "../core/index.js";
-import { assertStoreMatchesPolicyPlacement, resolveAttributeQueryLocation } from "../core/tierDocs.js";
+import {
+  assertStoreMatchesPolicyPlacement,
+  assertStoreMatchesPolicySecretKeys,
+  resolveAttributeQueryLocation
+} from "../core/tierDocs.js";
 
 export {
   EMAIL_NOT_VERIFIED_ERROR_CODE,
@@ -358,6 +362,7 @@ export function createLanyardServer<
     revocationResubscribeDelayMs = 1000
   } = config;
   assertStoreMatchesPolicyPlacement(store, policy.cardFields);
+  assertStoreMatchesPolicySecretKeys(store, policy.secretKeys);
   if (typeof adminAuth?.getUser !== "function") {
     throw new Error(
       "createLanyardServer requires adminAuth.getUser to read users' admin claims (Firebase Admin's Auth has it)"

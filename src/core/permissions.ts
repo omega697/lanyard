@@ -30,8 +30,8 @@ interface NormalizedUserRule<TCapability extends string> {
 }
 
 interface NormalizedSecretRule<TCapability extends string> {
-  write?: TCapability;
-  allowSelfWrite?: boolean;
+  self?: boolean;
+  capability?: TCapability;
 }
 
 /**
@@ -272,17 +272,28 @@ export function createPermissionPolicy<TRole extends string = string, TCapabilit
   const secretRules = Object.create(null) as Record<string, NormalizedSecretRule<TCapability>>;
   if (config.secretCapabilities && typeof config.secretCapabilities === "object") {
     for (const [key, rule] of Object.entries(config.secretCapabilities)) {
-      if (!isSafeKey(key) || !rule) continue;
+      if (!isSafeKey(key)) throw new Error(`Invalid secretCapabilities key '${key}'.`);
       if (typeof rule === "string") {
-        secretRules[key] = Object.freeze({ write: rule as TCapability });
-      } else if (typeof rule === "object") {
+        if (!isSafeKey(rule)) throw new Error(`Invalid secretCapabilities.${key}: invalid capability '${rule}'.`);
+        secretRules[key] = Object.freeze({ capability: rule as TCapability });
+      } else if (rule && typeof rule === "object" && !Array.isArray(rule)) {
+        // The old shape defaulted to self-writable; reject it so the flipped default can't pass unnoticed
+        if ("write" in rule || "allowSelfWrite" in rule) {
+          throw new Error(
+            `Invalid secretCapabilities.${key}: 'write' and 'allowSelfWrite' were replaced by ` +
+              `{ capability?, self? } (self-writing is now opt-in with self: true; {} means server-only).`
+          );
+        }
         secretRules[key] = Object.freeze({
-          ...(rule.write ? { write: rule.write } : {}),
-          ...(rule.allowSelfWrite !== undefined ? { allowSelfWrite: Boolean(rule.allowSelfWrite) } : {})
+          ...(rule.self ? { self: true } : {}),
+          ...(rule.capability && isSafeKey(rule.capability) ? { capability: rule.capability } : {})
         });
+      } else {
+        throw new Error(`Invalid secretCapabilities.${key}: expected a capability or { capability?, self? }.`);
       }
     }
   }
+  const secretKeys: readonly string[] = Object.freeze(Object.keys(secretRules));
 
   Object.freeze(roles);
   Object.freeze(resolvedCapabilities);
@@ -352,7 +363,7 @@ export function createPermissionPolicy<TRole extends string = string, TCapabilit
     registerReferencedCapability(hiddenAttrRules[key].write);
   }
   for (const key of Object.keys(secretRules)) {
-    registerReferencedCapability(secretRules[key].write);
+    registerReferencedCapability(secretRules[key].capability);
   }
   for (const name of Object.keys(customDocs)) {
     registerReferencedCapability(customDocs[name].read.capability);
@@ -640,19 +651,12 @@ export function createPermissionPolicy<TRole extends string = string, TCapabilit
     const isSystemAdmin = typeof options === "boolean" ? options : Boolean(options?.isSystemAdmin);
     const isSelf = typeof options === "object" && options !== null ? Boolean(options.isSelf) : false;
 
-    if (isSystemAdmin) return true;
+    // Closed world: an undeclared key doesn't exist, so nobody (not even a system admin) can write it
     const rule = Object.hasOwn(secretRules, key) ? secretRules[key] : undefined;
-    if (!rule) {
-      // Unconfigured secret keys default to user-owned (`isSelf === true`)
-      return isSelf;
-    }
-    if (isSelf && rule.allowSelfWrite !== false) {
-      return true;
-    }
-    if (rule.write && hasCapability(actor, rule.write, false)) {
-      return true;
-    }
-    return false;
+    if (!rule) return false;
+    if (isSystemAdmin) return true;
+    if (isSelf && rule.self) return true;
+    return Boolean(rule.capability && hasCapability(actor, rule.capability, false));
   }
 
   function canWriteSecretsPatch(
@@ -706,6 +710,7 @@ export function createPermissionPolicy<TRole extends string = string, TCapabilit
     roleInherits,
     assignableRoles,
     defaultRoles,
+    secretKeys,
     userCapabilities: userRule,
     staffCapability,
     cardVisibility,

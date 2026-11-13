@@ -61,7 +61,7 @@ import {
   type VerifiedEmailChangeEvent
 } from "./core/index.js";
 import { FirestoreServerStore } from "./server/firestore.js";
-import { createLanyardServer, isEncryptedSecretData } from "./server/index.js";
+import { createLanyardServer, encryptSecret, isEncryptedSecretData } from "./server/index.js";
 import { generateFirestoreRules } from "./rules/index.js";
 import { assertRevocationEpochConformance, assertSessionRevocationConformance } from "./testing/index.js";
 
@@ -422,13 +422,14 @@ describe.skipIf(!emulatorsAvailable)(
           blindAuditHash: { write: "write:audit_hash" }
         },
         secretCapabilities: {
-          geminiKey: { allowSelfWrite: true },
-          openaiKey: { write: "write:ai_keys", allowSelfWrite: false }
+          geminiKey: { self: true },
+          openaiKey: { capability: "write:ai_keys" }
         }
       });
 
       const serverStore = new FirestoreServerStore<Role, Cap, Prefs, Attrs, HiddenAttrs, Secrets>({
         db: adminDb,
+        policy,
         usersCollection: "users_st",
         metaCollection: "lanyard_meta_st",
         encryptionKey: "emulator-test-master-encryption-key"
@@ -936,7 +937,7 @@ describe.skipIf(!emulatorsAvailable)(
           internalNotes: { write: "write:notes" }
         },
         secretCapabilities: {
-          geminiKey: { write: "manage:secrets", allowSelfWrite: false }
+          geminiKey: { capability: "manage:secrets" }
         }
       });
 
@@ -949,6 +950,7 @@ describe.skipIf(!emulatorsAvailable)(
         { geminiKey: string }
       >({
         db: adminDb,
+        policy,
         usersCollection: "users_mt",
         scopeCollection: "orgs_mt",
         membersSubcollection: "members_mt",
@@ -1162,6 +1164,8 @@ ${block}
           { geminiKey: string }
         >({
           db: adminDb,
+          // This test drives the store directly; it declares the one secret key it writes
+          policy: createPermissionPolicy<Role, Cap>({ secretCapabilities: { geminiKey: { self: true } } }),
           usersCollection: "users",
           scopeCollection: "workspaces",
           membersSubcollection: "members",
@@ -2895,6 +2899,72 @@ ${generateFirestoreRules(policy, { usersCollection })}
         });
       } finally {
         await owner.close();
+      }
+    }, 30_000);
+
+    it("FIXED: on real Firestore, secrets are closed-world: only declared keys can be written or read back", async () => {
+      const suffix = Date.now();
+      const usersCollection = `users_secrets_${suffix}`;
+      // Mirrors canvus: AI keys are user-owned, OAuth tokens are written only by trusted backend code
+      const policy = createPermissionPolicy({
+        roles: { member: { capabilities: [] } },
+        secretCapabilities: {
+          geminiKey: { self: true },
+          openaiKey: { self: true },
+          anthropicKey: { self: true },
+          gmailAccessToken: {},
+          gmailRefreshToken: {},
+          calendarAccessToken: {},
+          calendarRefreshToken: {}
+        }
+      });
+      const encryptionKey = "emulator-closed-world-secrets-key";
+      const store = new FirestoreServerStore({ db: adminDb, policy, usersCollection, encryptionKey });
+      const server = createLanyardServer({ adminAuth, store, policy });
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      try {
+        const user = await server.upsertUserByEmail({ scopeId: GLOBAL_SCOPE, email: `secrets-${suffix}@example.com` });
+        await adminAuth.createUser({ uid: `secrets-admin-${suffix}`, email: `sa-${suffix}@example.com` });
+        await adminAuth.setCustomUserClaims(`secrets-admin-${suffix}`, { admin: true });
+        const selfWrite = (patch: Record<string, string>) =>
+          server.updateUserSecrets({ scopeId: GLOBAL_SCOPE, actor: user, targetUid: user.uid, patch } as any);
+
+        // The user writes their own AI key, but can't touch the backend-owned OAuth tokens
+        expect(await selfWrite({ geminiKey: "AIza-self" })).toEqual({ geminiKey: true });
+        await expect(selfWrite({ gmailRefreshToken: "forged" })).rejects.toThrow(/Forbidden/);
+
+        // Nobody can plant a key the policy doesn't declare: not the user, not an admin, not the store directly
+        await expect(selfWrite({ webhookUrl: "https://attacker.example" })).rejects.toThrow(/Forbidden/);
+        await expect(
+          server.updateUserSecrets({
+            scopeId: GLOBAL_SCOPE,
+            actor: { uid: `secrets-admin-${suffix}` },
+            targetUid: user.uid,
+            patch: { webhookUrl: "https://attacker.example" }
+          } as any)
+        ).rejects.toThrow(/Forbidden/);
+        await expect(store.updateUserSecrets(user.uid, { webhookUrl: "x" } as any)).rejects.toThrow(/not declared/);
+
+        // Trusted backend code (e.g. an OAuth callback) writes the OAuth tokens through the store
+        await store.updateUserSecrets(user.uid, { gmailRefreshToken: "refresh-1" } as any);
+        expect(await server.getDecryptedUserSecrets(GLOBAL_SCOPE, user.uid)).toEqual({
+          geminiKey: "AIza-self",
+          gmailRefreshToken: "refresh-1"
+        });
+
+        // A key written behind Lanyard's back (or left over from an older policy) is ignored, with a warning
+        await adminDb
+          .doc(`${usersCollection}/${user.uid}/private/secrets`)
+          .set({ webhookUrl: encryptSecret("https://attacker.example", encryptionKey) }, { merge: true });
+        expect(await store.getUserSecretsStatus(user.uid)).toEqual({ geminiKey: true, gmailRefreshToken: true });
+        expect(await server.getDecryptedUserSecrets(GLOBAL_SCOPE, user.uid)).toEqual({
+          geminiKey: "AIza-self",
+          gmailRefreshToken: "refresh-1"
+        });
+        expect(warn).toHaveBeenCalledWith(expect.stringContaining("Ignoring undeclared secret key 'webhookUrl'"));
+      } finally {
+        warn.mockRestore();
+        server.close();
       }
     }, 30_000);
   }

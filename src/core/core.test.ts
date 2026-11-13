@@ -1213,11 +1213,11 @@ describe("lanyard/core unit tests", () => {
           auditTrailHash: { write: "write:notes" }
         },
         secretCapabilities: {
-          // User/member-owned secret (allowSelfWrite defaults to true)
-          personalGeminiKey: { allowSelfWrite: true },
+          // User/member-owned secret (self-writing is opt-in)
+          personalGeminiKey: { self: true },
           // Role-gated secret where self cannot write unless they hold 'write:ai_keys'
-          sharedOpenaiKey: { write: "write:ai_keys", allowSelfWrite: false },
-          // String shorthand on secretCapabilities: self OR 'write:ai_keys' can write
+          sharedOpenaiKey: { capability: "write:ai_keys" },
+          // String shorthand on secretCapabilities: only holders of 'write:ai_keys' can write
           hybridAnthropicKey: "write:ai_keys"
         }
       });
@@ -1298,28 +1298,36 @@ describe("lanyard/core unit tests", () => {
       expect(policy.filterReadableHiddenAttributes(null, sampleHidden, true)).toEqual(sampleHidden);
 
       // 3. Write-only Secrets:
-      // - personalGeminiKey (allowSelfWrite: true) -> self can write; non-self without capability cannot
+      // - personalGeminiKey (self: true) -> self can write; non-self without capability cannot
       expect(policy.canWriteSecret(attendee, "personalGeminiKey", { isSelf: true })).toBe(true);
       expect(policy.canWriteSecret(attendee, "personalGeminiKey", { isSelf: false })).toBe(false);
-      // - Unconfigured secret key also defaults to allowSelfWrite: true when isSelf is true
-      expect(policy.canWriteSecret(attendee, "unconfiguredUserApiKey", { isSelf: true })).toBe(true);
-      expect(policy.canWriteSecret(attendee, "unconfiguredUserApiKey", { isSelf: false })).toBe(false);
-      // - sharedOpenaiKey (allowSelfWrite: false, write: "write:ai_keys") -> self cannot write unless holding write:ai_keys
+      // - An undeclared secret key doesn't exist: nobody can write it, not even the user or a system admin
+      expect(policy.canWriteSecret(attendee, "unconfiguredUserApiKey", { isSelf: true })).toBe(false);
+      expect(policy.canWriteSecret(attendee, "unconfiguredUserApiKey", { isSystemAdmin: true })).toBe(false);
+      // - sharedOpenaiKey (capability: "write:ai_keys", no self) -> self cannot write unless holding write:ai_keys
       expect(policy.canWriteSecret(attendee, "sharedOpenaiKey", { isSelf: true })).toBe(false);
       expect(policy.canWriteSecret(moderator, "sharedOpenaiKey", { isSelf: false })).toBe(true);
-      // - hybridAnthropicKey ("write:ai_keys") -> self OR holder of write:ai_keys can write
-      expect(policy.canWriteSecret(attendee, "hybridAnthropicKey", { isSelf: true })).toBe(true);
+      // - hybridAnthropicKey ("write:ai_keys" shorthand) -> only holders of write:ai_keys (self-writing is opt-in)
+      expect(policy.canWriteSecret(attendee, "hybridAnthropicKey", { isSelf: true })).toBe(false);
       expect(policy.canWriteSecret(moderator, "hybridAnthropicKey", { isSelf: false })).toBe(true);
       expect(policy.canWriteSecret(scanner, "hybridAnthropicKey", { isSelf: false })).toBe(false);
 
       // - canWriteSecretsPatch validates every key in a multi-key secret patch
       expect(
         policy.canWriteSecretsPatch(
-          attendee,
+          moderator,
           { personalGeminiKey: "AIza1", hybridAnthropicKey: "sk-ant-1" },
           { isSelf: true }
         )
       ).toBe(true);
+      // The string shorthand doesn't grant self-writing, so one non-writable key fails the whole patch
+      expect(
+        policy.canWriteSecretsPatch(
+          attendee,
+          { personalGeminiKey: "AIza1", hybridAnthropicKey: "sk-ant-1" },
+          { isSelf: true }
+        )
+      ).toBe(false);
       expect(
         policy.canWriteSecretsPatch(
           attendee,
@@ -1778,7 +1786,11 @@ describe("lanyard/core unit tests", () => {
         geminiKey: string;
       }
 
-      const store = new InMemoryLanyardStore<TestRole, TestCapability, Prefs, Attrs, HiddenAttrs, Secrets>();
+      const policy = createPermissionPolicy<TestRole, TestCapability>({
+        roles: { owner: { capabilities: [] }, manager: { capabilities: [] }, member: { capabilities: [] } },
+        secretCapabilities: { geminiKey: { self: true } }
+      });
+      const store = new InMemoryLanyardStore<TestRole, TestCapability, Prefs, Attrs, HiddenAttrs, Secrets>({ policy });
       const observedUsers: any[] = [];
       const unsubUser = store.subscribeToUser("u-hybrid", (u) => observedUsers.push(u));
 

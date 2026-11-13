@@ -1836,8 +1836,8 @@ describe("lanyard/client unit tests", () => {
         moderatorNotes: { write: "edit_content" }
       },
       secretCapabilities: {
-        personalGeminiKey: { allowSelfWrite: true },
-        workspaceOpenaiKey: { write: "invite_members", allowSelfWrite: false }
+        personalGeminiKey: { self: true },
+        workspaceOpenaiKey: { capability: "invite_members" }
       }
     });
 
@@ -2007,7 +2007,7 @@ describe("lanyard/client unit tests", () => {
     // - HiddenAttributes: not staff (lacks 'invite_members') so cannot read 'moderatorNotes', but has 'edit_content' so CAN write 'moderatorNotes'
     expect(clientFourTier.canReadHiddenAttribute(GLOBAL_SCOPE, "moderatorNotes")).toBe(false);
     expect(clientFourTier.canWriteHiddenAttribute(GLOBAL_SCOPE, "moderatorNotes")).toBe(true);
-    // - Secrets: can write own 'personalGeminiKey' (allowSelfWrite: true), cannot write 'workspaceOpenaiKey' (allowSelfWrite: false, lacks 'invite_members')
+    // - Secrets: can write own 'personalGeminiKey' (self: true), cannot write 'workspaceOpenaiKey' (no self, lacks 'invite_members')
     expect(clientFourTier.canWriteSecret(GLOBAL_SCOPE, "personalGeminiKey")).toBe(true);
     expect(clientFourTier.canWriteSecret(GLOBAL_SCOPE, "workspaceOpenaiKey")).toBe(false);
 

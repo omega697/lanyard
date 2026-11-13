@@ -27,14 +27,17 @@ import {
 } from "../core/index.js";
 import {
   assertCustomDocName,
+  assertDeclaredSecretKeys,
   assertNoReservedAttributeKeys,
   assertNoReservedTierKeys,
   readTierDocValues,
   resolveAttributeQueryLocation,
   resolveCardFields,
+  resolveSecretKeys,
   splitAttributesByPlacement,
   splitAttributesTierValues,
-  tierDocMetadata
+  tierDocMetadata,
+  withoutUndeclaredSecretKeys
 } from "../core/tierDocs.js";
 import { createSecretCipher, isEncryptedSecretData } from "./encryption.js";
 
@@ -122,6 +125,8 @@ export class FirestoreServerStore<
   private readonly metaCollection: string;
   private readonly cipher?: SecretCipher;
   readonly cardFields: CardFieldsPlacement;
+  /** Declared secret keys from the policy (none without one); secrets are closed-world. */
+  readonly secretKeys: readonly string[];
 
   constructor(config: FirestoreServerStoreConfig<TRole>) {
     this.db = config.db;
@@ -138,6 +143,7 @@ export class FirestoreServerStore<
     const key = config.encryptionKey || process.env.MASTER_ENCRYPTION_KEY;
     this.cipher = config.cipher ?? (key ? createSecretCipher(key) : undefined);
     this.cardFields = resolveCardFields(config.policy);
+    this.secretKeys = resolveSecretKeys(config.policy);
   }
 
   private requireCipher(): SecretCipher {
@@ -384,20 +390,31 @@ export class FirestoreServerStore<
     );
   }
 
-  private parseSecretsStatusFromDocData(data: Record<string, any>): Partial<Record<keyof TSecrets & string, boolean>> {
+  /** A secrets document's secret entries, dropping metadata and keys the policy doesn't declare. */
+  private declaredSecretEntries(data: Record<string, any>, where: string): [string, any][] {
+    const secrets = Object.fromEntries(
+      Object.entries(data).filter(([k]) => !FORBIDDEN_KEYS.has(k) && k !== "updatedAt" && k !== TIER_METADATA_KEY)
+    );
+    return Object.entries(withoutUndeclaredSecretKeys(this.secretKeys, secrets, where));
+  }
+
+  private parseSecretsStatusFromDocData(
+    data: Record<string, any>,
+    where: string
+  ): Partial<Record<keyof TSecrets & string, boolean>> {
     const status: Record<string, boolean> = {};
-    for (const [k, v] of Object.entries(data)) {
-      if (FORBIDDEN_KEYS.has(k) || k === "updatedAt" || k === TIER_METADATA_KEY) continue;
+    for (const [k, v] of this.declaredSecretEntries(data, where)) {
       status[k] = isEncryptedSecretData(v) || (typeof v === "string" && v.length > 0);
     }
     return status as Partial<Record<keyof TSecrets & string, boolean>>;
   }
 
-  private decryptSecretsFromDocData(data: Record<string, any>): Partial<Record<keyof TSecrets & string, string>> {
+  private decryptSecretsFromDocData(
+    data: Record<string, any>,
+    where: string
+  ): Partial<Record<keyof TSecrets & string, string>> {
     const out: Record<string, string> = {};
-    const entries = Object.entries(data).filter(
-      ([k]) => !FORBIDDEN_KEYS.has(k) && k !== "updatedAt" && k !== TIER_METADATA_KEY
-    );
+    const entries = this.declaredSecretEntries(data, where);
     if (entries.length === 0) return out as Partial<Record<keyof TSecrets & string, string>>;
     const cipher = this.requireCipher();
     for (const [k, v] of entries) {
@@ -418,9 +435,10 @@ export class FirestoreServerStore<
   ): Promise<Partial<Record<keyof TSecrets & string, boolean>>> {
     if (!patch || typeof patch !== "object" || Array.isArray(patch)) {
       const snap = await ref.get();
-      return snap.exists ? this.parseSecretsStatusFromDocData(snap.data() || {}) : {};
+      return snap.exists ? this.parseSecretsStatusFromDocData(snap.data() || {}, `${scopeId ?? "global"}/${uid}`) : {};
     }
     assertNoReservedTierKeys(patch, "secrets");
+    assertDeclaredSecretKeys(this.secretKeys, patch);
     const cipher = this.requireCipher();
     const firestorePayload: Record<string, any> = {};
     for (const [k, v] of Object.entries(patch)) {
@@ -435,7 +453,7 @@ export class FirestoreServerStore<
       await ref.set({ ...firestorePayload, ...tierDocMetadata("secrets", uid, scopeId) }, { merge: true });
     }
     const snap = await ref.get();
-    return snap.exists ? this.parseSecretsStatusFromDocData(snap.data() || {}) : {};
+    return snap.exists ? this.parseSecretsStatusFromDocData(snap.data() || {}, `${scopeId ?? "global"}/${uid}`) : {};
   }
 
   private parseUserRecord(
@@ -585,13 +603,13 @@ export class FirestoreServerStore<
   async getUserSecrets(uid: string): Promise<Partial<Record<keyof TSecrets & string, string>>> {
     const snap = await this.userSecretsDocRef(uid).get();
     if (!snap.exists) return {};
-    return this.decryptSecretsFromDocData(snap.data() || {});
+    return this.decryptSecretsFromDocData(snap.data() || {}, `${this.usersCollection}/${uid}`);
   }
 
   async getUserSecretsStatus(uid: string): Promise<Partial<Record<keyof TSecrets & string, boolean>>> {
     const snap = await this.userSecretsDocRef(uid).get();
     if (!snap.exists) return {};
-    return this.parseSecretsStatusFromDocData(snap.data() || {});
+    return this.parseSecretsStatusFromDocData(snap.data() || {}, `${this.usersCollection}/${uid}`);
   }
 
   async updateUserSecrets(
@@ -840,7 +858,7 @@ export class FirestoreServerStore<
   async getScopeMemberSecrets(scopeId: string, uid: string): Promise<Partial<Record<keyof TSecrets & string, string>>> {
     const snap = await this.memberSecretsDocRef(scopeId, uid).get();
     if (!snap.exists) return {};
-    return this.decryptSecretsFromDocData(snap.data() || {});
+    return this.decryptSecretsFromDocData(snap.data() || {}, `${this.scopeCollection}/${scopeId}/${uid}`);
   }
 
   async getScopeMemberSecretsStatus(
@@ -849,7 +867,7 @@ export class FirestoreServerStore<
   ): Promise<Partial<Record<keyof TSecrets & string, boolean>>> {
     const snap = await this.memberSecretsDocRef(scopeId, uid).get();
     if (!snap.exists) return {};
-    return this.parseSecretsStatusFromDocData(snap.data() || {});
+    return this.parseSecretsStatusFromDocData(snap.data() || {}, `${this.scopeCollection}/${scopeId}/${uid}`);
   }
 
   async updateScopeMemberSecrets(

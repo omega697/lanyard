@@ -25,12 +25,15 @@ import type {
 } from "./models.js";
 import {
   assertCustomDocName,
+  assertDeclaredSecretKeys,
   assertNoReservedAttributeKeys,
   assertNoReservedTierKeys,
   resolveAttributeQueryLocation,
   resolveCardFields,
+  resolveSecretKeys,
   splitAttributesByPlacement,
-  splitAttributesTierValues
+  splitAttributesTierValues,
+  withoutUndeclaredSecretKeys
 } from "./tierDocs.js";
 
 /** Private tier documents whose values are merged into user/member records. */
@@ -90,6 +93,8 @@ export class InMemoryLanyardStore<
 {
   private readonly cipher?: SecretCipher;
   readonly cardFields: CardFieldsPlacement;
+  /** Declared secret keys from the policy (none without one); secrets are closed-world. */
+  readonly secretKeys: readonly string[];
   private users = new Map<string, UserRecord<TRole, TCapability, TPreferences, TAttributes>>();
   // tier -> (tierKey(scopeId, uid) -> values)
   private tierValues: Record<MergedTier, Map<string, Record<string, any>>> = {
@@ -106,12 +111,13 @@ export class InMemoryLanyardStore<
   private scopeMemberSecrets = new Map<string, Map<string, Record<string, string | EncryptedSecretData>>>();
 
   /**
-   * @param options.policy The app's `PermissionPolicy`, used to place `cardFields.attributes` on the card
-   *   (omit if the policy doesn't set `cardFields`).
+   * @param options.policy The app's `PermissionPolicy`, used to place `cardFields.attributes` on the card and to
+   *   know which secret keys exist (secrets can't be written without it).
    */
   constructor(options?: { cipher?: SecretCipher; policy?: LanyardStorePlacementSource }) {
     this.cipher = options?.cipher;
     this.cardFields = resolveCardFields(options?.policy);
+    this.secretKeys = resolveSecretKeys(options?.policy);
   }
 
   private encryptSecretMapPatch(
@@ -132,11 +138,12 @@ export class InMemoryLanyardStore<
   }
 
   private decryptSecretMap(
-    stored: Record<string, string | EncryptedSecretData> | undefined
+    stored: Record<string, string | EncryptedSecretData> | undefined,
+    where: string
   ): Partial<Record<keyof TSecrets & string, string>> {
     const out: Record<string, string> = {};
     if (!stored) return out as Partial<Record<keyof TSecrets & string, string>>;
-    for (const [k, v] of Object.entries(stored)) {
+    for (const [k, v] of Object.entries(withoutUndeclaredSecretKeys(this.secretKeys, stored, where))) {
       if (FORBIDDEN_KEYS.has(k)) continue;
       if (typeof v === "string") {
         out[k] = v;
@@ -148,11 +155,12 @@ export class InMemoryLanyardStore<
   }
 
   private toSecretStatusMap(
-    stored: Record<string, string | EncryptedSecretData> | undefined
+    stored: Record<string, string | EncryptedSecretData> | undefined,
+    where: string
   ): Partial<Record<keyof TSecrets & string, boolean>> {
     const out: Record<string, boolean> = {};
     if (!stored) return out as Partial<Record<keyof TSecrets & string, boolean>>;
-    for (const [k, v] of Object.entries(stored)) {
+    for (const [k, v] of Object.entries(withoutUndeclaredSecretKeys(this.secretKeys, stored, where))) {
       if (FORBIDDEN_KEYS.has(k)) continue;
       out[k] = Boolean(v);
     }
@@ -636,12 +644,12 @@ export class InMemoryLanyardStore<
 
   async getUserSecrets(uid: string): Promise<Partial<Record<keyof TSecrets & string, string>>> {
     assertValidResourceId(uid, "uid");
-    return this.decryptSecretMap(this.userSecrets.get(uid));
+    return this.decryptSecretMap(this.userSecrets.get(uid), `users/${uid}`);
   }
 
   async getUserSecretsStatus(uid: string): Promise<Partial<Record<keyof TSecrets & string, boolean>>> {
     assertValidResourceId(uid, "uid");
-    return this.toSecretStatusMap(this.userSecrets.get(uid));
+    return this.toSecretStatusMap(this.userSecrets.get(uid), `users/${uid}`);
   }
 
   async updateUserSecrets(
@@ -651,9 +659,10 @@ export class InMemoryLanyardStore<
     assertValidResourceId(uid, "uid");
     const current = this.userSecrets.get(uid) || {};
     assertNoReservedTierKeys(patch || {}, "secrets");
+    assertDeclaredSecretKeys(this.secretKeys, patch || {});
     const updated = this.encryptSecretMapPatch(current, patch);
     this.userSecrets.set(uid, updated);
-    return this.toSecretStatusMap(updated);
+    return this.toSecretStatusMap(updated, `users/${uid}`);
   }
 
   async grantUserRoles(
@@ -833,7 +842,7 @@ export class InMemoryLanyardStore<
   async getScopeMemberSecrets(scopeId: string, uid: string): Promise<Partial<Record<keyof TSecrets & string, string>>> {
     assertValidResourceId(scopeId, "scopeId");
     assertValidResourceId(uid, "uid");
-    return this.decryptSecretMap(this.scopeMemberSecrets.get(scopeId)?.get(uid));
+    return this.decryptSecretMap(this.scopeMemberSecrets.get(scopeId)?.get(uid), `${scopeId}/${uid}`);
   }
 
   async getScopeMemberSecretsStatus(
@@ -842,7 +851,7 @@ export class InMemoryLanyardStore<
   ): Promise<Partial<Record<keyof TSecrets & string, boolean>>> {
     assertValidResourceId(scopeId, "scopeId");
     assertValidResourceId(uid, "uid");
-    return this.toSecretStatusMap(this.scopeMemberSecrets.get(scopeId)?.get(uid));
+    return this.toSecretStatusMap(this.scopeMemberSecrets.get(scopeId)?.get(uid), `${scopeId}/${uid}`);
   }
 
   async updateScopeMemberSecrets(
@@ -857,9 +866,10 @@ export class InMemoryLanyardStore<
     }
     const current = this.scopeMemberSecrets.get(scopeId)!.get(uid) || {};
     assertNoReservedTierKeys(patch || {}, "secrets");
+    assertDeclaredSecretKeys(this.secretKeys, patch || {});
     const updated = this.encryptSecretMapPatch(current, patch);
     this.scopeMemberSecrets.get(scopeId)!.set(uid, updated);
-    return this.toSecretStatusMap(updated);
+    return this.toSecretStatusMap(updated, `${scopeId}/${uid}`);
   }
 
   async grantScopeRoles(

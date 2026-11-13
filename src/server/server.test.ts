@@ -1281,15 +1281,15 @@ describe("lanyard/server unit tests", () => {
         moderatorNotes: { write: "write:notes" }
       },
       secretCapabilities: {
-        geminiKey: { allowSelfWrite: true },
-        openaiKey: { write: "write:ai_keys", allowSelfWrite: false }
+        geminiKey: { self: true },
+        openaiKey: { capability: "write:ai_keys" }
       }
     });
 
     const adminAuth = createFakeAdminAuth();
     // These tests act as system admins via hand-built actors, whose admin status comes from their Firebase claim
     adminAuth.claimsByUid.set("root-admin", { admin: true });
-    const store = new InMemoryLanyardStore<AppRole, AppCap, AppPrefs, AppAttrs, AppHiddenAttrs, AppSecrets>();
+    const store = new InMemoryLanyardStore<AppRole, AppCap, AppPrefs, AppAttrs, AppHiddenAttrs, AppSecrets>({ policy });
     const server = createLanyardServer<AppRole, AppCap, AppPrefs, AppAttrs, AppHiddenAttrs, AppSecrets>({
       adminAuth,
       store,
@@ -1480,7 +1480,7 @@ describe("lanyard/server unit tests", () => {
     });
 
     // 4. Write-Only Encrypted User Secrets:
-    // - Self (`attendee`) CAN write `geminiKey` (`allowSelfWrite: true`), receives boolean status, and server decrypts it
+    // - Self (`attendee`) CAN write `geminiKey` (`self: true`), receives boolean status, and server decrypts it
     const userSecretStatus = await server.updateUserSecrets({
       scopeId: GLOBAL_SCOPE,
       actor: attendee,
@@ -1499,7 +1499,7 @@ describe("lanyard/server unit tests", () => {
       geminiKey: "AIzaSyPersonal123"
     });
 
-    // - Self (`attendee`) CANNOT write `openaiKey` because `allowSelfWrite: false` and they lack `write:ai_keys`
+    // - Self (`attendee`) CANNOT write `openaiKey` because no `self` and they lack `write:ai_keys`
     await expect(
       server.updateUserSecrets({
         scopeId: GLOBAL_SCOPE,
@@ -1746,6 +1746,10 @@ describe("lanyard/server unit tests", () => {
       }
     };
 
+    const secretsPolicy = createPermissionPolicy<TestRole, TestCap>({
+      roles: { owner: { capabilities: [] }, manager: { capabilities: [] }, member: { capabilities: [] } },
+      secretCapabilities: { geminiKey: { self: true }, openaiKey: { self: true } }
+    });
     const fsStore = new FirestoreServerStore<
       TestRole,
       TestCap,
@@ -1755,6 +1759,7 @@ describe("lanyard/server unit tests", () => {
       { geminiKey: string; openaiKey: string }
     >({
       db: fakeDb,
+      policy: secretsPolicy,
       encryptionKey: "test-master-encryption-key-for-lanyard"
     });
 
@@ -1878,7 +1883,8 @@ describe("lanyard/server unit tests", () => {
 
     // FirestoreServerStore without encryptionKey throws a clear error if encrypted secrets are read/written
     const unconfiguredCipherStore = new FirestoreServerStore({
-      db: fakeDb
+      db: fakeDb,
+      policy: secretsPolicy
     });
     await expect(unconfiguredCipherStore.updateUserSecrets("u-1", { geminiKey: "fail" })).rejects.toThrow(
       /configure 'encryptionKey', 'cipher', or MASTER_ENCRYPTION_KEY/
@@ -2316,10 +2322,10 @@ describe("lanyard/server unit tests", () => {
       },
       secretCapabilities: {
         // Coordinator can connect/disconnect their own Gmail/Calendar OAuth tokens, and a lead can also manage them
-        gmailRefreshToken: { write: "manage:oauth_secrets", allowSelfWrite: true },
-        calendarRefreshToken: { write: "manage:oauth_secrets", allowSelfWrite: true },
+        gmailRefreshToken: { capability: "manage:oauth_secrets", self: true },
+        calendarRefreshToken: { capability: "manage:oauth_secrets", self: true },
         // Only a lead with manage:oauth_secrets (not self-coordinator) can set managedBotToken
-        managedBotToken: { write: "manage:oauth_secrets", allowSelfWrite: false }
+        managedBotToken: { capability: "manage:oauth_secrets" }
       }
     });
 
@@ -2330,7 +2336,7 @@ describe("lanyard/server unit tests", () => {
       Record<string, any>,
       Record<string, any>,
       ScopeMemberSecrets
-    >();
+    >({ policy });
     const adminAuth = createFakeAdminAuth();
     const server = createLanyardServer<
       ScopeRole,
@@ -2361,7 +2367,7 @@ describe("lanyard/server unit tests", () => {
       roles: ["lead"]
     });
 
-    // 1. Coordinator A can write and clear their own `gmailRefreshToken` (`allowSelfWrite: true`)
+    // 1. Coordinator A can write and clear their own `gmailRefreshToken` (`self: true`)
     const statusAfterSelfWrite = await server.updateUserSecrets({
       scopeId: "camp-1",
       actor: coordA,
@@ -2380,7 +2386,7 @@ describe("lanyard/server unit tests", () => {
       gmailRefreshToken: "1//0g-refresh-token-a"
     });
 
-    // 2. Coordinator A CANNOT write `managedBotToken` on themselves (`allowSelfWrite: false`)
+    // 2. Coordinator A CANNOT write `managedBotToken` on themselves (no `self`)
     await expect(
       server.updateUserSecrets({
         scopeId: "camp-1",
@@ -2481,6 +2487,7 @@ describe("lanyard/server unit tests", () => {
     delete process.env.MASTER_ENCRYPTION_KEY;
     try {
       const storeWithoutKey = new FirestoreServerStore({
+        policy: createPermissionPolicy({ roles: { member: { capabilities: [] } }, secretCapabilities: { apiKey: {} } }),
         db: {
           doc: () => ({
             get: async () => ({ exists: false, data: () => ({}) }),
@@ -2574,7 +2581,8 @@ describe("lanyard/server unit tests", () => {
       attributeCapabilities: {
         points: "write:users",
         vipTier: { write: "write:users" }
-      }
+      },
+      secretCapabilities: { apiKey: {} }
     });
 
     const adminAuth = createFakeAdminAuth();
@@ -2587,7 +2595,7 @@ describe("lanyard/server unit tests", () => {
       UserAttrs,
       { note: string },
       { apiKey: string }
-    >();
+    >({ policy });
     const server = createLanyardServer<
       UserRole,
       UserCap,
