@@ -1690,9 +1690,10 @@ export function createLanyardServer<
    * - When `scopeId === GLOBAL_SCOPE`: deletes `users/{targetUid}`, its private subdocuments, and the Firebase Auth user.
    * - When `scopeId` is a tenant string: removes `{scopeCollection}/{scopeId}/{membersSubcollection}/{targetUid}`
    *   and its private subdocuments without deleting the global user or Firebase Auth account.
-   * - If `actor.uid === targetUid` (self-deletion / leaving a scope), no `userCapabilities.write` capability is required.
-   * - If `actor.uid !== targetUid` (deleting another user/member), `actor` must hold `userCapabilities.write`
-   *   in `scopeId` (or be `isSystemAdmin`), and in `GLOBAL_SCOPE` non-system admins cannot delete a `systemAdmin`.
+   * - If `actor.uid === targetUid` (self-deletion / leaving a scope), no capability is required.
+   * - If `actor.uid !== targetUid` (deleting another user/member), `actor` must hold `userCapabilities.delete` in
+   *   `scopeId` (only system admins when it isn't configured), can't delete a system admin unless they are one, and
+   *   must hold (or inherit) every role the target holds there.
    * - In all cases, `confirmTargetEmail` must match `targetUid`'s stored email address case-insensitively.
    */
   async function deleteUser(params: {
@@ -1725,7 +1726,7 @@ export function createLanyardServer<
         const resolved = await resolveEffectiveAdminStatus(params.actor);
         isAdmin = resolved.isAdmin;
         actorRecord = resolved.userRecord;
-        if (!policy.canWriteUser(resolved.userRecord, isAdmin)) {
+        if (!policy.canDeleteUser(resolved.userRecord, isAdmin)) {
           throw new Error("Forbidden: Insufficient permissions to delete user");
         }
       }
@@ -1761,7 +1762,7 @@ export function createLanyardServer<
       throw new Error(`Forbidden: Caller is not a member of scope '${params.scopeId}'`);
     }
     const isSelf = Boolean(actorMember && actorUid === params.targetUid);
-    if (!isSelf && !policy.canWriteUser(actorMember, isAdmin)) {
+    if (!isSelf && !policy.canDeleteUser(actorMember, isAdmin)) {
       throw new Error(`Forbidden: Insufficient permissions to delete member in scope '${params.scopeId}'`);
     }
 

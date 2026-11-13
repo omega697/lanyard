@@ -2575,7 +2575,9 @@ describe("lanyard/server unit tests", () => {
       userCapabilities: {
         read: "read:users",
         write: "write:users",
-        assignRoles: "assign:roles"
+        assignRoles: "assign:roles",
+        // Deleting is its own capability (admin-only unless granted); this app lets user writers delete too
+        delete: "write:users"
       },
       staffCapability: "read:vip_tier",
       attributeCapabilities: {

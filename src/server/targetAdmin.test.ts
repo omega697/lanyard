@@ -12,7 +12,7 @@ type Role = "member" | "staff";
 type Cap = "manage";
 const policy = createPermissionPolicy<Role, Cap>({
   roles: { member: { capabilities: [] }, staff: { inherits: ["member"], capabilities: ["manage"] } },
-  userCapabilities: { write: "manage", assignRoles: "manage" }
+  userCapabilities: { write: "manage", assignRoles: "manage", delete: "manage" }
 });
 
 function fakeAdminAuth(claims: Record<string, Record<string, any>>) {

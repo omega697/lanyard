@@ -406,7 +406,8 @@ describe.skipIf(!emulatorsAvailable)(
         },
         userCapabilities: {
           read: "read:scanner_log",
-          write: "write:badges"
+          write: "write:badges",
+          delete: "write:badges"
         },
         // Holders of 'read:merch' (merch_seller, auditor, moderator) are staff: they read attributes/hiddenAttributes tiers
         staffCapability: "read:merch",
@@ -2761,7 +2762,7 @@ ${generateFirestoreRules(createPermissionPolicy({}), { usersCollection, metaColl
       type Role = "member" | "staff";
       const policy = createPermissionPolicy<Role, "manage">({
         roles: { member: { capabilities: [] }, staff: { inherits: ["member"], capabilities: ["manage"] } },
-        userCapabilities: { write: "manage" }
+        userCapabilities: { write: "manage", delete: "manage" }
       });
       const store = new FirestoreServerStore<Role, "manage">({
         db: adminDb,

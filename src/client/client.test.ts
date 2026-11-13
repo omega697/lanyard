@@ -231,6 +231,48 @@ describe("lanyard/client unit tests", () => {
     expect(authUsersObserved).toEqual([null, "u-1", "u-admin", null]);
   });
 
+  it("canDeleteUser follows userCapabilities.delete in each scope, and is admin-only without it", async () => {
+    const policy = createPermissionPolicy<TestRole, TestCap>({
+      capabilities: TEST_CAPS,
+      roles: {
+        owner: { inherits: ["manager"], capabilities: "*" },
+        manager: { inherits: ["member"], capabilities: ["invite_members"] },
+        member: { capabilities: [] }
+      },
+      userCapabilities: { write: "edit_content", delete: "invite_members" }
+    });
+    const store = new InMemoryLanyardStore<TestRole, TestCap, TestPrefs>({ policy });
+    await store.upsertUser({ uid: "u-del", email: "del@example.com", roles: ["member"] });
+    await store.upsertScopeMember("ws-1", { uid: "u-del", email: "del@example.com", roles: ["manager"] });
+    const user = {
+      uid: "u-del",
+      email: "del@example.com",
+      emailVerified: true,
+      displayName: "Del",
+      photoUrl: null,
+      isAdmin: false,
+      providerIds: ["password"]
+    };
+    const client = createLanyardClient<TestRole, TestCap, TestPrefs>({
+      store,
+      policy,
+      defaultPreferences: DEFAULT_PREFS
+    });
+    client.setActiveUser(user);
+    // A manager in ws-1 may remove members there, but holds no global role that deletes accounts
+    expect(client.canDeleteUser("ws-1")).toBe(true);
+    expect(client.canDeleteUser(GLOBAL_SCOPE)).toBe(false);
+    expect(client.canDeleteUser("ws-other")).toBe(false);
+    client.destroy();
+
+    const noPolicy = createLanyardClient<TestRole, TestCap, TestPrefs>({ store, defaultPreferences: DEFAULT_PREFS });
+    noPolicy.setActiveUser(user);
+    expect(noPolicy.canDeleteUser("ws-1")).toBe(false);
+    noPolicy.setActiveUser({ ...user, isAdmin: true });
+    expect(noPolicy.canDeleteUser(GLOBAL_SCOPE)).toBe(true);
+    noPolicy.destroy();
+  });
+
   it("waits for Firebase to restore a saved session before completing a magic link, so it never replaces it", async () => {
     const store = new InMemoryLanyardStore<TestRole, TestCap, TestPrefs>();
     const restoredUser = {

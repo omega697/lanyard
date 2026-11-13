@@ -37,6 +37,18 @@
 
 ### Breaking changes
 
+- **Deleting users has its own capability, `userCapabilities.delete`, admin-only unless configured.** `deleteUser` used
+  to require only `userCapabilities.write`, so anyone allowed to edit profiles could delete another user's Firebase
+  account and all their data (globally) or remove a member along with that scope's secrets, hidden attributes and
+  preferences, none of which can be undone. Now deleting someone else, or removing them from a scope, requires
+  `delete`, checked like every capability against the actor's roles in that scope: a role that may remove members from
+  a scope doesn't thereby delete accounts, which takes a global role holding it. Without `delete`, only system admins
+  can. Deleting yourself and leaving a scope still need no capability, and the string shorthand for `userCapabilities`
+  doesn't grant `delete`. New `policy.canDeleteUser` and client `canDeleteUser(scopeId)`.
+
+  **Migrating:** if non-admins delete users or remove members through `deleteUser`, set `userCapabilities.delete` to the
+  capability that should allow it.
+
 - **The verified-email sync also updates scope memberships.** When `checkAuth` sees a user's verified email change, it
   now writes the new address to each of their scope memberships, then calls `onVerifiedEmailChange`, then updates
   their global record, so staff see the current address and scoped `deleteUser` confirms against it. (Member emails
@@ -85,7 +97,7 @@
   - peers of equal rank may grant and remove each other's role.
 
   Rank comes only from `inherits`, never from matching capabilities, and `capabilities: "*"` doesn't imply it. When
-  `assignRoles` or `write` is configured, `createPermissionPolicy` throws if a `"*"` role can't reach every other
+  `assignRoles`, `write` or `delete` is configured, `createPermissionPolicy` throws if a `"*"` role can't reach every other
   concrete role that isn't ranked above it (so two unrelated concrete `"*"` roles must be ordered by having one inherit
   the other; a role that inherits a `"*"` role, like a superowner above owner, is fine).
   New role flag `systemManaged: true` marks roles trusted server code owns (such as a roster-synced `volunteer`):
@@ -96,8 +108,8 @@
   return every concrete role).
 
   **Migrating:** make any role that should hand out, edit or delete holders of another role inherit it (directly or
-  through another role); this includes "side" staff roles that hold `userCapabilities.write` but sit outside the
-  hierarchy, which can no longer edit or delete people holding roles they don't. Pass a scope to
+  through another role); this includes "side" staff roles that hold `userCapabilities.write` or `delete` but sit
+  outside the hierarchy, which can no longer edit or delete people holding roles they don't. Pass a scope to
   `client.getAssignableRoles`, and mark roles that only server code assigns as `systemManaged`.
 
 - **Secrets are closed-world: only keys declared in `secretCapabilities` exist.** Before:
@@ -154,7 +166,7 @@
   `isAdmin` is whatever the refreshed claim says.
 
 - **Non-admins can't manage system admins, judged by the Firebase claim.** The guards that stop a non-admin with
-  `userCapabilities.write` / `assignRoles` from editing, re-roling or deleting a system admin used to check the
+  `userCapabilities.write` / `assignRoles` (and now `delete`) from editing, re-roling or deleting a system admin used to check the
   store's `isSystemAdmin` flag, and only in `GLOBAL_SCOPE`. So an admin whose record lacked the flag (for example one
   promoted in the Firebase console or by a script) could be edited, re-roled, or deleted (including their Firebase
   Auth account) by staff, and the scoped paths had no guard at all.

@@ -24,7 +24,7 @@ const roles = {
   coordinator: { inherits: ["scanner"] as Role[], capabilities: ["assign_roles", "manage"] as Cap[] },
   owner: { inherits: ["coordinator", "greeter", "lead"] as Role[], capabilities: "*" as const }
 };
-const userCapabilities = { assignRoles: "assign_roles" as Cap, write: "manage" as Cap };
+const userCapabilities = { assignRoles: "assign_roles" as Cap, write: "manage" as Cap, delete: "manage" as Cap };
 
 function fakeAdminAuth(admins: string[] = []) {
   return {

@@ -98,8 +98,9 @@ export interface RoleDefinition<TRole extends string = string, TCapability exten
 }
 
 /**
- * Specifies the required capabilities for reading, updating/deleting, or assigning roles on user records.
- * If a string `TCapability` is passed directly, it gates `read`, `write`, and `assignRoles`.
+ * Specifies the required capabilities for reading, updating, deleting, or assigning roles on user records.
+ * If a string `TCapability` is passed directly, it gates `read`, `write`, and `assignRoles`, but never `delete`:
+ * deleting is irreversible, so it's admin-only unless granted explicitly.
  */
 export type UserCapabilitiesRule<TCapability extends string = string> =
   | TCapability
@@ -107,6 +108,12 @@ export type UserCapabilitiesRule<TCapability extends string = string> =
       read?: TCapability;
       write?: TCapability;
       assignRoles?: TCapability;
+      /**
+       * Who may delete other users: the global `deleteUser` removes their Firebase account and all their data, a scoped
+       * one removes their membership and that scope's private data. Checked against the actor's roles in that scope.
+       * Omitted means only system admins.
+       */
+      delete?: TCapability;
     };
 
 /**
@@ -275,8 +282,9 @@ export interface PermissionPolicyConfig<TRole extends string = string, TCapabili
    */
   defaultRoles?: readonly TRole[];
   /**
-   * Optional capability rule governing who can read, write (update profile/delete), or assign roles (`assignRoles`)
-   * on other users' records (beyond global system admins). `self` can always read and update their own profile/account.
+   * Optional capability rule governing who can read, write (update profiles), delete, or assign roles (`assignRoles`)
+   * on other users' records (beyond global system admins). `self` can always read and update their own profile/account,
+   * and delete it or leave a scope.
    */
   userCapabilities?: UserCapabilitiesRule<TCapability>;
   /**
@@ -343,6 +351,7 @@ export interface PermissionPolicy<TRole extends string = string, TCapability ext
     read?: TCapability;
     write?: TCapability;
     assignRoles?: TCapability;
+    delete?: TCapability;
   }>;
   /** Capability identifying scope staff (`undefined` means only system admins are staff). */
   readonly staffCapability: TCapability | undefined;
@@ -450,10 +459,17 @@ export interface PermissionPolicy<TRole extends string = string, TCapability ext
   ): boolean;
 
   /**
-   * Evaluates whether the caller can write (update profile or delete) another user/member record.
+   * Evaluates whether the caller can update another user/member's profile.
    * Returns `true` if `isSystemAdmin = true` or the caller holds the `write` capability configured in `userCapabilities`.
    */
   canWriteUser(actor: PolicySubject<TRole, TCapability> | null | undefined, isSystemAdmin?: boolean): boolean;
+
+  /**
+   * Evaluates whether the caller can delete another user (or remove a member from a scope). Returns `true` if
+   * `isSystemAdmin = true` or the caller holds the `delete` capability configured in `userCapabilities` (only admins
+   * when it isn't configured).
+   */
+  canDeleteUser(actor: PolicySubject<TRole, TCapability> | null | undefined, isSystemAdmin?: boolean): boolean;
 
   /**
    * Evaluates whether the caller can assign or modify roles on a user/member record.

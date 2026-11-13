@@ -1345,7 +1345,7 @@ export function createLanyardClient<
   }
 
   /**
-   * Checks whether the current user can write (update/delete) another user/member record
+   * Checks whether the current user can update another user/member's profile
    * within `scopeId` (`GLOBAL_SCOPE` or tenant `string`).
    */
   function canWriteUser(scopeId: ScopeId): boolean {
@@ -1356,6 +1356,21 @@ export function createLanyardClient<
     const subject = resolveTargetSubject(scopeId);
     if (!policy) return isAdmin;
     return policy.canWriteUser(subject, isAdmin);
+  }
+
+  /**
+   * Checks whether the current user holds the capability to delete other users (`GLOBAL_SCOPE`) or remove members from
+   * `scopeId`. It doesn't consider a particular target: the server also refuses targets who outrank them or are admins,
+   * and requires the target's email as confirmation.
+   */
+  function canDeleteUser(scopeId: ScopeId): boolean {
+    const currentUser = authStoreInternal.get().user;
+    if (!currentUser) return false;
+    if (scopeId !== GLOBAL_SCOPE && !isValidResourceId(scopeId)) return false;
+    const isAdmin = Boolean(currentUser.isAdmin);
+    const subject = resolveTargetSubject(scopeId);
+    if (!policy) return isAdmin;
+    return policy.canDeleteUser(subject, isAdmin);
   }
 
   /**
@@ -1744,6 +1759,7 @@ export function createLanyardClient<
     getPreferences,
     canReadUser,
     canWriteUser,
+    canDeleteUser,
     canAssignRoles,
     canReadAttribute,
     canWriteAttribute,

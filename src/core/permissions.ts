@@ -27,6 +27,7 @@ interface NormalizedUserRule<TCapability extends string> {
   read?: TCapability;
   write?: TCapability;
   assignRoles?: TCapability;
+  delete?: TCapability;
 }
 
 interface NormalizedSecretRule<TCapability extends string> {
@@ -265,6 +266,9 @@ export function createPermissionPolicy<TRole extends string = string, TCapabilit
           : {}),
         ...(config.userCapabilities.assignRoles && isSafeKey(config.userCapabilities.assignRoles)
           ? { assignRoles: config.userCapabilities.assignRoles }
+          : {}),
+        ...(config.userCapabilities.delete && isSafeKey(config.userCapabilities.delete)
+          ? { delete: config.userCapabilities.delete }
           : {})
       });
     }
@@ -273,7 +277,7 @@ export function createPermissionPolicy<TRole extends string = string, TCapabilit
   // When non-admins can assign roles or manage users, rank (which comes only from `inherits`) limits whom they can act
   // on. A role with every capability is clearly meant to be top rank, so refuse one that couldn't assign or manage some
   // role rather than letting those actions fail at runtime.
-  if (userRule.assignRoles || userRule.write) {
+  if (userRule.assignRoles || userRule.write || userRule.delete) {
     for (const role of wildcardRoles) {
       if (rawRoles[role].abstract) continue;
       for (const [other, def] of entries) {
@@ -382,6 +386,7 @@ export function createPermissionPolicy<TRole extends string = string, TCapabilit
   registerReferencedCapability(userRule.read);
   registerReferencedCapability(userRule.write);
   registerReferencedCapability(userRule.assignRoles);
+  registerReferencedCapability(userRule.delete);
   registerReferencedCapability(staffCapability);
   if (typeof cardVisibility === "object") {
     registerReferencedCapability(cardVisibility.capability);
@@ -518,6 +523,12 @@ export function createPermissionPolicy<TRole extends string = string, TCapabilit
     if (isSystemAdmin) return true;
     if (!userRule.write) return false;
     return hasCapability(actor, userRule.write, false);
+  }
+
+  function canDeleteUser(actor: PolicySubject<TRole, TCapability> | null | undefined, isSystemAdmin = false): boolean {
+    if (isSystemAdmin) return true;
+    if (!userRule.delete) return false;
+    return hasCapability(actor, userRule.delete, false);
   }
 
   function canAssignRoles(actor: PolicySubject<TRole, TCapability> | null | undefined, isSystemAdmin = false): boolean {
@@ -780,6 +791,7 @@ export function createPermissionPolicy<TRole extends string = string, TCapabilit
     shouldTrackPresence,
     canReadUser,
     canWriteUser,
+    canDeleteUser,
     canAssignRoles,
     isStaff,
     canReadTier,
