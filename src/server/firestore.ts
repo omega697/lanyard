@@ -563,6 +563,18 @@ export class FirestoreServerStore<
     await this.writeAttributesTier(cleanUid, cleanScopeId, undefined, fields.email);
   }
 
+  async listUserMembershipScopeIds(uid: string): Promise<string[]> {
+    const cleanUid = assertValidFirestoreDocId(uid, "uid");
+    // The same collection-group query the client uses for memberships, limited to this store's scope collection
+    const snap = await this.db.collectionGroup(this.membersSubcollection).where("uid", "==", cleanUid).get();
+    return (
+      snap.docs
+        // The exact top-level scope collection, not a nested collection that happens to share its name
+        .filter((doc) => doc.ref.parent.parent?.parent.path === this.scopeCollection)
+        .map((doc) => doc.ref.parent.parent!.id)
+    );
+  }
+
   async updateUserAttributes(
     uid: string,
     patch: Partial<TAttributes>

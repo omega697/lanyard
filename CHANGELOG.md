@@ -29,6 +29,19 @@
 
 ### Breaking changes
 
+- **The verified-email sync also updates scope memberships.** When `checkAuth` sees a user's verified email change, it
+  now writes the new address to each of their scope memberships, then calls `onVerifiedEmailChange`, then updates
+  their global record, so staff see the current address and scoped `deleteUser` confirms against it. (Member emails
+  used to keep whatever was written at provisioning once clients could no longer write email.) If a write fails, the
+  global record stays unchanged and the next request retries; a failure among the memberships doesn't call the hook,
+  a membership removed meanwhile is skipped, and while the hook keeps failing, retries on the same server go straight
+  to it without re-listing or re-writing memberships. Server stores must implement the new required
+  `listUserMembershipScopeIds(uid)` (`createLanyardServer` checks for it); `FirestoreServerStore` uses the same
+  collection-group query on the members subcollection as the client's membership listener, so no new index is needed,
+  and keeps only documents directly under its scope collection. Member emails that went stale before upgrading are
+  corrected the next time that user's email changes; to fix them sooner, rewrite them from the global records with
+  `patchScopeMember`.
+
 - **Stricter secret decryption.** The built-in AES-256-GCM cipher now pins the auth tag to 16 bytes (GCM otherwise
   accepts a shortened tag, as short as 4 bytes, which makes forging a secret far easier) and refuses envelopes whose IV
   isn't 24 hex characters, whose tag isn't 32, or whose ciphertext isn't even-length hex (`Buffer.from(…, "hex")`

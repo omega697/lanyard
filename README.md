@@ -612,6 +612,9 @@ class PostgresServerStore<
   async listScopeMembers(scopeId: string): Promise<ScopedMember<TRole, TCapability, TPreferences, TAttributes>[]> {
     /* ... */
   }
+  async listUserMembershipScopeIds(uid: string): Promise<string[]> {
+    /* ... the scopes uid belongs to (used to keep their verified email current everywhere) */
+  }
   async upsertScopeMember(
     scopeId: string,
     member: ScopedMember<TRole, TCapability, TPreferences, TAttributes>

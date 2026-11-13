@@ -2137,7 +2137,8 @@ ${generateFirestoreRules(createPermissionPolicy({}), { usersCollection, metaColl
         body: JSON.stringify({ rules: { files: [{ name: "firestore.rules", content: rules }] } })
       });
       expect(rulesRes.status).toBe(200);
-      const store = new FirestoreServerStore({ db: adminDb, usersCollection, metaCollection });
+      const scopeCollection = `orgs_email_change_${suffix}`;
+      const store = new FirestoreServerStore({ db: adminDb, usersCollection, metaCollection, scopeCollection });
       const events: VerifiedEmailChangeEvent[] = [];
       const server = createLanyardServer({
         adminAuth: adminAuth as any,
@@ -2161,6 +2162,12 @@ ${generateFirestoreRules(createPermissionPolicy({}), { usersCollection, metaColl
         const uid = auth.currentUser!.uid;
         expect(auth.currentUser!.providerData.map((p) => p.providerId)).toEqual(["password"]);
         await store.upsertUser({ uid, email: oldEmail, roles: [] });
+        await store.upsertScopeMember(`org-${suffix}`, { uid, email: oldEmail, roles: [] });
+        // A same-named subcollection under another app collection isn't one of this store's memberships, nor is one
+        // nested under a collection that merely shares the scope collection's name
+        await adminDb.doc(`other_app_${suffix}/x/members/${uid}`).set({ uid });
+        await adminDb.doc(`archive_${suffix}/2024/${scopeCollection}/old-org/members/${uid}`).set({ uid });
+        expect(await store.listUserMembershipScopeIds(uid)).toEqual([`org-${suffix}`]);
         expect((await runMiddleware(server.checkAuth, await auth.currentUser!.getIdToken())).nextCalled).toBe(true);
         expect(events).toEqual([]);
 
@@ -2188,6 +2195,8 @@ ${generateFirestoreRules(createPermissionPolicy({}), { usersCollection, metaColl
         expect((await runMiddleware(server.checkAuth, refreshedToken)).nextCalled).toBe(true);
         expect(events).toEqual([{ uid, email: newEmail, previousEmail: oldEmail }]);
         expect((await store.getUser(uid))?.email).toBe(newEmail);
+        // ...and on their memberships, which staff see and scoped deleteUser confirms against
+        expect((await store.getScopeMember(`org-${suffix}`, uid))?.email).toBe(newEmail);
         expect((await runMiddleware(server.checkAuth, refreshedToken)).nextCalled).toBe(true);
         expect(events).toHaveLength(1);
 

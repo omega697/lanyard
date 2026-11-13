@@ -610,6 +610,11 @@ export class InMemoryLanyardStore<
     this.notifyMembershipListeners(scopeId, uid);
   }
 
+  async listUserMembershipScopeIds(uid: string): Promise<string[]> {
+    assertValidResourceId(uid, "uid");
+    return this.getMembershipsForUser(uid).map((m) => m.scopeId!);
+  }
+
   async updateUserAttributes(
     uid: string,
     patch: Partial<TAttributes>

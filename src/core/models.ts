@@ -1095,6 +1095,8 @@ export interface LanyardServerStore<
   ): Promise<void>;
   /** Required: Like `patchUser`, for an existing member of `scopeId`; throws if they aren't a member. */
   patchScopeMember(scopeId: string, uid: string, fields: StoredProfileFieldsPatch): Promise<void>;
+  /** Required: the scopes `uid` is a member of, so the server can keep every copy of their verified email current. */
+  listUserMembershipScopeIds(uid: string): Promise<string[]>;
   /**
    * Optional: the secret keys this store accepts (from the policy it was given). If present, `createLanyardServer`
    * checks they match `policy.secretKeys`. Stores must refuse writes to any other key.

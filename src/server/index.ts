@@ -376,6 +376,11 @@ export function createLanyardServer<
       );
     }
   }
+  if (typeof (store as any).listUserMembershipScopeIds !== "function") {
+    throw new Error(
+      "Lanyard server store must implement listUserMembershipScopeIds() (the verified-email sync updates every membership)"
+    );
+  }
   for (const method of [
     "getRevocationEpoch",
     "bumpRevocationEpoch",
@@ -446,6 +451,11 @@ export function createLanyardServer<
 
   // Tracks in-flight verified email change syncs per (uid -> targetEmail) so concurrent requests don't double-fire
   const inFlightEmailSyncs = new Map<string, Promise<void>>();
+  // For each user, the email change (from their global email, to the verified one) whose memberships this server has
+  // already updated, so while onVerifiedEmailChange keeps failing, retries go straight to the hook. Matching both ends
+  // means a note left over from an earlier change (say, one another server finished) never skips a later one. One
+  // entry per user, removed once their global record is updated.
+  const membershipEmailsSynced = new Map<string, { from: string; to: string }>();
 
   // The admin status checkAuth decided for each request user it produced (verified claim plus revocation checks), keyed
   // by object identity. It's never read back from the object, so code that later sets `req.user.isAdmin` gains nothing.
@@ -554,6 +564,29 @@ export function createLanyardServer<
             const previousEmail = userRecord.email || "";
             const nextEmail = user.email.toLowerCase().trim();
             syncPromise = (async () => {
+              // Memberships first, then the hook, then the global record. The global email is what marks the sync as
+              // done, so if anything fails the next request retries; the membership writes are idempotent, and a
+              // failure among them doesn't fire the hook. Only the email is written, so a role or admin change made
+              // since userRecord was read can't be undone.
+              const synced = membershipEmailsSynced.get(user.uid);
+              if (synced?.from !== previousEmail || synced?.to !== nextEmail) {
+                const scopeIds = await store.listUserMembershipScopeIds(user.uid);
+                await Promise.all(
+                  scopeIds.map(async (scopeId) => {
+                    try {
+                      await store.patchScopeMember(scopeId, user.uid, { email: nextEmail });
+                    } catch (error) {
+                      // They left the scope since it was listed: nothing to update there
+                      const stillMember = await store.getScopeMember(scopeId, user.uid).then(
+                        (member) => member !== null,
+                        () => true
+                      );
+                      if (stillMember) throw error;
+                    }
+                  })
+                );
+                membershipEmailsSynced.set(user.uid, { from: previousEmail, to: nextEmail });
+              }
               // A record with no email yet is simply filled in: that's not a change of address
               if (previousEmail && typeof onVerifiedEmailChange === "function") {
                 await onVerifiedEmailChange({
@@ -562,8 +595,8 @@ export function createLanyardServer<
                   previousEmail
                 });
               }
-              // Only the email is written, so a role or admin change made since userRecord was read can't be undone
               await store.patchUser(user.uid, { email: nextEmail });
+              membershipEmailsSynced.delete(user.uid);
               req.userRecord = { ...userRecord, email: nextEmail };
             })().finally(() => {
               inFlightEmailSyncs.delete(syncKey);
