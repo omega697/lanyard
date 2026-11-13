@@ -1914,5 +1914,200 @@ service cloud.firestore {
         await deleteClientApp(app);
       }
     }, 30_000);
+
+    // --- Known vulnerabilities, reproduced with real Auth emulator tokens ---
+    // Each test asserts the SECURE outcome and is marked `it.fails` while the attack still works. The commit that
+    // fixes a vulnerability must flip its test to `it`, so a fix that doesn't stop the attack can't land. `it.fails`
+    // also passes when a test breaks for an unrelated reason, so run with LANYARD_SHOW_VULNERABILITIES=1 to execute
+    // them as ordinary tests and confirm each fails at its secure-outcome assertion.
+    const knownVulnerability = process.env.LANYARD_SHOW_VULNERABILITIES ? it : it.fails;
+
+    async function signInEmulatorUser(uid: string, email: string, claims?: Record<string, unknown>) {
+      await adminAuth.createUser({ uid, email, emailVerified: true });
+      if (claims) await adminAuth.setCustomUserClaims(uid, claims);
+      const app = initializeClientApp({ projectId, apiKey: "fake-api-key" }, `client-${uid}`);
+      const auth = getClientAuth(app);
+      connectAuthEmulator(auth, `http://127.0.0.1:${authEmulatorPort}`, { disableWarnings: true });
+      const db = getClientFirestore(app);
+      connectFirestoreEmulator(db, "127.0.0.1", emulatorPort);
+      const { user } = await signInWithCredential(
+        auth,
+        GoogleAuthProvider.credential(JSON.stringify({ sub: uid, email, email_verified: true }))
+      );
+      return {
+        user,
+        db,
+        async close() {
+          await terminate(db);
+          await deleteClientApp(app);
+        }
+      };
+    }
+
+    /** Runs Express-style middleware against a bearer token and reports whether it called next() and what it sent. */
+    async function runMiddleware(
+      middleware: (req: any, res: any, next: () => void) => unknown,
+      token: string,
+      req: any = {}
+    ) {
+      const outcome = { nextCalled: false, status: 200, body: undefined as any, req };
+      req.headers = { ...(req.headers || {}), authorization: `Bearer ${token}` };
+      const res: any = {
+        status(code: number) {
+          outcome.status = code;
+          return res;
+        },
+        json(body: any) {
+          outcome.body = body;
+          return res;
+        }
+      };
+      await middleware(req, res, () => {
+        outcome.nextCalled = true;
+      });
+      return outcome;
+    }
+
+    const crossSecondBoundary = () => new Promise((resolve) => setTimeout(resolve, 1100));
+
+    knownVulnerability(
+      "KNOWN VULNERABILITY (H1): a demoted claim-only admin's still-valid token re-promotes them permanently",
+      async () => {
+        const suffix = Date.now();
+        const store = new FirestoreServerStore({
+          db: adminDb,
+          usersCollection: `users_h1_${suffix}`,
+          metaCollection: `meta_h1_${suffix}`
+        });
+        const server = createLanyardServer({ adminAuth: adminAuth as any, store });
+        // An admin known only by their claim (e.g. bootstrapped with a script), with no users/{uid} document
+        const victim = await signInEmulatorUser("u-h1-admin", "h1-admin@example.com", { admin: true });
+        try {
+          const staleAdminToken = await victim.user.getIdToken();
+          await server.setSystemAdminStatus({
+            email: "h1-admin@example.com",
+            isAdmin: false,
+            actor: { uid: "u-h1-other-admin", isAdmin: true }
+          });
+
+          // The demoted admin keeps using the token they already hold...
+          await runMiddleware(server.checkAuth, staleAdminToken);
+          // ...then refreshes, getting a token that correctly says admin:false
+          await crossSecondBoundary();
+          const refreshedToken = await victim.user.getIdToken(true);
+          const authed = await runMiddleware(server.checkAuth, refreshedToken);
+          expect(authed.nextCalled).toBe(true);
+          const admin = await runMiddleware(server.requireAdmin, refreshedToken, authed.req);
+
+          // Secure outcome: no longer an admin. Today the stale-token request re-created their admin record.
+          expect(admin.nextCalled).toBe(false);
+          expect(admin.status).toBe(403);
+        } finally {
+          await victim.close();
+        }
+      },
+      30_000
+    );
+
+    knownVulnerability(
+      "KNOWN VULNERABILITY (H2): setSystemAdminStatus lets a non-admin actor make themselves an admin",
+      async () => {
+        const suffix = Date.now();
+        const store = new FirestoreServerStore({
+          db: adminDb,
+          usersCollection: `users_h2_${suffix}`,
+          metaCollection: `meta_h2_${suffix}`
+        });
+        const server = createLanyardServer({ adminAuth: adminAuth as any, store });
+        await adminAuth.createUser({ uid: "u-h2-attacker", email: "h2-attacker@example.com", emailVerified: true });
+
+        // An app route that forwards the caller as the actor, without its own admin check
+        const attempt = server.setSystemAdminStatus({
+          email: "h2-attacker@example.com",
+          isAdmin: true,
+          actor: { uid: "u-h2-attacker", isAdmin: false }
+        });
+
+        // Secure outcome: rejected, and no admin claim granted. Today it succeeds.
+        await expect(attempt).rejects.toThrow();
+        expect((await adminAuth.getUser("u-h2-attacker")).customClaims?.admin).not.toBe(true);
+      },
+      30_000
+    );
+
+    knownVulnerability(
+      "KNOWN VULNERABILITY: a session revoked with revokeRefreshTokens is still accepted by checkAuth",
+      async () => {
+        const suffix = Date.now();
+        const store = new FirestoreServerStore({
+          db: adminDb,
+          usersCollection: `users_sr_${suffix}`,
+          metaCollection: `meta_sr_${suffix}`
+        });
+        const server = createLanyardServer({ adminAuth: adminAuth as any, store });
+        const signedOut = await signInEmulatorUser("u-signed-out", "signed-out@example.com");
+        try {
+          const tokenBeforeRevocation = await signedOut.user.getIdToken();
+          await adminAuth.revokeRefreshTokens("u-signed-out");
+
+          // Secure outcome: the token issued before the revocation is refused. Today it's accepted for up to an hour.
+          const outcome = await runMiddleware(server.checkAuth, tokenBeforeRevocation);
+          expect(outcome.nextCalled).toBe(false);
+          expect(outcome.status).toBe(401);
+        } finally {
+          await signedOut.close();
+        }
+      },
+      30_000
+    );
+
+    knownVulnerability(
+      "KNOWN VULNERABILITY: generated rules keep honoring a demoted admin's stale claim",
+      async () => {
+        const usersCollection = `users_rules_${Date.now()}`;
+        const rules = `rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+${generateFirestoreRules(createPermissionPolicy({}), { usersCollection })}
+  }
+}
+`;
+        const rulesRes = await fetch(
+          `http://127.0.0.1:${emulatorPort}/emulator/v1/projects/${projectId}:securityRules`,
+          {
+            method: "PUT",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ rules: { files: [{ name: "firestore.rules", content: rules }] } })
+          }
+        );
+        expect(rulesRes.status).toBe(200);
+        await adminDb.doc(`${usersCollection}/u-rules-victim/private/preferences`).set({ theme: "dark" });
+
+        const store = new FirestoreServerStore({
+          db: adminDb,
+          usersCollection,
+          metaCollection: `meta_rules_${Date.now()}`
+        });
+        const server = createLanyardServer({ adminAuth: adminAuth as any, store });
+        const demoted = await signInEmulatorUser("u-rules-admin", "rules-admin@example.com", { admin: true });
+        try {
+          // As an admin they can read another user's private preferences
+          await clientGetDoc(clientDoc(demoted.db, `${usersCollection}/u-rules-victim/private/preferences`));
+          await server.setSystemAdminStatus({
+            email: "rules-admin@example.com",
+            isAdmin: false,
+            actor: { uid: "u-rules-other-admin", isAdmin: true }
+          });
+
+          // Secure outcome: denied right after demotion. Today the stale claim keeps working for up to an hour.
+          await expect(
+            clientGetDoc(clientDoc(demoted.db, `${usersCollection}/u-rules-victim/private/preferences`))
+          ).rejects.toMatchObject({ code: "permission-denied" });
+        } finally {
+          await demoted.close();
+        }
+      },
+      30_000
+    );
   }
 );
