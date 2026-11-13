@@ -29,6 +29,23 @@
 
 ### Breaking changes
 
+- **The Firebase `admin` claim is the only admin authority.** Admin status used to be resolved from the store first
+  (`users/{uid}.isSystemAdmin`, then `system_admins`) with the token claim as a fallback, and `checkAuth`/`requireAdmin`
+  auto-provisioned an admin record (`syncAdminProfileIfNeeded`) for anyone they judged an admin. Together those let a
+  demoted admin's still-valid token re-create their admin record and undo the demotion permanently. Now:
+  - `checkAuth` takes `req.user.isAdmin` from the verified token claim (kept current by the revocation checks) and
+    never reads or writes admin records; admin status no longer depends on the store being reachable;
+  - `requireAdmin` trusts `req.user.isAdmin` only on a `req.user` that `checkAuth` verified; for any other object it asks
+    Firebase for the user's current claim (`AdminAuthAdapter.getUser`, newly optional) and fails closed if it can't;
+  - actor-based server methods do the same: `actor.isAdmin` on a hand-built actor is ignored in favor of the user's
+    current Firebase claim (pass `req.user` to avoid the lookup);
+  - `setSystemAdminStatus` demotions bump the revocation epoch after changing the claim, so the demoted user's existing
+    `admin: true` tokens are refused as stale immediately.
+
+  Store admin records (`isSystemAdmin`, `system_admins`) remain as a directory for listing admins, written only by
+  `setSystemAdminStatus`; they grant nothing. This supersedes the store-based fail-closed admin check from earlier in
+  this release: admin checks no longer touch the store at all.
+
 - **`checkAuth` enforces revocations, and requires token times.** It now rejects, before any store lookup:
   - tokens from a session revoked after the user signed in (`auth_time` at or before the user's session revocation):
     `401 { error, code: "auth/session-revoked" }` (`SESSION_REVOKED_ERROR_CODE`); the user must sign in again;

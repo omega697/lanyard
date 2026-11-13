@@ -105,6 +105,8 @@ export interface AdminAuthAdapter {
   deleteUser?(uid: string): Promise<void>;
   /** Revokes the user's refresh tokens (required by `revokeUserSessions`). */
   revokeRefreshTokens?(uid: string): Promise<void>;
+  /** Reads a user's current custom claims (used to check admin status of actors not verified by `checkAuth`). */
+  getUser?(uid: string): Promise<{ uid: string; customClaims?: Record<string, any> | null }>;
 }
 
 /**
@@ -363,54 +365,42 @@ export function createLanyardServer<
   // Tracks in-flight verified email change syncs per (uid -> targetEmail) so concurrent requests don't double-fire
   const inFlightEmailSyncs = new Map<string, Promise<void>>();
 
+  // Users whose admin claim checkAuth verified (token signature plus revocation checks); their isAdmin is trustworthy
+  const verifiedUsers = new WeakSet<object>();
+
+  /** Whether Firebase currently gives `uid` the admin claim. Fails closed if it can't be confirmed. */
+  async function firebaseClaimIsAdmin(uid: string): Promise<boolean> {
+    if (typeof adminAuth.getUser !== "function") return false;
+    try {
+      const record = await adminAuth.getUser(uid);
+      return record?.customClaims?.admin === true;
+    } catch {
+      return false;
+    }
+  }
+
   /**
-   * Resolves whether an actor is an active system admin, guarding against stale 1-hour JWT custom claims
-   * when the user has been explicitly demoted (`isSystemAdmin === false` on their `users/{uid}` record).
+   * Whether an actor is a system admin. The Firebase `admin` claim is the only authority: for a `req.user` verified by
+   * `checkAuth` that's its token claim (kept current by the revocation checks); for any other actor object, whose
+   * `isAdmin` can't be trusted, it's the user's current claim from Firebase.
    */
-  async function resolveEffectiveAdminStatus(actor: LanyardActor): Promise<{
-    isAdmin: boolean;
-    userRecord: UserRecord<TRole, TCapability, TPreferences, TAttributes> | null;
-  }> {
+  async function isActorAdmin(actor: LanyardActor): Promise<boolean> {
     if (!actor || typeof actor !== "object") {
       throw new Error("Invalid actor: actor object with uid is required");
     }
     assertValidResourceId(actor.uid, "actor.uid");
-
-    const userRecord = typeof store.getUser === "function" ? await store.getUser(actor.uid) : null;
-    if (userRecord && userRecord.isSystemAdmin === false) {
-      // Explicitly demoted in the backing store: immediately revoke admin privileges even if JWT hasn't expired
-      return { isAdmin: false, userRecord };
-    }
-    if (userRecord?.isSystemAdmin === true) {
-      return { isAdmin: true, userRecord };
-    }
-    const sysAdmin = await store.getSystemAdmin(actor.uid);
-    if (sysAdmin?.isSystemAdmin !== false && sysAdmin !== null) {
-      return { isAdmin: true, userRecord };
-    }
-    return { isAdmin: Boolean(actor.isAdmin), userRecord };
+    if (verifiedUsers.has(actor)) return actor.isAdmin === true;
+    return firebaseClaimIsAdmin(actor.uid);
   }
 
-  async function syncAdminProfileIfNeeded(user: AuthenticatedUser): Promise<void> {
-    const existing = await store.getSystemAdmin(user.uid);
-    if (!existing) {
-      await store.upsertSystemAdmin({
-        uid: user.uid,
-        email: user.email.toLowerCase().trim(),
-        displayName: user.name || user.email,
-        photoUrl: user.photoUrl || null,
-        isSystemAdmin: true,
-        addedBy: "auto-provision",
-        createdAt: new Date().toISOString(),
-        updatedAt: new Date().toISOString()
-      });
-    } else if (user.photoUrl && existing.photoUrl !== user.photoUrl) {
-      await store.upsertSystemAdmin({
-        ...existing,
-        photoUrl: user.photoUrl,
-        updatedAt: new Date().toISOString()
-      });
-    }
+  /** Resolves an actor's admin status (see `isActorAdmin`) along with their global user record. */
+  async function resolveEffectiveAdminStatus(actor: LanyardActor): Promise<{
+    isAdmin: boolean;
+    userRecord: UserRecord<TRole, TCapability, TPreferences, TAttributes> | null;
+  }> {
+    const isAdmin = await isActorAdmin(actor);
+    const userRecord = typeof store.getUser === "function" ? await store.getUser(actor.uid) : null;
+    return { isAdmin, userRecord };
   }
 
   function assertValidScopeId(scopeId: ScopeId): void {
@@ -435,12 +425,10 @@ export function createLanyardServer<
         return res.status(rejection.status).json(rejection.body);
       }
       try {
-        const { isAdmin, userRecord } = await resolveEffectiveAdminStatus(user);
-        user.isAdmin = isAdmin;
+        // Admin status is the verified token's claim, kept current by the revocation checks above; nothing here
+        // consults or writes admin records, so a stale record or claim can't override a demotion
+        const userRecord = typeof store.getUser === "function" ? await store.getUser(user.uid) : null;
         req.userRecord = userRecord;
-        if (isAdmin) {
-          await syncAdminProfileIfNeeded(user);
-        }
         if (
           user.email &&
           user.emailVerified === true &&
@@ -478,10 +466,10 @@ export function createLanyardServer<
           await syncPromise;
         }
       } catch {
-        // If the backing store is unreachable, the caller is still authenticated by their verified token, but admin
-        // can't be confirmed (a demotion may not be reflected in a still-valid token claim), so fail closed on admin
-        user.isAdmin = false;
+        // If the backing store is unreachable, the caller is still authenticated, and admin status doesn't depend on it
       }
+      user.isAdmin = Boolean(user.isAdmin);
+      verifiedUsers.add(user);
       req.user = user;
       next();
     } catch (error: unknown) {
@@ -498,26 +486,11 @@ export function createLanyardServer<
       return res.status(403).json({ error: "Forbidden: Administrative access required" });
     }
 
-    let resolved: Awaited<ReturnType<typeof resolveEffectiveAdminStatus>>;
-    try {
-      resolved = await resolveEffectiveAdminStatus(req.user);
-    } catch {
-      // If the store can't be read, demotion can't be ruled out, so never fall back to the token's admin claim
-      req.user.isAdmin = false;
-      return res.status(503).json({ error: "Service unavailable: unable to verify administrative access" });
-    }
-    if (!resolved.isAdmin) {
+    if (!(await isActorAdmin(req.user))) {
       req.user.isAdmin = false;
       return res.status(403).json({ error: "Forbidden: Administrative access required" });
     }
     req.user.isAdmin = true;
-    req.userRecord = resolved.userRecord;
-    try {
-      await syncAdminProfileIfNeeded(req.user);
-    } catch {
-      // Mirroring the admin profile is best-effort; admin status was already confirmed against the store above
-    }
-
     next();
   }
 
@@ -808,6 +781,12 @@ export function createLanyardServer<
     }
 
     await adminAuth.setCustomUserClaims(uid, { ...existingClaims, admin: isAdmin });
+
+    if (!isAdmin) {
+      // The claim is the admin authority, so a demotion must supersede the user's existing admin:true tokens right
+      // away: bump the revocation epoch (after the claim change, so refreshed tokens carry admin:false)
+      revocationEpoch.set(await store.bumpRevocationEpoch(Date.now()));
+    }
 
     if (isAdmin) {
       const existing =

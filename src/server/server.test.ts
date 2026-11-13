@@ -159,6 +159,8 @@ function createFakeAdminAuth(): FakeAdminAuth {
     const now = Math.floor(Date.now() / 1000);
     return { iat: now, auth_time: now - 60, ...(await verifyClaims(idToken)) };
   };
+  // Like Firebase, reports each user's current custom claims (the admin authority for actors checkAuth didn't verify)
+  fake.getUser = async (uid: string) => ({ uid, customClaims: claimsByUid.get(uid) ?? null });
   return fake;
 }
 
@@ -229,7 +231,7 @@ describe("lanyard/server unit tests", () => {
     expect(lenientUser?.emailVerified).toBe(false);
   });
 
-  it("authenticates but does not grant admin from the token claim in checkAuth when the backing store throws", async () => {
+  it("keeps the verified admin claim in checkAuth when the backing store throws: admin status doesn't depend on the store", async () => {
     const store = new InMemoryLanyardStore<TestRole, TestCap>();
     const server = createLanyardServer<TestRole, TestCap>({
       adminAuth: createFakeAdminAuth(),
@@ -245,7 +247,7 @@ describe("lanyard/server unit tests", () => {
     });
 
     expect(nextCalled).toBe(true);
-    expect(req.user).toMatchObject({ uid: "u-admin-claim", isAdmin: false });
+    expect(req.user).toMatchObject({ uid: "u-admin-claim", isAdmin: true });
   });
 
   it("omits the email-not-verified code from other checkAuth rejections", async () => {
@@ -428,15 +430,17 @@ describe("lanyard/server unit tests", () => {
     await server.checkAuth({ headers: { authorization: "Bearer invalid-token" } } as any, resBadHeader, () => {});
     expect(resBadHeader.statusCode).toBe(401);
 
-    // requireAdmin rejects non-admin (403) and auto-seeds brand-new admin
+    // requireAdmin rejects non-admins (403). For a req.user that checkAuth didn't verify it ignores req.user.isAdmin and
+    // asks Firebase for the current claim, and it never writes admin records.
     const resNonAdmin = createMockRes();
     await server.requireAdmin(
-      { user: { uid: "u1", email: "u1@example.com", isAdmin: false } } as any,
+      { user: { uid: "u1", email: "u1@example.com", isAdmin: true } } as any,
       resNonAdmin,
       () => {}
     );
     expect(resNonAdmin.statusCode).toBe(403);
 
+    adminAuth.claimsByUid.set("u-new-admin", { admin: true });
     let adminNext = false;
     await server.requireAdmin(
       {
@@ -444,8 +448,7 @@ describe("lanyard/server unit tests", () => {
           uid: "u-new-admin",
           email: "newadmin@example.com",
           name: "New Admin",
-          photoUrl: "https://example.com/newadmin.png",
-          isAdmin: true
+          photoUrl: "https://example.com/newadmin.png"
         }
       } as any,
       createMockRes(),
@@ -454,28 +457,7 @@ describe("lanyard/server unit tests", () => {
       }
     );
     expect(adminNext).toBe(true);
-    expect((await store.getSystemAdmin("u-new-admin"))?.photoUrl).toBe("https://example.com/newadmin.png");
-
-    // Pre-existing admin gets photoUrl updated on requireAdmin
-    await store.upsertSystemAdmin({
-      uid: "u-pre-admin",
-      email: "preadmin@example.com",
-      displayName: "Pre Admin",
-      photoUrl: null
-    });
-    await server.requireAdmin(
-      {
-        user: {
-          uid: "u-pre-admin",
-          email: "preadmin@example.com",
-          photoUrl: "https://example.com/admin-oauth.png",
-          isAdmin: true
-        }
-      } as any,
-      createMockRes(),
-      () => {}
-    );
-    expect((await store.getSystemAdmin("u-pre-admin"))?.photoUrl).toBe("https://example.com/admin-oauth.png");
+    expect(await store.getSystemAdmin("u-new-admin")).toBeNull();
 
     await store.upsertScopeMember("ws-1", {
       uid: "u-inviter",
@@ -813,6 +795,8 @@ describe("lanyard/server unit tests", () => {
 
   it("enforces cross-scope authorization isolation, capability revocation, and custom scopeParamName", async () => {
     const adminAuth = createFakeAdminAuth();
+    // The system admin below is a hand-built req.user, so its admin status comes from its Firebase claim
+    adminAuth.claimsByUid.set("u-sysadmin", { admin: true });
     const store = new InMemoryLanyardStore<TestRole, TestCap>();
     const server = createLanyardServer<TestRole, TestCap>({
       adminAuth,
@@ -1042,9 +1026,9 @@ describe("lanyard/server unit tests", () => {
     ).rejects.toThrow(/role is not defined in policy\.roles/);
   });
 
-  it("covers fail-closed requireAdmin store errors, requireCapability 500 sanitization, and FirestoreServerStore photoUrl sanitization", async () => {
-    // 1. requireAdmin denies (503, never calls next()) when the backing directory store throws, even if the token
-    //    carries an admin claim: a stale claim must not grant admin while demotion can't be checked
+  it("covers store-independent requireAdmin, requireCapability 500 sanitization, and FirestoreServerStore photoUrl sanitization", async () => {
+    // 1. requireAdmin doesn't depend on the store: with the store failing, a hand-built req.user is judged by its
+    //    current Firebase claim (never by req.user.isAdmin), and a store record saying "admin" grants nothing
     const adminAuth = createFakeAdminAuth();
     const store = new InMemoryLanyardStore<TestRole, TestCap>();
     const server = createLanyardServer<TestRole, TestCap>({
@@ -1053,32 +1037,36 @@ describe("lanyard/server unit tests", () => {
       policy: TEST_POLICY
     });
 
-    vi.spyOn(store, "getSystemAdmin").mockRejectedValueOnce(new Error("Transient directory outage"));
+    vi.spyOn(store, "getSystemAdmin").mockRejectedValue(new Error("Transient directory outage"));
+    vi.spyOn(store, "getUser").mockRejectedValue(new Error("Transient directory outage"));
+    adminAuth.claimsByUid.set("u-admin", { admin: true });
     let adminProceeded = false;
-    const adminRes = createMockRes();
-    await server.requireAdmin(
-      { user: { uid: "u-admin", email: "admin@example.com", isAdmin: true } } as any,
-      adminRes,
-      () => {
-        adminProceeded = true;
-      }
-    );
-    expect(adminProceeded).toBe(false);
-    expect(adminRes.statusCode).toBe(503);
-    expect(adminRes.body).toEqual({ error: "Service unavailable: unable to verify administrative access" });
+    await server.requireAdmin({ user: { uid: "u-admin", email: "admin@example.com" } } as any, createMockRes(), () => {
+      adminProceeded = true;
+    });
+    expect(adminProceeded).toBe(true);
 
-    // 1b. ...but once admin is confirmed against the store, a failing best-effort admin profile mirror doesn't block it
-    await store.upsertUser({ uid: "u-store-admin", email: "store-admin@example.com", roles: [], isSystemAdmin: true });
-    vi.spyOn(store, "upsertSystemAdmin").mockRejectedValueOnce(new Error("Transient write outage"));
-    let storeAdminProceeded = false;
+    let pretenderProceeded = false;
+    const pretenderRes = createMockRes();
     await server.requireAdmin(
-      { user: { uid: "u-store-admin", email: "store-admin@example.com", isAdmin: false } } as any,
-      createMockRes(),
+      { user: { uid: "u-pretender", email: "pretender@example.com", isAdmin: true } } as any,
+      pretenderRes,
       () => {
-        storeAdminProceeded = true;
+        pretenderProceeded = true;
       }
     );
-    expect(storeAdminProceeded).toBe(true);
+    expect(pretenderProceeded).toBe(false);
+    expect(pretenderRes.statusCode).toBe(403);
+    vi.restoreAllMocks();
+
+    await store.upsertUser({ uid: "u-record-only", email: "record@example.com", roles: [], isSystemAdmin: true });
+    const recordOnlyRes = createMockRes();
+    await server.requireAdmin(
+      { user: { uid: "u-record-only", email: "record@example.com" } } as any,
+      recordOnlyRes,
+      () => {}
+    );
+    expect(recordOnlyRes.statusCode).toBe(403);
 
     // 4. requireCapability returns 500 with sanitized error when store.getScopeMember rejects
     const requireEdit = server.requireCapability("edit_content");
@@ -1291,6 +1279,8 @@ describe("lanyard/server unit tests", () => {
     });
 
     const adminAuth = createFakeAdminAuth();
+    // These tests act as system admins via hand-built actors, whose admin status comes from their Firebase claim
+    adminAuth.claimsByUid.set("root-admin", { admin: true });
     const store = new InMemoryLanyardStore<AppRole, AppCap, AppPrefs, AppAttrs, AppHiddenAttrs, AppSecrets>();
     const server = createLanyardServer<AppRole, AppCap, AppPrefs, AppAttrs, AppHiddenAttrs, AppSecrets>({
       adminAuth,
@@ -1952,6 +1942,8 @@ describe("lanyard/server unit tests", () => {
     });
 
     const adminAuth = createFakeAdminAuth();
+    // These tests act as system admins via hand-built actors, whose admin status comes from their Firebase claim
+    adminAuth.claimsByUid.set("sys-admin", { admin: true });
     const store = new InMemoryLanyardStore<
       SingleTenantRole,
       SingleTenantCap,

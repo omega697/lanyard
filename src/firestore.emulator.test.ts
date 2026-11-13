@@ -433,6 +433,9 @@ describe.skipIf(!emulatorsAvailable)(
         store: serverStore,
         policy
       });
+      // The system admin acting below is a hand-built actor, so its admin status comes from its real Firebase claim
+      await adminAuth.createUser({ uid: "root-admin", email: "root-admin@example.com", emailVerified: true });
+      await adminAuth.setCustomUserClaims("root-admin", { admin: true });
 
       // 1. Provision single-tenant users in real Firebase Auth Emulator + real Firestore (including omitting optional firstName/lastName to verify no undefined field errors!)
       const attendee = await server.upsertUserByEmail({
@@ -756,14 +759,17 @@ describe.skipIf(!emulatorsAvailable)(
       });
       await waitForStore(client.authStore, (s) => s.user?.isAdmin === false);
 
-      // Even if a request arrives with a real signed Auth Emulator JWT that still has `admin: true`,
-      // `checkAuth` + `requireAdmin` re-checks live Firestore `isSystemAdmin` and rejects with 403!
+      // Even if a request arrives with a real signed Auth Emulator JWT that still has `admin: true`, `checkAuth`
+      // refuses it as stale: the demotion bumped the revocation epoch, so the user must refresh to admin:false
       const staleReq: any = { headers: { authorization: `Bearer ${staleAdminJwt}` } };
-      await server.checkAuth(staleReq, createMockRes(), () => {});
-      expect(staleReq.user?.isAdmin).toBe(false);
-      const resStaleAdmin = createMockRes();
-      await server.requireAdmin(staleReq, resStaleAdmin, () => {});
-      expect(resStaleAdmin.statusCode).toBe(403);
+      const resStaleCheck = createMockRes();
+      let staleNext = false;
+      await server.checkAuth(staleReq, resStaleCheck, () => {
+        staleNext = true;
+      });
+      expect(staleNext).toBe(false);
+      expect(resStaleCheck.statusCode).toBe(401);
+      expect(resStaleCheck.body).toMatchObject({ code: TOKEN_STALE_ERROR_CODE });
 
       // And attendee's attributes & preferences are still intact in real Firestore after admin demotion!
       const preservedInFirestore = await serverStore.getUser(attendee.uid);
@@ -2005,44 +2011,46 @@ service cloud.firestore {
       };
     }
 
-    knownVulnerability(
-      "KNOWN VULNERABILITY (H1): a demoted claim-only admin's still-valid token re-promotes them permanently",
-      async () => {
-        const suffix = Date.now();
-        const store = new FirestoreServerStore({
-          db: adminDb,
-          usersCollection: `users_h1_${suffix}`,
-          metaCollection: `meta_h1_${suffix}`
+    it("FIXED (H1): a demoted claim-only admin's still-valid token is refused at once, and can't re-promote them", async () => {
+      const suffix = Date.now();
+      const store = new FirestoreServerStore({
+        db: adminDb,
+        usersCollection: `users_h1_${suffix}`,
+        metaCollection: `meta_h1_${suffix}`
+      });
+      const server = createLanyardServer({ adminAuth: adminAuth as any, store });
+      await adminAuth.createUser({ uid: "u-h1-other-admin", email: "h1-other-admin@example.com", emailVerified: true });
+      await adminAuth.setCustomUserClaims("u-h1-other-admin", { admin: true });
+      // An admin known only by their claim (e.g. bootstrapped with a script), with no users/{uid} document
+      const victim = await signInEmulatorUser("u-h1-admin", "h1-admin@example.com", { admin: true });
+      try {
+        const staleAdminToken = await victim.user.getIdToken();
+        await crossSecondBoundary();
+        await server.setSystemAdminStatus({
+          email: "h1-admin@example.com",
+          isAdmin: false,
+          actor: { uid: "u-h1-other-admin" }
         });
-        const server = createLanyardServer({ adminAuth: adminAuth as any, store });
-        // An admin known only by their claim (e.g. bootstrapped with a script), with no users/{uid} document
-        const victim = await signInEmulatorUser("u-h1-admin", "h1-admin@example.com", { admin: true });
-        try {
-          const staleAdminToken = await victim.user.getIdToken();
-          await server.setSystemAdminStatus({
-            email: "h1-admin@example.com",
-            isAdmin: false,
-            actor: { uid: "u-h1-other-admin", isAdmin: true }
-          });
 
-          // The demoted admin keeps using the token they already hold...
-          await runMiddleware(server.checkAuth, staleAdminToken);
-          // ...then refreshes, getting a token that correctly says admin:false
-          await crossSecondBoundary();
-          const refreshedToken = await victim.user.getIdToken(true);
-          const authed = await runMiddleware(server.checkAuth, refreshedToken);
-          expect(authed.nextCalled).toBe(true);
-          const admin = await runMiddleware(server.requireAdmin, refreshedToken, authed.req);
+        // The token they already hold is refused as stale, so it can't act as admin (or re-create an admin record)
+        const stale = await runMiddleware(server.checkAuth, staleAdminToken);
+        expect(stale.nextCalled).toBe(false);
+        expect(stale.body).toMatchObject({ code: TOKEN_STALE_ERROR_CODE });
+        expect(await store.getSystemAdmin("u-h1-admin")).toBeNull();
 
-          // Secure outcome: no longer an admin. Today the stale-token request re-created their admin record.
-          expect(admin.nextCalled).toBe(false);
-          expect(admin.status).toBe(403);
-        } finally {
-          await victim.close();
-        }
-      },
-      30_000
-    );
+        // After refreshing past the revocation, their token says admin:false and requireAdmin refuses it
+        await new Promise((resolve) => setTimeout(resolve, REVOCATION_CLOCK_SKEW_MS + 1100));
+        const refreshedToken = await victim.user.getIdToken(true);
+        const authed = await runMiddleware(server.checkAuth, refreshedToken);
+        expect(authed.nextCalled).toBe(true);
+        const admin = await runMiddleware(server.requireAdmin, refreshedToken, authed.req);
+        expect(admin.nextCalled).toBe(false);
+        expect(admin.status).toBe(403);
+      } finally {
+        server.close();
+        await victim.close();
+      }
+    }, 30_000);
 
     knownVulnerability(
       "KNOWN VULNERABILITY (H2): setSystemAdminStatus lets a non-admin actor make themselves an admin",

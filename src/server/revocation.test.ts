@@ -255,9 +255,11 @@ describe("checkAuth token freshness", () => {
 describe("revokeUserSessions", () => {
   it("lets users sign themselves out everywhere and admins revoke anyone, and the revoked session is refused at once", async () => {
     const t = nowSeconds();
-    const adminAuth = fakeAdminAuth();
+    const adminAuth = Object.assign(fakeAdminAuth(), {
+      // Admin status comes from the user's current Firebase claim
+      getUser: async (uid: string) => ({ uid, customClaims: uid === "u-admin" ? { admin: true } : {} })
+    });
     const store = new InMemoryLanyardStore();
-    await store.upsertUser({ uid: "u-admin", email: "admin@example.com", roles: [], isSystemAdmin: true });
     const server = createLanyardServer({
       adminAuth,
       store,
