@@ -1,6 +1,6 @@
 {
   "name": "lanyard",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "UID-first, storage-agnostic authentication, presence tracking, and role/capability authorization library.",
   "type": "module",
   "main": "./dist/index.js",

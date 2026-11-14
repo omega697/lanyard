@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.3.1
+
+### Fixed
+
+- **`grantUserRoles` and `grantScopeRoles` backfill missing fields on existing cards (`backfillValues`).** In `0.3.0`,
+  when a client created a bare `users/{uid}` card first (for example via `syncAvatar` or `updateProfile`, which cannot
+  write server-owned `private/attributes.email`) before any server `checkAuth` call ran, calling `grantRolesByEmail`
+  (or calling `grantUserRoles` / `grantScopeRoles` directly with a 3rd/4th seed argument) saw the existing card and
+  ignored that argument completely, leaving `email: ""` in `private/attributes` and blank profile fields unset. Both
+  `FirestoreServerStore` and `InMemoryLanyardStore` now backfill unset or empty `email`, profile, `preferences`, and
+  `attributes` fields from `backfillValues` (renamed from `fallbackUser` / `fallbackMember`; positional and
+  backwards-compatible) without overwriting existing values.
+
 ## 0.3.0
 
 A security-hardening release. It closes ways to gain or keep admin access, escalate roles, sign someone into another
