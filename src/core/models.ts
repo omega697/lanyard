@@ -1078,12 +1078,14 @@ export interface LanyardServerStore<
   ): Promise<Partial<Record<keyof TSecrets & string, boolean>>>;
   /**
    * Optional: Additively grants `roles` to global `users/{uid}` without clobbering existing roles.
-   * If the user does not yet exist, initializes the record using `fallbackUser`.
+   * If the user does not yet exist, initializes the record using `backfillValues`; if the card already exists
+   * (for example, created on the client before server provisioning), fills in any unset or empty fields from
+   * `backfillValues` without overwriting existing values.
    */
   grantUserRoles?(
     uid: string,
     roles: readonly TRole[],
-    fallbackUser?: Omit<UserRecord<TRole, TCapability, TPreferences, TAttributes>, "roles">
+    backfillValues?: Omit<UserRecord<TRole, TCapability, TPreferences, TAttributes>, "roles">
   ): Promise<UserRecord<TRole, TCapability, TPreferences, TAttributes>>;
   /**
    * Optional: Removes the specified `roles` from global `users/{uid}` while preserving all other roles.
@@ -1152,13 +1154,14 @@ export interface LanyardServerStore<
   ): Promise<Partial<Record<keyof TSecrets & string, boolean>>>;
   /**
    * Additively grants `roles` to `(scopeId, uid)` without clobbering existing roles.
-   * If the member does not yet exist in `scopeId`, initializes the record using `fallbackMember`.
+   * If the member does not yet exist in `scopeId`, initializes the record using `backfillValues`; if the card already
+   * exists, fills in any unset or empty fields from `backfillValues` without overwriting existing values.
    */
   grantScopeRoles(
     scopeId: string,
     uid: string,
     roles: readonly TRole[],
-    fallbackMember?: Omit<ScopedMember<TRole, TCapability, TPreferences, TAttributes>, "roles">
+    backfillValues?: Omit<ScopedMember<TRole, TCapability, TPreferences, TAttributes>, "roles">
   ): Promise<ScopedMember<TRole, TCapability, TPreferences, TAttributes>>;
   /**
    * Removes the specified `roles` from `(scopeId, uid)` while preserving all other roles.

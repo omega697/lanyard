@@ -29,6 +29,7 @@ import {
   assertNoReservedAttributeKeys,
   assertNoReservedTierKeys,
   decryptSecretEntries,
+  pickMissingEntries,
   resolveAttributeQueryLocation,
   resolveCardFields,
   resolveSecretKeys,
@@ -679,26 +680,73 @@ export class InMemoryLanyardStore<
   async grantUserRoles(
     uid: string,
     roles: readonly TRole[],
-    fallbackUser?: Omit<UserRecord<TRole, TCapability, TPreferences, TAttributes>, "roles">
+    backfillValues?: Omit<UserRecord<TRole, TCapability, TPreferences, TAttributes>, "roles">
   ): Promise<UserRecord<TRole, TCapability, TPreferences, TAttributes>> {
     assertValidResourceId(uid, "uid");
     const existing = this.getUserCard(uid);
-    if (!existing && !fallbackUser) {
-      throw new Error(`User '${uid}' does not exist and no fallbackUser was provided.`);
+    if (!existing) {
+      if (!backfillValues) {
+        throw new Error(`User '${uid}' does not exist and no backfillValues were provided.`);
+      }
+      await this.upsertUser({
+        ...backfillValues,
+        uid,
+        roles: Array.from(new Set(roles)),
+        updatedAt: new Date().toISOString()
+      });
+      return (await this.getUser(uid))!;
     }
-    const base = existing || {
-      ...fallbackUser!,
-      uid,
-      roles: [] as TRole[]
-    };
-    const mergedRoles = Array.from(new Set([...(base.roles || []), ...roles]));
-    const updated: UserRecord<TRole, TCapability, TPreferences, TAttributes> = {
-      ...base,
+
+    const mergedRoles = Array.from(new Set([...(existing.roles || []), ...roles]));
+    if (!backfillValues) {
+      await this.upsertUser({
+        ...existing,
+        uid,
+        roles: mergedRoles,
+        updatedAt: new Date().toISOString()
+      });
+      return (await this.getUser(uid))!;
+    }
+
+    const cleanPrefs =
+      backfillValues.preferences !== undefined
+        ? this.cleanTierPatch(backfillValues.preferences, "preferences")
+        : undefined;
+    const cleanAttrs =
+      backfillValues.attributes !== undefined
+        ? this.cleanTierPatch(backfillValues.attributes, "attributes")
+        : undefined;
+    const fullExisting = this.withPrivateTiers(existing, null);
+    const missingPrefs = pickMissingEntries(cleanPrefs, fullExisting.preferences);
+    const missingAttrs = pickMissingEntries(cleanAttrs, fullExisting.attributes);
+    const backfillEmail =
+      !fullExisting.email && typeof backfillValues.email === "string" && backfillValues.email
+        ? backfillValues.email
+        : undefined;
+    const backfillPhoto =
+      !sanitizeAvatarUrl(existing.photoUrl) && backfillValues.photoUrl !== undefined
+        ? sanitizeAvatarUrl(backfillValues.photoUrl)
+        : undefined;
+
+    await this.upsertUser({
+      ...existing,
+      ...(backfillEmail !== undefined ? { email: backfillEmail } : {}),
+      ...(!existing.firstName && backfillValues.firstName ? { firstName: backfillValues.firstName } : {}),
+      ...(!existing.lastName && backfillValues.lastName ? { lastName: backfillValues.lastName } : {}),
+      ...(!existing.displayName && backfillValues.displayName ? { displayName: backfillValues.displayName } : {}),
+      ...(!existing.lastSeen && backfillValues.lastSeen ? { lastSeen: backfillValues.lastSeen } : {}),
+      ...(backfillPhoto ? { photoUrl: backfillPhoto } : {}),
+      ...(existing.isSystemAdmin === undefined && typeof backfillValues.isSystemAdmin === "boolean"
+        ? { isSystemAdmin: backfillValues.isSystemAdmin }
+        : {}),
+      ...(existing.addedBy === undefined && backfillValues.addedBy ? { addedBy: backfillValues.addedBy } : {}),
+      ...(existing.createdAt === undefined && backfillValues.createdAt ? { createdAt: backfillValues.createdAt } : {}),
+      ...(missingPrefs ? { preferences: missingPrefs } : {}),
+      ...(missingAttrs ? { attributes: missingAttrs } : {}),
       uid,
       roles: mergedRoles,
       updatedAt: new Date().toISOString()
-    };
-    await this.upsertUser(updated);
+    });
     return (await this.getUser(uid))!;
   }
 
@@ -887,27 +935,69 @@ export class InMemoryLanyardStore<
     scopeId: string,
     uid: string,
     roles: readonly TRole[],
-    fallbackMember?: Omit<ScopedMember<TRole, TCapability, TPreferences, TAttributes>, "roles">
+    backfillValues?: Omit<ScopedMember<TRole, TCapability, TPreferences, TAttributes>, "roles">
   ): Promise<ScopedMember<TRole, TCapability, TPreferences, TAttributes>> {
     assertValidResourceId(scopeId, "scopeId");
     assertValidResourceId(uid, "uid");
     const existing = this.getMemberCard(scopeId, uid);
-    if (!existing && !fallbackMember) {
-      throw new Error(`Member '${uid}' does not exist in scope '${scopeId}' and no fallbackMember was provided.`);
+    if (!existing) {
+      if (!backfillValues) {
+        throw new Error(`Member '${uid}' does not exist in scope '${scopeId}' and no backfillValues were provided.`);
+      }
+      await this.upsertScopeMember(scopeId, {
+        ...backfillValues,
+        uid,
+        scopeId,
+        roles: Array.from(new Set(roles))
+      });
+      return (await this.getScopeMember(scopeId, uid))!;
     }
-    const base = existing || {
-      ...fallbackMember!,
+
+    const mergedRoles = Array.from(new Set([...(existing.roles || []), ...roles]));
+    if (!backfillValues) {
+      await this.upsertScopeMember(scopeId, {
+        ...existing,
+        scopeId,
+        roles: mergedRoles
+      });
+      return (await this.getScopeMember(scopeId, uid))!;
+    }
+
+    const cleanPrefs =
+      backfillValues.preferences !== undefined
+        ? this.cleanTierPatch(backfillValues.preferences, "preferences")
+        : undefined;
+    const cleanAttrs =
+      backfillValues.attributes !== undefined
+        ? this.cleanTierPatch(backfillValues.attributes, "attributes")
+        : undefined;
+    const fullExisting = this.withPrivateTiers(existing, scopeId);
+    const missingPrefs = pickMissingEntries(cleanPrefs, fullExisting.preferences);
+    const missingAttrs = pickMissingEntries(cleanAttrs, fullExisting.attributes);
+    const backfillEmail =
+      !fullExisting.email && typeof backfillValues.email === "string" && backfillValues.email
+        ? backfillValues.email
+        : undefined;
+    const backfillPhoto =
+      !sanitizeAvatarUrl(existing.photoUrl) && backfillValues.photoUrl !== undefined
+        ? sanitizeAvatarUrl(backfillValues.photoUrl)
+        : undefined;
+
+    await this.upsertScopeMember(scopeId, {
+      ...existing,
+      ...(backfillEmail !== undefined ? { email: backfillEmail } : {}),
+      ...(!existing.firstName && backfillValues.firstName ? { firstName: backfillValues.firstName } : {}),
+      ...(!existing.lastName && backfillValues.lastName ? { lastName: backfillValues.lastName } : {}),
+      ...(!existing.displayName && backfillValues.displayName ? { displayName: backfillValues.displayName } : {}),
+      ...(!existing.lastSeen && backfillValues.lastSeen ? { lastSeen: backfillValues.lastSeen } : {}),
+      ...(!existing.scopeName && backfillValues.scopeName ? { scopeName: backfillValues.scopeName } : {}),
+      ...(backfillPhoto ? { photoUrl: backfillPhoto } : {}),
+      ...(missingPrefs ? { preferences: missingPrefs } : {}),
+      ...(missingAttrs ? { attributes: missingAttrs } : {}),
       uid,
       scopeId,
-      roles: [] as TRole[]
-    };
-    const mergedRoles = Array.from(new Set([...(base.roles || []), ...roles]));
-    const updated: ScopedMember<TRole, TCapability, TPreferences, TAttributes> = {
-      ...base,
-      scopeId,
       roles: mergedRoles
-    };
-    await this.upsertScopeMember(scopeId, updated);
+    });
     return (await this.getScopeMember(scopeId, uid))!;
   }
 

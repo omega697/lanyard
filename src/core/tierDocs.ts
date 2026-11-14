@@ -57,6 +57,29 @@ export function tierDocMetadata(
 }
 
 /**
+ * Returns the entries of `incoming` whose keys are unset (`!Object.hasOwn` or `undefined`) in `existing`, or
+ * `undefined` when every provided key is already populated. Safe against `Object.prototype` key collisions.
+ * @internal Shared by the Lanyard stores; not part of the public API.
+ */
+export function pickMissingEntries<T extends Record<string, any>>(
+  incoming: Partial<T> | undefined,
+  existing: Partial<T> | undefined
+): Partial<T> | undefined {
+  if (!incoming) return undefined;
+  const missing: Record<string, any> = {};
+  for (const [k, v] of Object.entries(incoming)) {
+    if (
+      !FORBIDDEN_KEYS.has(k) &&
+      v !== undefined &&
+      (!existing || !Object.hasOwn(existing, k) || existing[k] === undefined)
+    ) {
+      missing[k] = v;
+    }
+  }
+  return Object.keys(missing).length > 0 ? (missing as Partial<T>) : undefined;
+}
+
+/**
  * Extracts the user-defined values from a private tier document, dropping metadata and unsafe keys.
  * @internal Shared by the Lanyard stores; not part of the public API.
  */

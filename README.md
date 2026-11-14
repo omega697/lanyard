@@ -610,7 +610,7 @@ class PostgresServerStore<
   async grantUserRoles(
     uid: string,
     roles: readonly TRole[],
-    fallback?: Omit<LanyardUserRecord<TRole, TCapability, TPreferences, TAttributes>, "roles">
+    backfillValues?: Omit<LanyardUserRecord<TRole, TCapability, TPreferences, TAttributes>, "roles">
   ): Promise<LanyardUserRecord<TRole, TCapability, TPreferences, TAttributes>> {
     /* ... */
   }
@@ -644,7 +644,7 @@ class PostgresServerStore<
     scopeId: string,
     uid: string,
     roles: readonly TRole[],
-    fallback?: Omit<ScopedMember<TRole, TCapability, TPreferences, TAttributes>, "roles">
+    backfillValues?: Omit<ScopedMember<TRole, TCapability, TPreferences, TAttributes>, "roles">
   ): Promise<ScopedMember<TRole, TCapability, TPreferences, TAttributes>> {
     /* ... */
   }

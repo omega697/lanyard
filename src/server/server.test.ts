@@ -549,6 +549,16 @@ describe("lanyard/server unit tests", () => {
           if (key === ref.path || key.startsWith(`${ref.path}/`)) docs.delete(key);
         }
       },
+      async runTransaction<T>(fn: (tx: any) => Promise<T>): Promise<T> {
+        const tx = {
+          get: (ref: any) => ref.get(),
+          set: (ref: any, payload: Record<string, any>, options?: { merge?: boolean }) => {
+            void ref.set(payload, options);
+            return tx;
+          }
+        };
+        return fn(tx);
+      },
       doc(path: string) {
         return {
           path,
@@ -590,6 +600,9 @@ describe("lanyard/server unit tests", () => {
       },
       collection(path: string) {
         return {
+          doc(id: string) {
+            return fakeDb.doc(`${path}/${id}`);
+          },
           async get() {
             const prefix = `${path}/`;
             const matching: any[] = [];
@@ -1095,6 +1108,16 @@ describe("lanyard/server unit tests", () => {
         for (const key of Array.from(docs.keys())) {
           if (key === ref.path || key.startsWith(`${ref.path}/`)) docs.delete(key);
         }
+      },
+      async runTransaction<T>(fn: (tx: any) => Promise<T>): Promise<T> {
+        const tx = {
+          get: (ref: any) => ref.get(),
+          set: (ref: any, payload: Record<string, any>, options?: { merge?: boolean }) => {
+            void ref.set(payload, options);
+            return tx;
+          }
+        };
+        return fn(tx);
       },
       doc(path: string) {
         return {
@@ -1682,6 +1705,16 @@ describe("lanyard/server unit tests", () => {
         for (const key of Array.from(docs.keys())) {
           if (key === ref.path || key.startsWith(`${ref.path}/`)) docs.delete(key);
         }
+      },
+      async runTransaction<T>(fn: (tx: any) => Promise<T>): Promise<T> {
+        const tx = {
+          get: (ref: any) => ref.get(),
+          set: (ref: any, payload: Record<string, any>, options?: { merge?: boolean }) => {
+            void ref.set(payload, options);
+            return tx;
+          }
+        };
+        return fn(tx);
       },
       doc(path: string) {
         return {
@@ -3538,6 +3571,333 @@ describe("lanyard/server unit tests", () => {
     expect(await store.listUsers()).toEqual([]);
     expect(await store.listScopeMembers("ws-1")).toEqual([]);
     expect(await store.listSystemAdmins()).toEqual([]);
+    server.close();
+  });
+
+  it("backfills missing email and profile fields transactionally via grantRolesByEmail / FirestoreServerStore without overwriting set fields or clobbering concurrent writes", async () => {
+    const docs = new Map<string, Record<string, any>>();
+    const docVersions = new Map<string, number>();
+    const setWritesByPath = new Map<string, number>();
+    let onBeforeCommitHook: (() => void) | null = null;
+
+    const applyPatch = (current: Record<string, any>, payload: Record<string, any>) => {
+      for (const [rawKey, v] of Object.entries(payload)) {
+        const ctorName = v && typeof v === "object" ? v.constructor?.name || "" : "";
+        const applyAt = (target: Record<string, any>, key: string) => {
+          if (ctorName.includes("Delete")) {
+            delete target[key];
+          } else if (ctorName.includes("ArrayUnion") && Array.isArray((v as any).elements)) {
+            const prev = Array.isArray(target[key]) ? target[key] : [];
+            target[key] = Array.from(new Set([...prev, ...(v as any).elements]));
+          } else if (ctorName.includes("ArrayRemove") && Array.isArray((v as any).elements)) {
+            const removeSet = new Set((v as any).elements);
+            target[key] = (Array.isArray(target[key]) ? target[key] : []).filter((x: any) => !removeSet.has(x));
+          } else if (
+            v &&
+            typeof v === "object" &&
+            !Array.isArray(v) &&
+            target[key] &&
+            typeof target[key] === "object" &&
+            !Array.isArray(target[key])
+          ) {
+            target[key] = { ...target[key], ...v };
+          } else {
+            target[key] = v;
+          }
+        };
+        if (rawKey.includes(".")) {
+          const [head, ...rest] = rawKey.split(".");
+          const nestedKey = rest.join(".");
+          current[head] =
+            current[head] && typeof current[head] === "object" && !Array.isArray(current[head])
+              ? { ...current[head] }
+              : {};
+          applyAt(current[head], nestedKey);
+        } else {
+          applyAt(current, rawKey);
+        }
+      }
+    };
+    const writeDoc = (path: string, payload: Record<string, any>, options?: { merge?: boolean }) => {
+      const current = options?.merge ? { ...(docs.get(path) || {}) } : {};
+      applyPatch(current, payload);
+      docs.set(path, current);
+      docVersions.set(path, (docVersions.get(path) || 0) + 1);
+      setWritesByPath.set(path, (setWritesByPath.get(path) || 0) + 1);
+    };
+    const fakeDb: any = {
+      async recursiveDelete(ref: { path: string }) {
+        for (const key of Array.from(docs.keys())) {
+          if (key === ref.path || key.startsWith(`${ref.path}/`)) docs.delete(key);
+        }
+      },
+      // Mirrors Firestore optimistic-concurrency transactions (all reads before writes, retry on version conflict)
+      async runTransaction<T>(fn: (tx: any) => Promise<T>): Promise<T> {
+        for (let attempt = 0; attempt < 5; attempt++) {
+          const readVersions = new Map<string, number>();
+          const stagedWrites: Array<{ path: string; payload: Record<string, any>; options?: { merge?: boolean } }> = [];
+          const tx = {
+            async get(ref: { path: string; get: () => Promise<any> }) {
+              if (stagedWrites.length > 0) {
+                throw new Error("Firestore transactions require all reads to be executed before all writes");
+              }
+              readVersions.set(ref.path, docVersions.get(ref.path) || 0);
+              return ref.get();
+            },
+            set(ref: { path: string }, payload: Record<string, any>, options?: { merge?: boolean }) {
+              stagedWrites.push({ path: ref.path, payload, options });
+              return tx;
+            }
+          };
+          const result = await fn(tx);
+          if (onBeforeCommitHook) {
+            const hook = onBeforeCommitHook;
+            onBeforeCommitHook = null;
+            hook();
+          }
+          let conflicted = false;
+          for (const [path, versionAtRead] of readVersions.entries()) {
+            if ((docVersions.get(path) || 0) !== versionAtRead) {
+              conflicted = true;
+              break;
+            }
+          }
+          if (conflicted) continue;
+          for (const w of stagedWrites) {
+            writeDoc(w.path, w.payload, w.options);
+          }
+          return result;
+        }
+        throw new Error("Transaction exceeded max retries");
+      },
+      doc(path: string) {
+        return {
+          path,
+          onSnapshot(onNext: (snap: any) => void) {
+            const data = docs.get(path);
+            onNext({ id: path.split("/").pop()!, exists: Boolean(data), data: () => (data ? { ...data } : undefined) });
+            return () => {};
+          },
+          async get() {
+            const data = docs.get(path);
+            return {
+              id: path.split("/").pop()!,
+              exists: Boolean(data),
+              data: () => (data ? { ...data } : undefined)
+            };
+          },
+          async set(payload: Record<string, any>, options?: { merge?: boolean }) {
+            writeDoc(path, payload, options);
+          },
+          async update(payload: Record<string, any>) {
+            if (!docs.has(path)) throw new Error(`Document '${path}' does not exist`);
+            writeDoc(path, payload, { merge: true });
+          },
+          async delete() {
+            docs.delete(path);
+            docVersions.set(path, (docVersions.get(path) || 0) + 1);
+          }
+        };
+      },
+      collection(path: string) {
+        return {
+          doc(id: string) {
+            return fakeDb.doc(`${path}/${id}`);
+          },
+          async get() {
+            const prefix = `${path}/`;
+            const matching: any[] = [];
+            for (const [k, v] of docs.entries()) {
+              if (k.startsWith(prefix) && !k.slice(prefix.length).includes("/")) {
+                matching.push({ id: k.slice(prefix.length), data: () => ({ ...v }) });
+              }
+            }
+            return { docs: matching };
+          }
+        };
+      },
+      collectionGroup() {
+        return {
+          where() {
+            return this;
+          },
+          async get() {
+            return { docs: [] };
+          }
+        };
+      }
+    };
+
+    type Prefs = Record<string, any>;
+    type Attrs = Record<string, any>;
+    const policy = createPermissionPolicy<TestRole, TestCap>({
+      capabilities: ["edit_content", "invite_members", "billing"],
+      roles: {
+        owner: { inherits: ["manager"], capabilities: "*" },
+        manager: { inherits: ["member"], capabilities: ["edit_content", "invite_members"] },
+        member: { capabilities: [] }
+      },
+      cardFields: { attributes: ["badge"] }
+    });
+
+    const adminAuth = createFakeAdminAuth();
+    adminAuth.claimsByUid.set("u-root-admin", { admin: true });
+    (adminAuth as any).getUser = async (uid: string) => ({ uid, customClaims: adminAuth.claimsByUid.get(uid) ?? null });
+    const createdAuthUser = await adminAuth.createUser({
+      email: "clientfirst@example.com",
+      emailVerified: true,
+      displayName: "Client Chosen Name"
+    });
+
+    const fsStore = new FirestoreServerStore<TestRole, TestCap, Prefs, Attrs>({
+      db: fakeDb,
+      policy
+    });
+    const server = createLanyardServer<TestRole, TestCap, Prefs, Attrs>({
+      adminAuth,
+      store: fsStore,
+      policy
+    });
+
+    // Simulate bare cards created without uid/scopeId (e.g. client heartbeat `{ lastSeen }` or syncAvatar)
+    docs.set(`users/${createdAuthUser.uid}`, {
+      displayName: "Client Chosen Name",
+      photoUrl: "https://example.com/client-avatar.png",
+      attributes: { badge: "existing-badge" }
+    });
+    docs.set(`users/${createdAuthUser.uid}/private/preferences`, {
+      theme: "dark",
+      _lanyard: { tier: "preferences", uid: createdAuthUser.uid, scopeId: null, updatedAt: "2026-11-13T00:00:00.000Z" }
+    });
+    docs.set(`users/${createdAuthUser.uid}/private/attributes`, {
+      points: 100,
+      _lanyard: { tier: "attributes", uid: createdAuthUser.uid, scopeId: null, updatedAt: "2026-11-13T00:00:00.000Z" }
+    });
+    docs.set(`workspaces/ws-1/members/${createdAuthUser.uid}`, {
+      lastSeen: "2026-11-13T01:00:00.000Z"
+    });
+
+    // 1. grantRolesByEmail in GLOBAL_SCOPE backfills uid, private/attributes.email, and missing firstName/lastName
+    //    without overwriting the client-set displayName or photoUrl
+    const globalGranted = await server.grantRolesByEmail({
+      scopeId: GLOBAL_SCOPE,
+      email: "ClientFirst@Example.com",
+      roles: ["manager"],
+      firstName: "Client",
+      lastName: "First"
+    });
+    expect(globalGranted).toMatchObject({
+      uid: createdAuthUser.uid,
+      email: "clientfirst@example.com",
+      firstName: "Client",
+      lastName: "First",
+      displayName: "Client Chosen Name",
+      photoUrl: "https://example.com/client-avatar.png",
+      roles: ["manager"],
+      preferences: { theme: "dark" },
+      attributes: { badge: "existing-badge", points: 100 }
+    });
+    expect(docs.get(`users/${createdAuthUser.uid}`)?.uid).toBe(createdAuthUser.uid);
+    expect(docs.get(`users/${createdAuthUser.uid}`)?.email).toBeUndefined();
+    expect(docs.get(`users/${createdAuthUser.uid}/private/attributes`)?.email).toBe("clientfirst@example.com");
+
+    // 2. Direct FirestoreServerStore.grantUserRoles backfills unset keys (including Object.prototype keys & lastSeen)
+    //    while preserving existing preferences (`theme`) and card/tier attributes (`badge`, `points`)
+    await fsStore.grantUserRoles(createdAuthUser.uid, ["owner"], {
+      uid: createdAuthUser.uid,
+      email: "ignored-second@example.com",
+      firstName: "Ignored",
+      lastSeen: "2026-11-13T02:00:00.000Z",
+      preferences: { theme: "solarized", compact: true, valueOf: "proto-pref" },
+      attributes: { badge: "overwritten-badge", points: 0, bonus: 25, toString: "proto-attr" }
+    });
+    const afterDirectBackfill = await fsStore.getUser(createdAuthUser.uid);
+    expect(afterDirectBackfill).toMatchObject({
+      email: "clientfirst@example.com",
+      firstName: "Client",
+      lastSeen: "2026-11-13T02:00:00.000Z",
+      roles: ["manager", "owner"],
+      preferences: { theme: "dark", compact: true, valueOf: "proto-pref" },
+      attributes: { badge: "existing-badge", points: 100, bonus: 25, toString: "proto-attr" }
+    });
+
+    // Repeat call when no tier keys are missing performs ZERO writes to private/preferences or private/attributes
+    const prefWritesBefore = setWritesByPath.get(`users/${createdAuthUser.uid}/private/preferences`) || 0;
+    const attrWritesBefore = setWritesByPath.get(`users/${createdAuthUser.uid}/private/attributes`) || 0;
+    await fsStore.grantUserRoles(createdAuthUser.uid, ["owner"], {
+      uid: createdAuthUser.uid,
+      email: "still-ignored@example.com",
+      preferences: { theme: "light", compact: false },
+      attributes: { badge: "ignored", points: 1, bonus: 2 }
+    });
+    expect(setWritesByPath.get(`users/${createdAuthUser.uid}/private/preferences`) || 0).toBe(prefWritesBefore);
+    expect(setWritesByPath.get(`users/${createdAuthUser.uid}/private/attributes`) || 0).toBe(attrWritesBefore);
+
+    // 3. Concurrency: a concurrent role grant, admin promotion, or client syncAvatar landing mid-operation is never clobbered
+    onBeforeCommitHook = () => {
+      // Simulate concurrent client syncAvatar + admin promotion + role grant landing on a brand-new card mid-flight
+      writeDoc(
+        `users/u-concurrent`,
+        {
+          uid: "u-concurrent",
+          displayName: "Concurrent Client Name",
+          photoUrl: "https://example.com/concurrent.png",
+          roles: ["manager"],
+          isSystemAdmin: true
+        },
+        { merge: true }
+      );
+    };
+    const concurrentResult = await fsStore.grantUserRoles("u-concurrent", [], {
+      uid: "u-concurrent",
+      email: "concurrent@example.com",
+      displayName: "concurrent@example.com",
+      isSystemAdmin: false
+    });
+    expect(concurrentResult).toMatchObject({
+      uid: "u-concurrent",
+      email: "concurrent@example.com",
+      displayName: "Concurrent Client Name",
+      photoUrl: "https://example.com/concurrent.png",
+      roles: ["manager"],
+      isSystemAdmin: true
+    });
+
+    // 4. grantRolesByEmail in tenant scope backfills uid, scopeId, member private/attributes.email, displayName, and scopeName
+    const scopedGranted = await server.grantRolesByEmail({
+      scopeId: "ws-1",
+      scopeName: "Workspace One",
+      email: "clientfirst@example.com",
+      roles: ["member"],
+      firstName: "Client",
+      lastName: "First"
+    });
+    expect(scopedGranted).toMatchObject({
+      uid: createdAuthUser.uid,
+      scopeId: "ws-1",
+      scopeName: "Workspace One",
+      email: "clientfirst@example.com",
+      firstName: "Client",
+      lastName: "First",
+      displayName: "Client First",
+      roles: ["member"]
+    });
+    expect(docs.get(`workspaces/ws-1/members/${createdAuthUser.uid}`)).toMatchObject({
+      uid: createdAuthUser.uid,
+      scopeId: "ws-1"
+    });
+    expect(docs.get(`workspaces/ws-1/members/${createdAuthUser.uid}/private/attributes`)?.email).toBe(
+      "clientfirst@example.com"
+    );
+
+    // 5. Email-confirmed deleteUser now succeeds because email was backfilled into private/attributes
+    await server.deleteUser({
+      scopeId: GLOBAL_SCOPE,
+      actor: { uid: "u-root-admin" },
+      targetUid: createdAuthUser.uid,
+      confirmTargetEmail: "clientfirst@example.com"
+    });
+    expect(await fsStore.getUser(createdAuthUser.uid)).toBeNull();
     server.close();
   });
 });

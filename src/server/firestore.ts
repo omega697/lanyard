@@ -1,4 +1,4 @@
-import { FieldValue, type Firestore } from "firebase-admin/firestore";
+import { FieldValue, type DocumentReference, type Firestore } from "firebase-admin/firestore";
 import {
   assertValidResourceId,
   assertValidRevocationEpoch,
@@ -31,6 +31,7 @@ import {
   assertNoReservedAttributeKeys,
   assertNoReservedTierKeys,
   decryptSecretEntries,
+  pickMissingEntries,
   readTierDocValues,
   resolveAttributeQueryLocation,
   resolveCardFields,
@@ -632,36 +633,222 @@ export class FirestoreServerStore<
     return this.writeEncryptedSecretsToRef(this.userSecretsDocRef(cleanUid), cleanUid, null, patch);
   }
 
+  private mergeTierSnapshotsIntoRecord<
+    R extends { email: string; attributes?: Partial<TAttributes>; preferences?: Partial<TPreferences> }
+  >(card: R, prefsData: Record<string, any> | undefined, attrsData: Record<string, any> | undefined): R {
+    const merged = { ...card };
+    if (prefsData !== undefined) merged.preferences = readTierDocValues<TPreferences>(prefsData);
+    if (attrsData !== undefined) {
+      const { attributes, email } = splitAttributesTierValues<TAttributes>(readTierDocValues(attrsData));
+      merged.attributes = { ...(card.attributes || {}), ...attributes };
+      if (!this.cardFields.email) merged.email = email || "";
+    }
+    return merged;
+  }
+
+  private async grantRolesInTransaction<
+    R extends
+      | UserRecord<TRole, TCapability, TPreferences, TAttributes>
+      | ScopedMember<TRole, TCapability, TPreferences, TAttributes>
+  >(params: {
+    ref: DocumentReference;
+    uid: string;
+    scopeId: string | null;
+    roles: readonly TRole[];
+    notFoundMessage: string;
+    parseCard: (data: Record<string, any>) => R;
+    backfillValues?: {
+      email?: string;
+      firstName?: string;
+      lastName?: string;
+      displayName?: string;
+      lastSeen?: string;
+      photoUrl?: string | null;
+      scopeName?: string;
+      isSystemAdmin?: boolean;
+      addedBy?: string;
+      createdAt?: string;
+      updatedAt?: string;
+      preferences?: Partial<TPreferences>;
+      attributes?: Partial<TAttributes>;
+    };
+  }): Promise<R> {
+    const { ref, uid, scopeId, roles, notFoundMessage, parseCard, backfillValues } = params;
+    // Validate tier patches before opening a transaction so invalid keys never write anything
+    const cleanPrefs =
+      backfillValues?.preferences !== undefined
+        ? this.cleanTierPatch(backfillValues.preferences, "preferences")
+        : undefined;
+    const cleanAttrs =
+      backfillValues?.attributes !== undefined
+        ? this.cleanTierPatch(backfillValues.attributes, "attributes")
+        : undefined;
+
+    const prefsRef = this.tierDocRef("preferences", uid, scopeId);
+    const attrsRef = this.tierDocRef("attributes", uid, scopeId);
+
+    return this.db.runTransaction(async (tx) => {
+      const [snap, prefsSnap, attrsSnap] = await Promise.all([tx.get(ref), tx.get(prefsRef), tx.get(attrsRef)]);
+
+      if (!snap.exists) {
+        if (!backfillValues) {
+          throw new Error(notFoundMessage);
+        }
+        // Grants never add default roles: a new record gets exactly the granted roles
+        const initialRoles = Array.from(new Set(roles));
+        const { preferences: _p, attributes: _a, email, ...restCard } = backfillValues;
+        const missingPrefs = pickMissingEntries(
+          cleanPrefs,
+          prefsSnap.exists ? readTierDocValues<TPreferences>(prefsSnap.data()) : undefined
+        );
+        if (missingPrefs) {
+          tx.set(prefsRef, { ...missingPrefs, ...tierDocMetadata("preferences", uid, scopeId) }, { merge: true });
+        }
+
+        const existingAttrsTier = attrsSnap.exists
+          ? splitAttributesTierValues<TAttributes>(readTierDocValues(attrsSnap.data()))
+          : { attributes: undefined, email: undefined };
+        const missingAttrs = pickMissingEntries(cleanAttrs, existingAttrsTier.attributes);
+        const { card: cardAttrs, tier: tierAttrs } = splitAttributesByPlacement(missingAttrs || {}, this.cardFields);
+        const backfillEmail = !existingAttrsTier.email ? email : undefined;
+        const tierEmail = this.tierEmail(backfillEmail);
+        const tierAttrWrite: Record<string, any> = { ...tierAttrs, ...(tierEmail ? { email: tierEmail } : {}) };
+        if (Object.keys(tierAttrWrite).length > 0) {
+          tx.set(attrsRef, { ...tierAttrWrite, ...tierDocMetadata("attributes", uid, scopeId) }, { merge: true });
+        }
+
+        const cardPayload = stripUndefinedFields({
+          ...restCard,
+          ...this.cardEmailField(email),
+          ...(restCard.photoUrl !== undefined ? { photoUrl: sanitizeAvatarUrl(restCard.photoUrl) } : {}),
+          uid,
+          ...(scopeId !== null ? { scopeId } : {}),
+          roles: initialRoles,
+          ...(Object.keys(cardAttrs).length > 0 ? { attributes: cardAttrs } : {})
+        });
+        tx.set(ref, cardPayload, { merge: true });
+
+        const nextPrefsData = missingPrefs
+          ? { ...(prefsSnap.data() || {}), ...missingPrefs }
+          : prefsSnap.exists
+            ? prefsSnap.data()
+            : undefined;
+        const nextAttrsData =
+          Object.keys(tierAttrWrite).length > 0
+            ? { ...(attrsSnap.data() || {}), ...tierAttrWrite }
+            : attrsSnap.exists
+              ? attrsSnap.data()
+              : undefined;
+        return this.mergeTierSnapshotsIntoRecord(parseCard(cardPayload), nextPrefsData, nextAttrsData);
+      }
+
+      const cardData = snap.data() || {};
+      const parsedExisting = parseCard(cardData);
+      const existingMerged = this.mergeTierSnapshotsIntoRecord(
+        parsedExisting,
+        prefsSnap.exists ? prefsSnap.data() : undefined,
+        attrsSnap.exists ? attrsSnap.data() : undefined
+      );
+
+      const existingRoles = this.extractRoles(cardData);
+      const mergedRoles = Array.from(new Set([...existingRoles, ...roles]));
+      const cardUpdate: Record<string, any> = {};
+      if (!Array.isArray(cardData.roles) || mergedRoles.length !== existingRoles.length) {
+        cardUpdate.roles = mergedRoles;
+      }
+      if (!cardData.uid) cardUpdate.uid = uid;
+      if (scopeId !== null && !cardData.scopeId) cardUpdate.scopeId = scopeId;
+
+      let missingPrefs: Partial<TPreferences> | undefined;
+      let tierAttrWrite: Record<string, any> = {};
+      if (backfillValues) {
+        missingPrefs = pickMissingEntries(cleanPrefs, existingMerged.preferences);
+        if (missingPrefs) {
+          tx.set(prefsRef, { ...missingPrefs, ...tierDocMetadata("preferences", uid, scopeId) }, { merge: true });
+        }
+
+        const missingAttrs = pickMissingEntries(cleanAttrs, existingMerged.attributes);
+        const backfillEmail =
+          !existingMerged.email && typeof backfillValues.email === "string" && backfillValues.email
+            ? backfillValues.email
+            : undefined;
+        const { card: missingCardAttrs, tier: missingTierAttrs } = splitAttributesByPlacement(
+          missingAttrs || {},
+          this.cardFields
+        );
+        const tierEmail = this.tierEmail(backfillEmail);
+        tierAttrWrite = { ...missingTierAttrs, ...(tierEmail ? { email: tierEmail } : {}) };
+        if (Object.keys(tierAttrWrite).length > 0) {
+          tx.set(attrsRef, { ...tierAttrWrite, ...tierDocMetadata("attributes", uid, scopeId) }, { merge: true });
+        }
+
+        if (backfillEmail !== undefined && this.cardFields.email) {
+          cardUpdate.email = backfillEmail;
+        }
+        if (!cardData.firstName && backfillValues.firstName) cardUpdate.firstName = backfillValues.firstName;
+        if (!cardData.lastName && backfillValues.lastName) cardUpdate.lastName = backfillValues.lastName;
+        if (!cardData.displayName && backfillValues.displayName) cardUpdate.displayName = backfillValues.displayName;
+        if (!cardData.lastSeen && backfillValues.lastSeen) cardUpdate.lastSeen = backfillValues.lastSeen;
+        if (scopeId !== null && !cardData.scopeName && backfillValues.scopeName) {
+          cardUpdate.scopeName = backfillValues.scopeName;
+        }
+        if (scopeId === null) {
+          if (cardData.isSystemAdmin === undefined && typeof backfillValues.isSystemAdmin === "boolean") {
+            cardUpdate.isSystemAdmin = backfillValues.isSystemAdmin;
+          }
+          if (cardData.addedBy === undefined && backfillValues.addedBy) cardUpdate.addedBy = backfillValues.addedBy;
+          if (cardData.createdAt === undefined && backfillValues.createdAt) {
+            cardUpdate.createdAt = backfillValues.createdAt;
+          }
+        }
+        if (!sanitizeAvatarUrl(cardData.photoUrl) && backfillValues.photoUrl !== undefined) {
+          const cleanPhoto = sanitizeAvatarUrl(backfillValues.photoUrl);
+          if (cleanPhoto) cardUpdate.photoUrl = cleanPhoto;
+        }
+        if (Object.keys(missingCardAttrs).length > 0) {
+          cardUpdate.attributes = missingCardAttrs;
+        }
+      }
+
+      if (Object.keys(cardUpdate).length > 0) {
+        tx.set(ref, cardUpdate, { merge: true });
+      }
+
+      const finalCardData = {
+        ...cardData,
+        ...cardUpdate,
+        ...(cardUpdate.attributes ? { attributes: { ...(cardData.attributes || {}), ...cardUpdate.attributes } } : {})
+      };
+      const nextPrefsData = missingPrefs
+        ? { ...(prefsSnap.data() || {}), ...missingPrefs }
+        : prefsSnap.exists
+          ? prefsSnap.data()
+          : undefined;
+      const nextAttrsData =
+        Object.keys(tierAttrWrite).length > 0
+          ? { ...(attrsSnap.data() || {}), ...tierAttrWrite }
+          : attrsSnap.exists
+            ? attrsSnap.data()
+            : undefined;
+      return this.mergeTierSnapshotsIntoRecord(parseCard(finalCardData), nextPrefsData, nextAttrsData);
+    });
+  }
+
   async grantUserRoles(
     uid: string,
     roles: readonly TRole[],
-    fallbackUser?: Omit<UserRecord<TRole, TCapability, TPreferences, TAttributes>, "roles">
+    backfillValues?: Omit<UserRecord<TRole, TCapability, TPreferences, TAttributes>, "roles">
   ): Promise<UserRecord<TRole, TCapability, TPreferences, TAttributes>> {
     const cleanUid = assertValidFirestoreDocId(uid, "uid");
-    const ref = this.userDocRef(cleanUid);
-    const snap = await ref.get();
-    if (!snap.exists) {
-      if (!fallbackUser) {
-        throw new Error(`User '${cleanUid}' does not exist`);
-      }
-      // Grants never add default roles: a new record gets exactly the granted roles
-      const initialRoles = Array.from(new Set(roles));
-      const created: UserRecord<TRole, TCapability, TPreferences, TAttributes> = {
-        ...fallbackUser,
-        ...(fallbackUser.photoUrl !== undefined ? { photoUrl: sanitizeAvatarUrl(fallbackUser.photoUrl) } : {}),
-        uid: cleanUid,
-        roles: initialRoles
-      };
-      await this.upsertUser(created);
-      return created;
-    }
-
-    if (roles.length > 0) {
-      await ref.update({
-        roles: FieldValue.arrayUnion(...roles)
-      });
-    }
-    return (await this.getUser(cleanUid))!;
+    return this.grantRolesInTransaction({
+      ref: this.userDocRef(cleanUid),
+      uid: cleanUid,
+      scopeId: null,
+      roles,
+      notFoundMessage: `User '${cleanUid}' does not exist`,
+      parseCard: (data) => this.parseUserRecord(cleanUid, data),
+      backfillValues
+    });
   }
 
   async revokeUserRoles(uid: string, roles: readonly TRole[]): Promise<void> {
@@ -901,33 +1088,19 @@ export class FirestoreServerStore<
     scopeId: string,
     uid: string,
     roles: readonly TRole[],
-    fallbackMember?: Omit<ScopedMember<TRole, TCapability, TPreferences, TAttributes>, "roles">
+    backfillValues?: Omit<ScopedMember<TRole, TCapability, TPreferences, TAttributes>, "roles">
   ): Promise<ScopedMember<TRole, TCapability, TPreferences, TAttributes>> {
-    const ref = this.memberDocRef(scopeId, uid);
-    const snap = await ref.get();
-    if (!snap.exists) {
-      if (!fallbackMember) {
-        throw new Error(`Member '${uid}' does not exist in scope '${scopeId}'`);
-      }
-      // Grants never add default roles: a new record gets exactly the granted roles
-      const initialRoles = Array.from(new Set(roles));
-      const created: ScopedMember<TRole, TCapability, TPreferences, TAttributes> = {
-        ...fallbackMember,
-        ...(fallbackMember.photoUrl !== undefined ? { photoUrl: sanitizeAvatarUrl(fallbackMember.photoUrl) } : {}),
-        uid,
-        scopeId,
-        roles: initialRoles
-      };
-      await this.upsertScopeMember(scopeId, created);
-      return created;
-    }
-
-    if (roles.length > 0) {
-      await ref.update({
-        roles: FieldValue.arrayUnion(...roles)
-      });
-    }
-    return (await this.getScopeMember(scopeId, uid))!;
+    const cleanScopeId = assertValidFirestoreDocId(scopeId, "scopeId");
+    const cleanUid = assertValidFirestoreDocId(uid, "uid");
+    return this.grantRolesInTransaction({
+      ref: this.memberDocRef(cleanScopeId, cleanUid),
+      uid: cleanUid,
+      scopeId: cleanScopeId,
+      roles,
+      notFoundMessage: `Member '${cleanUid}' does not exist in scope '${cleanScopeId}'`,
+      parseCard: (data) => this.parseScopedMember(cleanUid, cleanScopeId, data),
+      backfillValues
+    });
   }
 
   async revokeScopeRoles(scopeId: string, uid: string, roles: readonly TRole[]): Promise<void> {

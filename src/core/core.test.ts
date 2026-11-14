@@ -387,7 +387,7 @@ describe("lanyard/core unit tests", () => {
         scopeSnapshots.push(members);
       });
 
-      // Throws if granting roles to a non-existent member without fallbackMember
+      // Throws if granting roles to a non-existent member without backfillValues
       await expect(store.grantScopeRoles("ws-1", "missing-uid", ["member"])).rejects.toThrow(/does not exist/);
 
       await store.grantScopeRoles("ws-1", "uid-1", ["member"], {
@@ -413,6 +413,151 @@ describe("lanyard/core unit tests", () => {
 
       unsubScope();
       expect(scopeSnapshots.length).toBeGreaterThanOrEqual(4);
+    });
+
+    it("backfills missing email, profile, preferences, and attributes from backfillValues on existing cards without overwriting set fields or re-emitting unchanged tiers", async () => {
+      type Prefs = Record<string, any>;
+      type Attrs = Record<string, any>;
+      const policy = createPermissionPolicy<TestRole, TestCapability>({
+        roles: { owner: { capabilities: [] }, manager: { capabilities: [] }, member: { capabilities: [] } },
+        cardFields: { attributes: ["badge"] }
+      });
+      const store = new InMemoryLanyardStore<TestRole, TestCapability, Prefs, Attrs>({ policy });
+
+      // Client creates a bare global card via syncAvatar (displayName + photoUrl set, email/firstName/lastName/lastSeen missing)
+      await store.syncAvatar({
+        uid: "u-bare",
+        displayName: "Custom Name",
+        photoUrl: "https://example.com/custom.png"
+      });
+      await store.savePreferences("u-bare", { theme: "dark" });
+      await store.updateUserAttributes("u-bare", { score: 10 });
+
+      const prefEmissions: Partial<Prefs>[] = [];
+      const attrEmissions: Array<{ attrs: Partial<Attrs>; email?: string }> = [];
+      const unsubPrefs = store.subscribeToPreferences("u-bare", (p) => prefEmissions.push(p));
+      const unsubAttrs = store.subscribeToAttributes("u-bare", (attrs, email) => attrEmissions.push({ attrs, email }));
+      expect(prefEmissions).toHaveLength(1);
+      expect(attrEmissions).toHaveLength(1);
+
+      const granted = await store.grantUserRoles("u-bare", ["manager"], {
+        uid: "u-bare",
+        email: "bare@example.com",
+        firstName: "Bare",
+        lastName: "User",
+        displayName: "bare@example.com",
+        photoUrl: "https://example.com/fallback.png",
+        lastSeen: "2026-11-13T05:00:00.000Z",
+        preferences: { theme: "light", compact: true, valueOf: "proto-pref" },
+        attributes: { badge: "founder", score: 999, toString: "proto-attr" }
+      });
+
+      expect(granted).toMatchObject({
+        uid: "u-bare",
+        email: "bare@example.com",
+        firstName: "Bare",
+        lastName: "User",
+        // Existing non-empty displayName & photoUrl win over backfillValues
+        displayName: "Custom Name",
+        photoUrl: "https://example.com/custom.png",
+        lastSeen: "2026-11-13T05:00:00.000Z",
+        roles: ["manager"],
+        preferences: { theme: "dark", compact: true, valueOf: "proto-pref" },
+        attributes: { badge: "founder", score: 10, toString: "proto-attr" }
+      });
+      // Missing entries in both private tiers were backfilled -> each tier emitted once
+      expect(prefEmissions).toHaveLength(2);
+      expect(attrEmissions).toHaveLength(2);
+
+      // Second grant with conflicting backfill values does NOT overwrite populated fields and does NOT re-emit private tiers
+      const grantedAgain = await store.grantUserRoles("u-bare", ["owner"], {
+        uid: "u-bare",
+        email: "other@example.com",
+        firstName: "Other",
+        lastSeen: "2026-11-14T00:00:00.000Z",
+        preferences: { theme: "solarized", compact: false, valueOf: "other-pref" },
+        attributes: { badge: "other-badge", score: 0, toString: "other-attr" }
+      });
+      expect(grantedAgain.email).toBe("bare@example.com");
+      expect(grantedAgain.firstName).toBe("Bare");
+      expect(grantedAgain.lastSeen).toBe("2026-11-13T05:00:00.000Z");
+      expect(grantedAgain.preferences).toEqual({ theme: "dark", compact: true, valueOf: "proto-pref" });
+      expect(grantedAgain.attributes).toEqual({ badge: "founder", score: 10, toString: "proto-attr" });
+      expect(grantedAgain.roles).toEqual(["manager", "owner"]);
+      expect(prefEmissions).toHaveLength(2);
+      expect(attrEmissions).toHaveLength(2);
+
+      // Scoped member card existing without email, lastSeen, or profile fields
+      await store.upsertScopeMember("ws-1", {
+        uid: "u-scope-bare",
+        email: ""
+      });
+      const scopePrefEmissions: Partial<Prefs>[] = [];
+      const scopeAttrEmissions: Array<{ attrs: Partial<Attrs>; email?: string }> = [];
+      const unsubScopePrefs = store.subscribeToScopePreferences("ws-1", "u-scope-bare", (p) =>
+        scopePrefEmissions.push(p)
+      );
+      const unsubScopeAttrs = store.subscribeToScopeAttributes("ws-1", "u-scope-bare", (attrs, email) =>
+        scopeAttrEmissions.push({ attrs, email })
+      );
+      expect(scopePrefEmissions).toHaveLength(1);
+      expect(scopeAttrEmissions).toHaveLength(1);
+
+      const scopedGranted = await store.grantScopeRoles("ws-1", "u-scope-bare", ["member"], {
+        uid: "u-scope-bare",
+        scopeId: "ws-1",
+        scopeName: "Workspace One",
+        email: "scoped@example.com",
+        firstName: "Scoped",
+        displayName: "Scoped Member",
+        lastSeen: "2026-11-13T00:00:00.000Z",
+        preferences: { theme: "dark" },
+        attributes: { score: 7 }
+      });
+      expect(scopedGranted).toMatchObject({
+        uid: "u-scope-bare",
+        scopeId: "ws-1",
+        scopeName: "Workspace One",
+        email: "scoped@example.com",
+        firstName: "Scoped",
+        displayName: "Scoped Member",
+        lastSeen: "2026-11-13T00:00:00.000Z",
+        preferences: { theme: "dark" },
+        attributes: { score: 7 },
+        roles: ["member"]
+      });
+      expect(scopePrefEmissions).toHaveLength(2);
+      expect(scopeAttrEmissions).toHaveLength(2);
+
+      // Repeat scoped grant when nothing in preferences/attributes is missing does not re-emit private tiers
+      await store.grantScopeRoles("ws-1", "u-scope-bare", ["manager"], {
+        uid: "u-scope-bare",
+        scopeId: "ws-1",
+        email: "ignored@example.com",
+        lastSeen: "2026-11-15T00:00:00.000Z",
+        preferences: { theme: "light" },
+        attributes: { score: 99 }
+      });
+      expect(scopePrefEmissions).toHaveLength(2);
+      expect(scopeAttrEmissions).toHaveLength(2);
+
+      unsubPrefs();
+      unsubAttrs();
+      unsubScopePrefs();
+      unsubScopeAttrs();
+
+      // Also works when cardFields.email places email on the card
+      const cardEmailPolicy = createPermissionPolicy<TestRole, TestCapability>({
+        roles: { owner: { capabilities: [] }, manager: { capabilities: [] }, member: { capabilities: [] } },
+        cardFields: { email: true }
+      });
+      const cardEmailStore = new InMemoryLanyardStore<TestRole, TestCapability>({ policy: cardEmailPolicy });
+      await cardEmailStore.syncAvatar({ uid: "u-card-email", photoUrl: "https://example.com/a.png" });
+      const cardGranted = await cardEmailStore.grantUserRoles("u-card-email", ["member"], {
+        uid: "u-card-email",
+        email: "oncard@example.com"
+      });
+      expect(cardGranted.email).toBe("oncard@example.com");
     });
 
     it("supports system admins, preferences, avatar syncing, and presence heartbeats", async () => {
